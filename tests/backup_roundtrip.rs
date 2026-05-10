@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use wal_rs::compression::Method;
-use wal_rs::config::{Settings, StorageSettings};
+use wal_rs::config::{DeltaSettings, Settings, StorageSettings};
+use wal_rs::pg::backup::delta as delta_mod;
 use wal_rs::pg::backup::fetch as fetch_mod;
 use wal_rs::pg::backup::list as list_mod;
 use wal_rs::pg::backup::{
@@ -28,6 +29,7 @@ fn test_settings() -> Settings {
         retry: wal_rs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
+        delta: Default::default(),
     }
 }
 
@@ -290,4 +292,107 @@ async fn show_round_trip_and_mark_flips_permanent() {
     let raw = std::fs::read(dir.path().join(sentinel_key(&backup_name))).unwrap();
     let after: BackupSentinelDtoV2 = serde_json::from_slice(&raw).unwrap();
     assert!(!after.is_permanent);
+}
+
+#[tokio::test]
+async fn delta_parent_picks_latest_when_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Storage> = Arc::new(FsStorage::new(dir.path()).unwrap());
+
+    // Seed two sentinels; the later one (higher LSN, later StartTime) wins
+    let older_name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
+    let mut older = make_sentinel_v2("/var/lib/postgres/data");
+    older.sentinel.backup_start_lsn = Some(0x0100_0000);
+    older.start_time = chrono::Utc::now() - chrono::Duration::hours(2);
+    older.finish_time = older.start_time + chrono::Duration::minutes(1);
+    put_bytes(
+        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        &sentinel_key(&older_name),
+        serde_json::to_vec(&older).unwrap(),
+    )
+    .await;
+
+    let newer_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
+    let mut newer = make_sentinel_v2("/var/lib/postgres/data");
+    newer.sentinel.backup_start_lsn = Some(0x0300_0000);
+    newer.start_time = chrono::Utc::now();
+    newer.finish_time = newer.start_time + chrono::Duration::minutes(1);
+    put_bytes(
+        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        &sentinel_key(&newer_name),
+        serde_json::to_vec(&newer).unwrap(),
+    )
+    .await;
+
+    // Bring up the fs storage's list_mtime via touch-ordering so the
+    // newer entry sorts last
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        dir.path().join(sentinel_key(&newer_name)),
+        serde_json::to_vec(&newer).unwrap(),
+    )
+    .unwrap();
+
+    let delta = DeltaSettings {
+        max_steps: 3,
+        from_full: false,
+        from_name: None,
+        from_user_data: None,
+    };
+    let info = delta_mod::configure_delta_parent(&store, &delta, false)
+        .await
+        .unwrap()
+        .expect("delta parent should be picked");
+    assert_eq!(info.name, newer_name);
+    assert_eq!(info.start_lsn, 0x0300_0000);
+    assert_eq!(info.timeline, 1);
+    assert_eq!(info.increment_count, 1);
+}
+
+#[tokio::test]
+async fn delta_parent_falls_back_to_full_when_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Storage> = Arc::new(FsStorage::new(dir.path()).unwrap());
+
+    let name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
+    let sentinel = make_sentinel_v2("/var/lib/postgres/data");
+    put_bytes(
+        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        &sentinel_key(&name),
+        serde_json::to_vec(&sentinel).unwrap(),
+    )
+    .await;
+
+    let delta = DeltaSettings::default();
+    let info = delta_mod::configure_delta_parent(&store, &delta, false)
+        .await
+        .unwrap();
+    assert!(info.is_none(), "max_steps=0 → must fall back to full");
+}
+
+#[tokio::test]
+async fn delta_parent_falls_back_when_max_steps_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Storage> = Arc::new(FsStorage::new(dir.path()).unwrap());
+
+    let name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
+    let mut sentinel = make_sentinel_v2("/var/lib/postgres/data");
+    sentinel.sentinel.increment_count = Some(3); // chain already 3 deep
+    put_bytes(
+        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        &sentinel_key(&name),
+        serde_json::to_vec(&sentinel).unwrap(),
+    )
+    .await;
+
+    let delta = DeltaSettings {
+        max_steps: 3,
+        from_full: false,
+        from_name: None,
+        from_user_data: None,
+    };
+    let info = delta_mod::configure_delta_parent(&store, &delta, false)
+        .await
+        .unwrap();
+    assert!(info.is_none(), "next would be increment 4 > max 3");
 }

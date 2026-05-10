@@ -58,6 +58,14 @@ pub enum Cmd {
         /// Override `WALG_TAR_SIZE_THRESHOLD` (bytes); 0 = default 1 GiB
         #[arg(long, default_value_t = 0u64, env = "WALG_TAR_SIZE_THRESHOLD")]
         tar_size_threshold: u64,
+        /// Build the delta map from `$PGDATA/pg_wal/summaries` (PG17+,
+        /// requires `summarize_wal=on`). Emits PG-native INCREMENTAL files
+        /// instead of wal-g's `wi1` format. Mutually exclusive with `--full`
+        #[arg(long)]
+        delta_from_wal_summaries: bool,
+        /// Force a full (non-delta) backup, ignoring `WALG_DELTA_MAX_STEPS`
+        #[arg(long, conflicts_with = "delta_from_wal_summaries")]
+        full: bool,
     },
     /// Show sentinel + files_metadata summary for one backup
     BackupShow {
@@ -131,6 +139,8 @@ impl Cli {
                 fast,
                 no_verify_checksums,
                 tar_size_threshold,
+                delta_from_wal_summaries,
+                full,
             } => {
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
@@ -146,6 +156,8 @@ impl Cli {
                     fast_checkpoint: fast,
                     no_verify_checksums,
                     tar_size_threshold,
+                    delta_from_wal_summaries,
+                    full,
                 };
                 backup::push::handle(&s, storage, args).await
             }

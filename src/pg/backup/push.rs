@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::compression::{self, AsyncReader};
 use crate::config::Settings;
+use crate::pg::backup::delta;
 use crate::pg::backup::tar_streamer::{self, StreamerOpts, tablespace_prefix};
 use crate::pg::backup::{
     BACKUP_NAME_PREFIX, BackupSentinelDto, BackupSentinelDtoV2, ExtendedMetadataDto,
@@ -52,10 +53,47 @@ pub struct PushArgs {
     pub no_verify_checksums: bool,
     /// `WALG_TAR_SIZE_THRESHOLD` override (bytes). 0 = use the streamer default
     pub tar_size_threshold: u64,
+    /// `--delta-from-wal-summaries`: build delta map from PG17 walsummarizer
+    /// output, emit native INCREMENTAL files instead of wal-g `wi1` format
+    pub delta_from_wal_summaries: bool,
+    /// `--full`: explicit override to skip delta detection
+    pub full: bool,
 }
 
 pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) -> Result<()> {
     let start_time = chrono::Utc::now();
+
+    // Resolve a delta parent if WALG_DELTA_MAX_STEPS > 0 (or --delta-from-
+    // wal-summaries). The pre-flight runs eagerly so misconfig surfaces.
+    // Streamer-side increment emission is not yet wired (see PHASEC.md /
+    // PHASEC2.md): when a parent is found we log it & fall back to full,
+    // so the sentinel never claims a delta that the bucket can't deliver.
+    //
+    // `--full` short-circuits delta detection entirely (matches wal-g's
+    // `--full` flag). `--delta-from-wal-summaries` is mutually exclusive
+    let parent = if args.full {
+        None
+    } else {
+        delta::configure_delta_parent(&storage, &settings.delta, args.is_permanent).await?
+    };
+    if let Some(p) = parent.as_ref() {
+        let mode = if args.delta_from_wal_summaries {
+            "wal-summaries + PG17 native"
+        } else {
+            "WAL-walk + wi1"
+        };
+        tracing::warn!(
+            target = "backup_push",
+            "delta parent {} resolved (count={}, start_lsn={:X}, mode={mode}) but increment \
+             generation not yet implemented; producing a full backup",
+            p.name,
+            p.increment_count,
+            p.start_lsn,
+        );
+        // TODO(phase-c): pass parent + format flag into streamer
+    }
+    let _drop_parent_for_now: Option<delta::PrevBackupInfo> = None;
+    let _ = _drop_parent_for_now;
 
     let cfg = PgConfig::from_env()?;
     tracing::info!(
@@ -81,6 +119,44 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
             .await
             .unwrap_or_default(),
     };
+
+    // `--delta-from-wal-summaries`: server-side preconditions + build the
+    // delta map up front so the BASE_BACKUP can run with a hot map. PG17 +
+    // summarize_wal=on are hard requirements; abort early on either miss
+    if args.delta_from_wal_summaries {
+        if pg_version < 170000 {
+            bail!(
+                "--delta-from-wal-summaries requires PostgreSQL 17 or newer (server reports {pg_version})"
+            );
+        }
+        let on = fetch_setting(&mut conn, "summarize_wal").await?;
+        if on.trim() != "on" {
+            bail!("--delta-from-wal-summaries requires summarize_wal=on on the server");
+        }
+        // TODO(phase-c2): build delta map from pg_wal/summaries & feed it
+        // into the streamer. The upper bound (this backup's start LSN) only
+        // becomes known after BackupEvent::Start fires, so the build either
+        // has to move into the event loop, or wait until START_REPLICATION
+        // returns the start LSN
+        match (parent.as_ref(), args.pgdata.as_ref()) {
+            (None, _) => tracing::info!(
+                target = "backup_push",
+                "no delta parent resolved; --delta-from-wal-summaries will produce a full backup"
+            ),
+            (Some(p), Some(pgdata)) => tracing::info!(
+                target = "backup_push",
+                "would build delta map from {}/pg_wal/summaries for [{:X}, ?) on timeline {}",
+                pgdata.display(),
+                p.start_lsn,
+                p.timeline,
+            ),
+            (Some(_), None) => tracing::warn!(
+                target = "backup_push",
+                "--delta-from-wal-summaries without --pgdata: WAL summaries live on the \
+                 PG host's filesystem, not reachable from a remote pusher; skipping",
+            ),
+        }
+    }
 
     let label = format!("wal-rs {}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
     let opts = BaseBackupOpts {

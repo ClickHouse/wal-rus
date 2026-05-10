@@ -1,0 +1,507 @@
+//! `WalParser` — stateful record reader that stitches records across pages
+//!
+//! A single XLogRecord can span two or more 8 KiB pages. `WalParser` holds
+//! the bytes accumulated for a record that started on an earlier page;
+//! when the next page's header is read it walks the continuation data &
+//! emits the joined record. The state is checkpointable via `save`/`load`
+//! so wal-g (and we) can stash partial state in a delta_NN sidecar file
+//!
+//! On disk: a delta file stores a list of `BlockLocation` tuples (16 bytes
+//! each, LE u32×4) terminated by an all-zero tuple, then a u32 length
+//! prefix + the parser's `current_record_data` bytes. See wal-g
+//! `block_location_writer.go` & `wal_parser.go::Save`
+
+use std::io::{self, Read, Write};
+
+use thiserror::Error;
+
+use super::parse::{
+    AlignedReader, ExtractError, ParseError, extract_block_locations, parse_record_from_bytes,
+    read_xlog_page_header, read_xlog_record_header, try_read_xlog_record_data,
+};
+use super::types::{BlockLocation, WAL_PAGE_SIZE, XLogPage, XLogPageHeader, XLogRecord};
+
+#[derive(Debug, Error)]
+pub enum ParsePageError {
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    #[error("io: {0}")]
+    Io(#[from] io::Error),
+    #[error("cannot save partial parser: no record beginning present")]
+    CantSavePartialParser,
+}
+
+#[derive(Debug, Error)]
+pub enum ReadLocationsError {
+    #[error("io: {0}")]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+}
+
+#[derive(Debug, Default)]
+pub struct WalParser {
+    current_record_data: Vec<u8>,
+    has_current_record_beginning: bool,
+}
+
+impl WalParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn invalidate(&mut self) {
+        self.set_current_record_data(Vec::new());
+    }
+
+    fn set_current_record_data(&mut self, data: Vec<u8>) {
+        self.has_current_record_beginning = !data.is_empty();
+        self.current_record_data = data;
+    }
+
+    pub fn current_record_data(&self) -> &[u8] {
+        &self.current_record_data
+    }
+
+    pub fn has_current_record_beginning(&self) -> bool {
+        self.has_current_record_beginning
+    }
+
+    /// Parse all records starting on `page_data` (exactly one 8 KiB page).
+    /// Returns `(prev_record_tail, records)`:
+    ///   - `prev_record_tail`: a stitched-together record body whose
+    ///     *beginning* the parser missed (e.g. first page of an
+    ///     ExtractLocations call). Caller chooses to discard or use
+    ///   - `records`: complete records that ended on or before this page
+    ///
+    /// `Ok((empty, empty))` on partial / zero pages so callers can keep
+    /// walking; `Err` only on truly malformed data
+    pub fn parse_records_from_page(
+        &mut self,
+        page_data: &[u8],
+    ) -> Result<(Vec<u8>, Vec<XLogRecord>), ParsePageError> {
+        let page = match self.parse_page(page_data) {
+            Ok(p) => p,
+            Err(ParsePageError::Parse(ParseError::PartialPage))
+            | Err(ParsePageError::Parse(ParseError::ZeroPage)) => {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Cross-page record's continuation didn't fully land yet: buffer
+        if (page.prev_record_trailing_data.len() as u32) < page.header.remaining_data_len {
+            self.current_record_data
+                .extend_from_slice(&page.prev_record_trailing_data);
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let mut current_record_data = std::mem::take(&mut self.current_record_data);
+        current_record_data.extend_from_slice(&page.prev_record_trailing_data);
+
+        if !self.has_current_record_beginning {
+            // Tail without beginning: emit for caller to discard
+            self.set_current_record_data(page.next_record_heading_data.clone());
+            return Ok((current_record_data, page.records));
+        }
+
+        let header = read_xlog_record_header(&mut current_record_data.as_slice())?;
+        if header.total_record_length as usize != current_record_data.len() {
+            return Err(ParseError::ContinuationNotFound.into());
+        }
+        let current_record = parse_record_from_bytes(&current_record_data)?;
+
+        let mut records = Vec::with_capacity(page.records.len() + 1);
+        records.push(current_record);
+        records.extend(page.records);
+        self.set_current_record_data(page.next_record_heading_data);
+        Ok((Vec::new(), records))
+    }
+
+    fn parse_page(&mut self, page_data: &[u8]) -> Result<XLogPage, ParsePageError> {
+        if page_data.len() < WAL_PAGE_SIZE as usize / 2 {
+            return Err(ParseError::PartialPage.into());
+        }
+
+        // Pass 1: page header (consumes 20 or 36 bytes off the page front)
+        let mut cursor: &[u8] = page_data;
+        let header = match read_xlog_page_header(&mut cursor) {
+            Ok(h) => h,
+            Err(ParseError::ZeroPageHeader) => {
+                if all_zero(page_data) {
+                    return Err(ParseError::ZeroPage.into());
+                }
+                return Err(ParseError::ZeroPageHeader.into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let consumed = page_data.len() - cursor.len();
+        let mut ar = AlignedReader {
+            buf: cursor,
+            consumed,
+        };
+        ar.read_to_alignment()?;
+
+        // Bytes carrying over a previous record's tail
+        let want = std::cmp::min(header.remaining_data_len as usize, WAL_PAGE_SIZE as usize);
+        let take_n = want.min(ar.buf.len());
+        let remaining_data = ar.take(take_n, "pageRemainingData")?.to_vec();
+
+        // Short tail: page ended before we got the full RemainingDataLen
+        if remaining_data.len() != header.remaining_data_len as usize {
+            return Ok(XLogPage {
+                header,
+                prev_record_trailing_data: remaining_data,
+                records: Vec::new(),
+                next_record_heading_data: Vec::new(),
+            });
+        }
+
+        // If we had a buffered start AND the tail bytes form a WAL-switch
+        // record together with it, the rest of the page is padding
+        if self.has_current_record_beginning {
+            let mut joined = self.current_record_data.clone();
+            joined.extend_from_slice(&remaining_data);
+            if let Ok(record) = parse_record_from_bytes(&joined)
+                && record.is_wal_switch()
+            {
+                return Ok(XLogPage {
+                    header,
+                    prev_record_trailing_data: remaining_data,
+                    records: Vec::new(),
+                    next_record_heading_data: Vec::new(),
+                });
+            }
+        }
+
+        read_xlog_page_inner(&mut ar, header, remaining_data)
+    }
+
+    pub fn save<W: Write>(&self, mut w: W) -> Result<(), ParsePageError> {
+        if !self.current_record_data.is_empty() && !self.has_current_record_beginning {
+            return Err(ParsePageError::CantSavePartialParser);
+        }
+        let len = self.current_record_data.len() as u32;
+        w.write_all(&len.to_le_bytes())?;
+        w.write_all(&self.current_record_data)?;
+        Ok(())
+    }
+
+    pub fn load<R: Read>(mut r: R) -> Result<Self, ParsePageError> {
+        let mut len_bytes = [0u8; 4];
+        r.read_exact(&mut len_bytes)?;
+        let len = u32::from_le_bytes(len_bytes);
+        let mut data = vec![0u8; len as usize];
+        r.read_exact(&mut data)?;
+        let has = !data.is_empty();
+        Ok(Self {
+            current_record_data: data,
+            has_current_record_beginning: has,
+        })
+    }
+}
+
+fn all_zero(data: &[u8]) -> bool {
+    data.iter().all(|&b| b == 0)
+}
+
+fn read_xlog_page_inner(
+    ar: &mut AlignedReader<'_>,
+    header: XLogPageHeader,
+    remaining_data: Vec<u8>,
+) -> Result<XLogPage, ParsePageError> {
+    let mut records = Vec::new();
+    loop {
+        let res = try_read_xlog_record_data(ar);
+        match res {
+            Ok((data, whole)) => {
+                if data.is_empty() && !whole {
+                    return Ok(XLogPage {
+                        header,
+                        prev_record_trailing_data: remaining_data,
+                        records,
+                        next_record_heading_data: Vec::new(),
+                    });
+                }
+                if whole {
+                    let record = parse_record_from_bytes(&data)?;
+                    let is_switch = record.is_wal_switch();
+                    records.push(record);
+                    if is_switch {
+                        return Ok(XLogPage {
+                            header,
+                            prev_record_trailing_data: remaining_data,
+                            records,
+                            next_record_heading_data: Vec::new(),
+                        });
+                    }
+                    continue;
+                }
+                return Ok(XLogPage {
+                    header,
+                    prev_record_trailing_data: remaining_data,
+                    records,
+                    next_record_heading_data: data,
+                });
+            }
+            Err(ParseError::ZeroRecordHeader) => {
+                if all_zero(ar.buf) {
+                    return Ok(XLogPage {
+                        header,
+                        prev_record_trailing_data: remaining_data,
+                        records,
+                        next_record_heading_data: Vec::new(),
+                    });
+                }
+                return Err(ParseError::ZeroRecordHeader.into());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Walk a WAL segment file (or any `Read` that yields raw page bytes),
+/// extracting every `BlockLocation` referenced. Tolerates Partial / Zero
+/// page errors as end-of-valid-data signals
+pub fn extract_locations_from_wal_file<R: Read>(
+    parser: &mut WalParser,
+    mut r: R,
+) -> Result<Vec<BlockLocation>, ExtractError> {
+    let mut out = Vec::new();
+    let mut page_buf = vec![0u8; WAL_PAGE_SIZE as usize];
+    loop {
+        match read_exact_or_eof(&mut r, &mut page_buf)? {
+            ReadStatus::Eof => return Ok(out),
+            ReadStatus::Short(n) => {
+                let (_, records) = parser
+                    .parse_records_from_page(&page_buf[..n])
+                    .map_err(parse_to_extract)?;
+                out.extend(extract_block_locations(&records));
+                return Ok(out);
+            }
+            ReadStatus::Full => {
+                let (_, records) = parser
+                    .parse_records_from_page(&page_buf)
+                    .map_err(parse_to_extract)?;
+                out.extend(extract_block_locations(&records));
+            }
+        }
+    }
+}
+
+fn parse_to_extract(e: ParsePageError) -> ExtractError {
+    match e {
+        ParsePageError::Parse(p) => ExtractError::Parse(p),
+        ParsePageError::Io(i) => ExtractError::Io(i),
+        ParsePageError::CantSavePartialParser => ExtractError::Parse(ParseError::PartialPage),
+    }
+}
+
+enum ReadStatus {
+    Eof,
+    Short(usize),
+    Full,
+}
+
+fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadStatus> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = r.read(&mut buf[filled..])?;
+        if n == 0 {
+            return Ok(if filled == 0 {
+                ReadStatus::Eof
+            } else {
+                ReadStatus::Short(filled)
+            });
+        }
+        filled += n;
+    }
+    Ok(ReadStatus::Full)
+}
+
+// ─── delta file BlockLocation list I/O (wal-g block_location_writer/reader) ─
+
+/// Write a list of locations as 16-byte LE u32×4 tuples + an all-zero
+/// terminator. Format consumed by wal-g's `ReadLocationsFrom`
+pub fn write_locations_to<W: Write>(mut w: W, locations: &[BlockLocation]) -> io::Result<()> {
+    for loc in locations {
+        w.write_all(&loc.rel.spc_node.to_le_bytes())?;
+        w.write_all(&loc.rel.db_node.to_le_bytes())?;
+        w.write_all(&loc.rel.rel_node.to_le_bytes())?;
+        w.write_all(&loc.block_no.to_le_bytes())?;
+    }
+    w.write_all(&[0u8; 16])?;
+    Ok(())
+}
+
+/// Read locations until the terminal (all-zero) tuple. EOF before terminal
+/// is tolerated (returns what we got) — matches wal-g behavior
+pub fn read_locations_from<R: Read>(mut r: R) -> Result<Vec<BlockLocation>, ReadLocationsError> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 16];
+    loop {
+        match r.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(out),
+            Err(e) => return Err(e.into()),
+        }
+        let loc = BlockLocation::new(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        );
+        if loc.is_terminal() {
+            return Ok(out);
+        }
+        out.push(loc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locations_round_trip() {
+        let locs = vec![
+            BlockLocation::new(1663, 16384, 16385, 7),
+            BlockLocation::new(1664, 1, 2, 0),
+            BlockLocation::new(0, 0, 0, 1),
+        ];
+        let mut buf = Vec::new();
+        write_locations_to(&mut buf, &locs).unwrap();
+        assert_eq!(buf.len(), (locs.len() + 1) * 16);
+        let parsed = read_locations_from(buf.as_slice()).unwrap();
+        assert_eq!(parsed, locs);
+    }
+
+    #[test]
+    fn parser_save_load_empty() {
+        let p = WalParser::new();
+        let mut buf = Vec::new();
+        p.save(&mut buf).unwrap();
+        let p2 = WalParser::load(buf.as_slice()).unwrap();
+        assert!(p2.current_record_data().is_empty());
+        assert!(!p2.has_current_record_beginning());
+    }
+
+    #[test]
+    fn parser_save_with_data_round_trips() {
+        let mut p = WalParser::new();
+        p.set_current_record_data(vec![1, 2, 3, 4, 5]);
+        let mut buf = Vec::new();
+        p.save(&mut buf).unwrap();
+        let p2 = WalParser::load(buf.as_slice()).unwrap();
+        assert_eq!(p2.current_record_data(), &[1u8, 2, 3, 4, 5]);
+        assert!(p2.has_current_record_beginning());
+    }
+
+    #[test]
+    fn cannot_save_tail_without_beginning() {
+        let mut p = WalParser::new();
+        p.current_record_data = vec![1, 2, 3];
+        p.has_current_record_beginning = false;
+        let err = p.save(&mut Vec::new()).unwrap_err();
+        assert!(matches!(err, ParsePageError::CantSavePartialParser));
+    }
+
+    #[test]
+    fn terminator_at_eof_treated_as_terminator() {
+        let buf = [0u8; 16];
+        let parsed = read_locations_from(buf.as_slice()).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn empty_wal_file_yields_no_locations() {
+        let mut p = WalParser::new();
+        let v = extract_locations_from_wal_file(&mut p, std::io::Cursor::new(Vec::new())).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn all_zero_wal_file_yields_no_locations() {
+        // Common end-of-segment shape for .partial files
+        let buf = vec![0u8; (WAL_PAGE_SIZE as usize) * 4];
+        let mut p = WalParser::new();
+        let v = extract_locations_from_wal_file(&mut p, std::io::Cursor::new(buf)).unwrap();
+        assert!(v.is_empty());
+    }
+
+    /// Builds a synthetic 8 KiB WAL page containing one record that references
+    /// two blocks: the first w/ explicit RelFileNode, the second w/ SameRel
+    /// flag. Validates the parser walks the record headers, applies SameRel
+    /// reuse, and surfaces both block locations via extract_block_locations
+    #[test]
+    fn synthetic_page_with_two_blocks_and_same_rel() {
+        use crate::pg::walparser::parse::extract_block_locations;
+        use crate::pg::walparser::types::{
+            BKP_BLOCK_SAME_REL, RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER,
+        };
+
+        // Record body: two block-0 / block-1 headers (no data, no image) and
+        // a 0-byte short main-data marker. Block 0 uses explicit
+        // RelFileNode, block 1 uses SameRel and just emits the block number.
+        let mut body = Vec::new();
+        // block 0 header: id=0, fork=0 (no data, no image), data_length=0,
+        // rel(12), block_no(4) = 4-byte loc
+        body.push(0u8);
+        body.push(0u8); // fork_flags
+        body.extend_from_slice(&0u16.to_le_bytes()); // data_length
+        body.extend_from_slice(&100u32.to_le_bytes()); // spc
+        body.extend_from_slice(&200u32.to_le_bytes()); // db
+        body.extend_from_slice(&300u32.to_le_bytes()); // rel
+        body.extend_from_slice(&7u32.to_le_bytes()); // block_no
+        // block 1 header: id=1, fork=SameRel, data_length=0, just block_no
+        body.push(1u8);
+        body.push(BKP_BLOCK_SAME_REL);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&42u32.to_le_bytes()); // block_no
+        // No main-data marker — main_data_len stays 0 since record header
+        // says total_record_length = 24 + body.len()
+
+        let total = X_LOG_RECORD_HEADER_SIZE + body.len();
+
+        // record header bytes
+        let mut record = Vec::new();
+        record.extend_from_slice(&(total as u32).to_le_bytes());
+        record.extend_from_slice(&0u32.to_le_bytes()); // xact
+        record.extend_from_slice(&0u64.to_le_bytes()); // prev
+        record.push(0u8); // info
+        record.push(RmId::Heap as u8); // rmid
+        record.push(0u8); // pad
+        record.push(0u8); // pad
+        record.extend_from_slice(&0u32.to_le_bytes()); // crc
+        record.extend_from_slice(&body);
+
+        // Build the page: long page header (36 B) + 4 B align padding +
+        // record + zero pad to 8192
+        let mut page = Vec::with_capacity(WAL_PAGE_SIZE as usize);
+        // page header
+        page.extend_from_slice(&0xD117u16.to_le_bytes()); // magic
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes()); // info
+        page.extend_from_slice(&1u32.to_le_bytes()); // timeline
+        page.extend_from_slice(&0u64.to_le_bytes()); // page_address
+        page.extend_from_slice(&0u32.to_le_bytes()); // remaining_data_len
+        // long header trailer
+        page.extend_from_slice(&12345u64.to_le_bytes()); // sysid
+        page.extend_from_slice(&(16u32 * 1024 * 1024).to_le_bytes()); // seg_size
+        page.extend_from_slice(&8192u32.to_le_bytes()); // xlog_block_size
+        // 4 bytes pad to 8-byte alignment (36 → 40)
+        page.extend_from_slice(&[0u8; 4]);
+        // record
+        page.extend_from_slice(&record);
+        // pad up to one full page
+        page.resize(WAL_PAGE_SIZE as usize, 0);
+
+        let mut parser = WalParser::new();
+        let (tail, records) = parser.parse_records_from_page(&page).unwrap();
+        assert!(tail.is_empty(), "no carryover tail expected");
+        assert_eq!(records.len(), 1);
+        let locs = extract_block_locations(&records);
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0], BlockLocation::new(100, 200, 300, 7));
+        assert_eq!(locs[1], BlockLocation::new(100, 200, 300, 42));
+    }
+}

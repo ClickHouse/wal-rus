@@ -26,6 +26,7 @@ fn settings_for(path: &str) -> Settings {
         retry: wal_rs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
+        delta: Default::default(),
     }
 }
 

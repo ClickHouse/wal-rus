@@ -33,6 +33,7 @@ base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "form", "query", "charset", "http2"] }
 hmac = "0.13"
 sha2 = "0.11"
+crc32c = "0.6"
 aws-lc-rs = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tar = "0.4"
