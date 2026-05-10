@@ -20,10 +20,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use postgres_protocol::message::backend::Message;
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::compression::{self, AsyncReader};
 use crate::config::Settings;
+use crate::pg::backup::delta;
 use crate::pg::backup::tar_streamer::{self, StreamerOpts, tablespace_prefix};
 use crate::pg::backup::{
     BACKUP_NAME_PREFIX, BackupSentinelDto, BackupSentinelDtoV2, ExtendedMetadataDto,
@@ -52,10 +54,47 @@ pub struct PushArgs {
     pub no_verify_checksums: bool,
     /// `WALG_TAR_SIZE_THRESHOLD` override (bytes). 0 = use the streamer default
     pub tar_size_threshold: u64,
+    /// `--delta-from-wal-summaries`: build delta map from PG17 walsummarizer
+    /// output, emit native INCREMENTAL files instead of wal-g `wi1` format
+    pub delta_from_wal_summaries: bool,
+    /// `--full`: explicit override to skip delta detection
+    pub full: bool,
 }
 
 pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) -> Result<()> {
     let start_time = chrono::Utc::now();
+
+    // Resolve a delta parent if WALG_DELTA_MAX_STEPS > 0 (or --delta-from-
+    // wal-summaries). The pre-flight runs eagerly so misconfig surfaces.
+    // Streamer-side increment emission is not yet wired (see PHASEC.md /
+    // PHASEC2.md): when a parent is found we log it & fall back to full,
+    // so the sentinel never claims a delta that the bucket can't deliver.
+    //
+    // `--full` short-circuits delta detection entirely (matches wal-g's
+    // `--full` flag). `--delta-from-wal-summaries` is mutually exclusive
+    let parent = if args.full {
+        None
+    } else {
+        delta::configure_delta_parent(&storage, &settings.delta, args.is_permanent).await?
+    };
+    if let Some(p) = parent.as_ref() {
+        let mode = if args.delta_from_wal_summaries {
+            "wal-summaries + PG17 native"
+        } else {
+            "WAL-walk + wi1"
+        };
+        tracing::warn!(
+            target = "backup_push",
+            "delta parent {} resolved (count={}, start_lsn={:X}, mode={mode}) but increment \
+             generation not yet implemented; producing a full backup",
+            p.name,
+            p.increment_count,
+            p.start_lsn,
+        );
+        // TODO(phase-c): pass parent + format flag into streamer
+    }
+    let _drop_parent_for_now: Option<delta::PrevBackupInfo> = None;
+    let _ = _drop_parent_for_now;
 
     let cfg = PgConfig::from_env()?;
     tracing::info!(
@@ -82,6 +121,44 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
             .unwrap_or_default(),
     };
 
+    // `--delta-from-wal-summaries`: server-side preconditions + build the
+    // delta map up front so the BASE_BACKUP can run with a hot map. PG17 +
+    // summarize_wal=on are hard requirements; abort early on either miss
+    if args.delta_from_wal_summaries {
+        if pg_version < 170000 {
+            bail!(
+                "--delta-from-wal-summaries requires PostgreSQL 17 or newer (server reports {pg_version})"
+            );
+        }
+        let on = fetch_setting(&mut conn, "summarize_wal").await?;
+        if on.trim() != "on" {
+            bail!("--delta-from-wal-summaries requires summarize_wal=on on the server");
+        }
+        // TODO(phase-c2): build delta map from pg_wal/summaries & feed it
+        // into the streamer. The upper bound (this backup's start LSN) only
+        // becomes known after BackupEvent::Start fires, so the build either
+        // has to move into the event loop, or wait until START_REPLICATION
+        // returns the start LSN
+        match (parent.as_ref(), args.pgdata.as_ref()) {
+            (None, _) => tracing::info!(
+                target = "backup_push",
+                "no delta parent resolved; --delta-from-wal-summaries will produce a full backup"
+            ),
+            (Some(p), Some(pgdata)) => tracing::info!(
+                target = "backup_push",
+                "would build delta map from {}/pg_wal/summaries for [{:X}, ?) on timeline {}",
+                pgdata.display(),
+                p.start_lsn,
+                p.timeline,
+            ),
+            (Some(_), None) => tracing::warn!(
+                target = "backup_push",
+                "--delta-from-wal-summaries without --pgdata: WAL summaries live on the \
+                 PG host's filesystem, not reachable from a remote pusher; skipping",
+            ),
+        }
+    }
+
     let label = format!("wal-rs {}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
     let opts = BaseBackupOpts {
         label: label.clone(),
@@ -98,6 +175,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     } else {
         args.tar_size_threshold
     };
+    let upload_sem = Arc::new(Semaphore::new(settings.upload_concurrency.max(1)));
 
     let mut start_lsn = None;
     let mut backup_name: Option<String> = None;
@@ -154,6 +232,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                     tee_names,
                     max_tar_size: tar_size,
                     starting_file_no: file_no,
+                    queue_depth: settings.upload_queue,
                 };
                 let archive_label = if is_data_dir {
                     "base.tar".to_string()
@@ -162,36 +241,51 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                 };
                 tracing::info!(
                     target = "backup_push",
-                    "streaming {archive_label} via tarball streamer (threshold={tar_size} bytes)"
+                    "streaming {archive_label} via tarball streamer (threshold={tar_size} bytes, \
+                     upload_concurrency={}, upload_queue={})",
+                    settings.upload_concurrency,
+                    settings.upload_queue,
                 );
                 let (mut parts_rx, streamer_task) = tar_streamer::start(counted, streamer_opts);
 
+                let mut uploads: JoinSet<Result<u64>> = JoinSet::new();
                 while let Some(part_res) = parts_rx.recv().await {
                     let part =
                         part_res.with_context(|| format!("streamer part: {archive_label}"))?;
                     let key = tar_part_key(name, part.file_no, settings.compression.extension());
                     tracing::info!(target = "backup_push", "uploading {key} <- {archive_label}");
-                    let reader: AsyncReader = Box::pin(part.reader);
-                    let compressed = compression::encode(
-                        settings.compression,
-                        reader,
-                        settings.compression_level,
-                    );
-                    let put_counter = Arc::new(AtomicU64::new(0));
-                    let counting = wrap_counted_reader(compressed, put_counter.clone());
-                    let throttled = settings.throttle_network(counting);
-                    storage
-                        .put(&key, throttled, None)
-                        .await
-                        .with_context(|| format!("put {key}"))?;
-                    compressed_size += put_counter.load(Ordering::Relaxed) as i64;
                     file_no = file_no.max(part.file_no);
+
+                    let permit = upload_sem
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("acquire upload permit")?;
+                    let s = storage.clone();
+                    let cfg = settings.clone();
+                    uploads.spawn(async move {
+                        let _permit = permit;
+                        let reader: AsyncReader = Box::pin(part.reader);
+                        let compressed =
+                            compression::encode(cfg.compression, reader, cfg.compression_level);
+                        let counter = Arc::new(AtomicU64::new(0));
+                        let counting = wrap_counted_reader(compressed, counter.clone());
+                        let throttled = cfg.throttle_network(counting);
+                        s.put(&key, throttled, None)
+                            .await
+                            .with_context(|| format!("put {key}"))?;
+                        Ok(counter.load(Ordering::Relaxed))
+                    });
                 }
 
                 let result = streamer_task
                     .await
                     .context("streamer task join")?
                     .with_context(|| format!("streamer task: {archive_label}"))?;
+                while let Some(joined) = uploads.join_next().await {
+                    let bytes = joined.context("upload task join")??;
+                    compressed_size += bytes as i64;
+                }
                 file_no = result.last_file_no;
                 uncompressed_size += counter_handle.bytes() as i64;
                 for (name, meta) in result.files {

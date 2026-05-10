@@ -8,7 +8,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod delta;
 pub mod fetch;
+pub mod increment;
 pub mod list;
 pub mod push;
 pub mod show;

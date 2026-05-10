@@ -14,6 +14,9 @@ pub struct Settings {
     pub compression: compression::Method,
     pub compression_level: i32,
     pub upload_concurrency: usize,
+    /// `WALG_UPLOAD_QUEUE`: buffer between part producer & uploader workers.
+    /// Caps how many parts may sit fully-finalized waiting for an uploader
+    pub upload_queue: usize,
     pub download_concurrency: usize,
     pub prevent_wal_overwrite: bool,
     pub retry: RetryPolicy,
@@ -21,6 +24,21 @@ pub struct Settings {
     pub network_rate_limit: u64,
     /// WALG_DISK_RATE_LIMIT in bytes/sec, 0 = unthrottled
     pub disk_rate_limit: u64,
+    pub delta: DeltaSettings,
+}
+
+/// Delta-backup config: WALG_DELTA_MAX_STEPS / _ORIGIN / _FROM_NAME / _FROM_USER_DATA
+///
+/// `max_steps == 0` means deltas are disabled (default). `from_full=true`
+/// (`WALG_DELTA_ORIGIN=LATEST_FULL`) means delta from the chain's root
+/// full backup, vs `LATEST` (default) which means delta from whichever
+/// backup is most recent — full or delta
+#[derive(Debug, Clone, Default)]
+pub struct DeltaSettings {
+    pub max_steps: u32,
+    pub from_full: bool,
+    pub from_name: Option<String>,
+    pub from_user_data: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,21 +58,25 @@ impl Settings {
         };
         let compression_level = parse_env_int("WALG_COMPRESSION_LEVEL", 3)? as i32;
         let upload_concurrency = parse_env_int("WALG_UPLOAD_CONCURRENCY", 4)?.max(1) as usize;
+        let upload_queue = parse_env_int("WALG_UPLOAD_QUEUE", 2)?.max(1) as usize;
         let download_concurrency = parse_env_int("WALG_DOWNLOAD_CONCURRENCY", 4)?.max(1) as usize;
         let prevent_wal_overwrite = parse_env_bool("WALG_PREVENT_WAL_OVERWRITE", false)?;
         let retry = RetryPolicy::from_env();
         let network_rate_limit = parse_env_int("WALG_NETWORK_RATE_LIMIT", 0)?.max(0) as u64;
         let disk_rate_limit = parse_env_int("WALG_DISK_RATE_LIMIT", 0)?.max(0) as u64;
+        let delta = DeltaSettings::from_env()?;
         Ok(Settings {
             storage,
             compression,
             compression_level,
             upload_concurrency,
+            upload_queue,
             download_concurrency,
             prevent_wal_overwrite,
             retry,
             network_rate_limit,
             disk_rate_limit,
+            delta,
         })
     }
 
@@ -111,6 +133,30 @@ impl Settings {
                 Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
             }
         }
+    }
+}
+
+impl DeltaSettings {
+    pub fn from_env() -> Result<Self> {
+        let max_steps = parse_env_int("WALG_DELTA_MAX_STEPS", 0)?.max(0) as u32;
+        let origin = std::env::var("WALG_DELTA_ORIGIN").ok();
+        let from_full = match origin.as_deref() {
+            None | Some("LATEST") => false,
+            Some("LATEST_FULL") => true,
+            Some(s) => bail!("WALG_DELTA_ORIGIN={s} must be LATEST or LATEST_FULL"),
+        };
+        let from_name = std::env::var("WALG_DELTA_FROM_NAME").ok();
+        let from_user_data = std::env::var("WALG_DELTA_FROM_USER_DATA").ok();
+        Ok(Self {
+            max_steps,
+            from_full,
+            from_name,
+            from_user_data,
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.max_steps > 0
     }
 }
 

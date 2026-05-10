@@ -35,6 +35,7 @@ async fn daemon_check_and_wal_roundtrip() {
         retry: wal_rs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
+        delta: Default::default(),
     };
     let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
 

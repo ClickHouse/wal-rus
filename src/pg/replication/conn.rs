@@ -140,6 +140,15 @@ impl ReplicationConn {
         self.flush().await
     }
 
+    /// Send a CopyData payload (used to deliver standby status updates
+    /// during a START_REPLICATION session)
+    pub async fn send_copy_data(&mut self, payload: &[u8]) -> Result<()> {
+        let msg = frontend::CopyData::new(payload)
+            .map_err(|e| anyhow::anyhow!("copy-data frame: {e}"))?;
+        msg.write(&mut self.tx);
+        self.flush().await
+    }
+
     pub async fn recv_message(&mut self) -> Result<Message> {
         loop {
             if let Some(msg) = Message::parse(&mut self.rx)? {
@@ -163,6 +172,44 @@ impl ReplicationConn {
                 bail!("postgres connection closed unexpectedly");
             }
         }
+    }
+
+    /// Pre-parse `CopyBothResponse` ('W') — sent by START_REPLICATION but not
+    /// recognized by postgres-protocol's `Message::parse`. Drains the message
+    /// from the read buffer & returns Ok; if the next message is anything
+    /// else, defers to `recv_message` so callers see a typed error/event
+    pub async fn expect_copy_both_open(&mut self) -> Result<()> {
+        // Ensure at least 5 bytes (1 tag + 4 length) in rx
+        while self.rx.len() < 5 {
+            let n = self.socket.read_buf(&mut self.rx).await?;
+            if n == 0 {
+                bail!("postgres connection closed during START_REPLICATION");
+            }
+        }
+        if self.rx[0] != b'W' {
+            // Delegate to the normal parser for non-W tags (ErrorResponse,
+            // ParameterStatus, NoticeResponse, etc.)
+            let msg = self.recv_message().await?;
+            return match msg {
+                Message::CopyOutResponse(_) => Ok(()),
+                Message::ErrorResponse(e) => bail!("START_REPLICATION: {}", error_message(&e)),
+                other => bail!(
+                    "START_REPLICATION: unexpected message {:?}",
+                    message_kind(&other)
+                ),
+            };
+        }
+        // 'W' CopyBothResponse: tag(1) + len(4) + format(1) + ncols(2) + ncols*i16
+        let len = u32::from_be_bytes(self.rx[1..5].try_into().unwrap()) as usize;
+        let total = 1 + len;
+        while self.rx.len() < total {
+            let n = self.socket.read_buf(&mut self.rx).await?;
+            if n == 0 {
+                bail!("postgres connection closed inside CopyBothResponse");
+            }
+        }
+        let _ = self.rx.split_to(total);
+        Ok(())
     }
 
     pub fn server_pg_version(&self) -> i32 {

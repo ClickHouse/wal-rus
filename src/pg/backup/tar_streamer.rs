@@ -46,6 +46,10 @@ pub struct StreamerOpts {
     pub max_tar_size: u64,
     /// Numbering continues from here (1-based; first part = starting_file_no + 1)
     pub starting_file_no: u32,
+    /// Buffer depth for the parts channel between this streamer and its
+    /// consumer. Equivalent to wal-g's `WALG_UPLOAD_QUEUE` once the
+    /// consumer spawns concurrent upload workers
+    pub queue_depth: usize,
 }
 
 impl Default for StreamerOpts {
@@ -55,6 +59,7 @@ impl Default for StreamerOpts {
             tee_names: Vec::new(),
             max_tar_size: DEFAULT_TAR_SIZE_THRESHOLD,
             starting_file_no: 0,
+            queue_depth: 1,
         }
     }
 }
@@ -99,7 +104,7 @@ pub fn start<R>(
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
-    let (parts_tx, parts_rx) = mpsc::channel::<Result<Part>>(1);
+    let (parts_tx, parts_rx) = mpsc::channel::<Result<Part>>(opts.queue_depth.max(1));
     let handle = tokio::task::spawn_blocking(move || -> Result<StreamerResult> {
         let sync_input = SyncIoBridge::new(input);
         run_blocking(sync_input, opts, parts_tx)

@@ -1,3 +1,8 @@
 pub mod fetch;
+pub mod prefetch;
 pub mod push;
+pub mod receive;
+pub mod restore;
 pub mod segment;
+pub mod show;
+pub mod verify;
