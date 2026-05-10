@@ -1,0 +1,175 @@
+//! CLI surface mirroring wal-g pg subcommands; only wired ones do real work
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use crate::config::Settings;
+use crate::pg::backup;
+use crate::pg::wal;
+
+#[derive(Parser, Debug)]
+#[command(name = "wal-rs", version, about = "Rust port of wal-g for PostgreSQL")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Cmd {
+    /// Upload WAL segment to storage
+    WalPush { wal_filepath: PathBuf },
+    /// Download WAL segment from storage to dst path
+    WalFetch { name: String, dst: PathBuf },
+    /// List backups under basebackups_005/
+    BackupList {
+        /// Print summaries as JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a base backup to a directory
+    BackupFetch {
+        /// Backup name, or LATEST
+        name: String,
+        /// Destination directory (created if missing)
+        dst: PathBuf,
+    },
+    /// Take a streaming base backup via the replication BASE_BACKUP protocol
+    ///
+    /// Uses libpq env vars (PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE).
+    /// Without --pgdata, the sentinel records the server-reported data_directory.
+    BackupPush {
+        /// Optional path to local PostgreSQL data directory (sentinel only)
+        #[arg(long)]
+        pgdata: Option<PathBuf>,
+        /// Mark this backup as permanent
+        #[arg(long)]
+        permanent: bool,
+        /// Optional JSON object stored under sentinel.UserData
+        #[arg(long)]
+        user_data: Option<String>,
+        /// Use CHECKPOINT 'fast' (default: spread)
+        #[arg(long, default_value_t = true)]
+        fast: bool,
+        /// Pass NOVERIFY_CHECKSUMS / VERIFY_CHECKSUMS false to BASE_BACKUP
+        #[arg(long)]
+        no_verify_checksums: bool,
+        /// Override `WALG_TAR_SIZE_THRESHOLD` (bytes); 0 = default 1 GiB
+        #[arg(long, default_value_t = 0u64, env = "WALG_TAR_SIZE_THRESHOLD")]
+        tar_size_threshold: u64,
+    },
+    /// Show sentinel + files_metadata summary for one backup
+    BackupShow {
+        /// Backup name, or LATEST
+        name: String,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark or unmark a backup as permanent (flips sentinel.IsPermanent)
+    BackupMark {
+        /// Backup name, or LATEST
+        name: String,
+        /// Set IsPermanent=false
+        #[arg(long)]
+        impermanent: bool,
+    },
+    /// Run as a long-lived daemon over a unix socket
+    Daemon {
+        #[arg(long)]
+        socket: PathBuf,
+    },
+    /// Send a single command to the daemon
+    DaemonClient {
+        #[arg(long)]
+        socket: PathBuf,
+        #[command(subcommand)]
+        op: DaemonOp,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonOp {
+    Check,
+    WalPush { wal_filepath: PathBuf },
+    WalFetch { name: String, dst: PathBuf },
+}
+
+impl Cli {
+    pub async fn run(self) -> Result<()> {
+        match self.cmd {
+            Cmd::WalPush { wal_filepath } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                wal::push::handle(&s, storage, &wal_filepath).await
+            }
+            Cmd::WalFetch { name, dst } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                wal::fetch::handle(&s, storage, &name, &dst).await
+            }
+            Cmd::BackupList { json } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                let format = if json {
+                    backup::list::Format::Json
+                } else {
+                    backup::list::Format::Plain
+                };
+                backup::list::handle(storage, format).await
+            }
+            Cmd::BackupFetch { name, dst } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                backup::fetch::handle(&s, storage, &name, &dst).await
+            }
+            Cmd::BackupPush {
+                pgdata,
+                permanent,
+                user_data,
+                fast,
+                no_verify_checksums,
+                tar_size_threshold,
+            } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                let user_data = user_data
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("--user-data is not valid JSON: {e}"))?;
+                let args = backup::push::PushArgs {
+                    pgdata,
+                    is_permanent: permanent,
+                    user_data,
+                    fast_checkpoint: fast,
+                    no_verify_checksums,
+                    tar_size_threshold,
+                };
+                backup::push::handle(&s, storage, args).await
+            }
+            Cmd::BackupShow { name, json } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                let format = if json {
+                    backup::show::Format::Json
+                } else {
+                    backup::show::Format::Plain
+                };
+                backup::show::show(storage, &name, format).await
+            }
+            Cmd::BackupMark { name, impermanent } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                backup::show::mark(storage, &name, !impermanent).await
+            }
+            Cmd::Daemon { socket } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                crate::daemon::serve(&socket, s, storage).await
+            }
+            Cmd::DaemonClient { socket, op } => crate::daemon::client::run(&socket, op).await,
+        }
+    }
+}

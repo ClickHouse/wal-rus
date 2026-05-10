@@ -1,0 +1,109 @@
+name: pg-compat
+
+# Integration tests adapted from wal-g's docker/pg_tests test scripts. Verifies
+# wal-rs against a real PostgreSQL cluster on the fs storage backend, plus
+# bidirectional bucket interop with an installed wal-g binary (forward:
+# wal-rs writes & wal-g reads, reverse: wal-g writes & wal-rs reads).
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned wal-g release; bump deliberately so a wal-g change can't silently
+  # break the cross-tool gate. Release artifacts live at
+  # https://github.com/wal-g/wal-g/releases
+  WALG_VERSION: v3.0.8
+  WALG_ASSET: wal-g-pg-ubuntu-22.04-amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --bin wal-rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wal-rs-bin
+          path: target/release/wal-rs
+          if-no-files-found: error
+          retention-days: 7
+
+  pg:
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [13, 14, 15, 16, 17]
+        test:
+          - full_backup
+          - backup_mark
+          - backup_show
+          - wal_overwrite
+          - daemon
+          - cross_tool_forward
+          - cross_tool_reverse
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch wal-rs binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wal-rs-bin
+          path: bin
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          set -eux
+          # Ubuntu runners ship PG 14; mask the default cluster and bring in
+          # PGDG packages for the matrix version.
+          sudo systemctl disable --now postgresql || true
+          sudo apt-get purge -y 'postgresql*' || true
+          sudo install -d /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg
+          codename=$(lsb_release -cs)
+          echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $codename-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} postgresql-client-${{ matrix.pg }} postgresql-contrib-${{ matrix.pg }}
+          # Stop auto-started cluster; tests bring up their own
+          sudo pg_ctlcluster ${{ matrix.pg }} main stop || true
+          sudo pg_dropcluster --stop ${{ matrix.pg }} main || true
+
+      - name: Install wal-g ${{ env.WALG_VERSION }}
+        if: ${{ startsWith(matrix.test, 'cross_tool') }}
+        run: |
+          set -eux
+          url="https://github.com/wal-g/wal-g/releases/download/${WALG_VERSION}/${WALG_ASSET}.tar.gz"
+          curl -fsSL -o /tmp/wal-g.tar.gz "$url"
+          tar -C /tmp -xzf /tmp/wal-g.tar.gz
+          sudo install -m 0755 "/tmp/${WALG_ASSET}" /usr/local/bin/wal-g
+          wal-g --version
+
+      - name: Run ${{ matrix.test }}
+        env:
+          PG_VERSION: ${{ matrix.pg }}
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
+          WALG_BIN: /usr/local/bin/wal-g
+        run: scripts/ci/${{ matrix.test }}.sh
+
+      - name: Collect PG logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-pg${{ matrix.pg }}-${{ matrix.test }}
+          path: |
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
+          if-no-files-found: ignore
+          retention-days: 14
