@@ -154,9 +154,9 @@ fn run_blocking<R: Read>(
         }
         let ctx = current.as_mut().unwrap();
 
+        // append_data handles path encoding (auto-emits GNU LongLink for
+        // > 100 char paths) and cksum, so no set_path here
         let mut new_hdr = header.clone();
-        new_hdr.set_path(&mapped).context("set entry path")?;
-        new_hdr.set_cksum();
 
         // Decide whether to tee this entry
         let tee_match =
@@ -167,18 +167,16 @@ fn run_blocking<R: Read>(
             let mut buf = Vec::with_capacity(entry_size as usize);
             entry.read_to_end(&mut buf).context("read tee entry")?;
             ctx.builder
-                .append(&new_hdr, std::io::Cursor::new(&buf))
+                .append_data(&mut new_hdr, &mapped, std::io::Cursor::new(&buf))
                 .context("append to current part")?;
-            let mut tee_hdr = header.clone();
-            tee_hdr.set_path(&mapped).context("set tee path")?;
-            tee_hdr.set_cksum();
             if let Some(tb) = tee_builder.as_mut() {
-                tb.append(&tee_hdr, std::io::Cursor::new(&buf))
+                let mut tee_hdr = header.clone();
+                tb.append_data(&mut tee_hdr, &mapped, std::io::Cursor::new(&buf))
                     .context("append to tee tar")?;
             }
         } else {
             ctx.builder
-                .append(&new_hdr, &mut entry)
+                .append_data(&mut new_hdr, &mapped, &mut entry)
                 .context("append to current part")?;
         }
 
@@ -495,6 +493,129 @@ mod tests {
         let tee = res.tee_bytes.expect("tee tar bytes");
         let tee_names: Vec<_> = list_entries(&tee).into_iter().map(|(n, _)| n).collect();
         assert_eq!(tee_names, vec!["global/pg_control".to_string()]);
+    }
+
+    /// PG basebackup tars carry paths > 100 chars (long table/relation names,
+    /// nested tablespace dirs) which require GNU LongLink emission. Confirms
+    /// the streamer reads them in (Archive auto-resolves LongLink) and writes
+    /// them out with prefix prepended, surviving a round-trip read.
+    #[tokio::test]
+    async fn long_path_roundtrip_with_prefix() {
+        // 180-char path in the input — well past ustar's 100-byte name limit
+        let long_segment = "a".repeat(120);
+        let long_path = format!("base/16384/{long_segment}");
+        assert!(long_path.len() > 100);
+
+        let mut input = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut input);
+            // append_data emits LongLink ('L') automatically for > 100 char paths
+            b.append_data(
+                &mut {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(4);
+                    h.set_mode(0o644);
+                    h.set_mtime(1_700_000_000);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h
+                },
+                &long_path,
+                &b"DATA"[..],
+            )
+            .unwrap();
+            b.finish().unwrap();
+        }
+
+        let prefix = tablespace_prefix(16385);
+        let (rx, h) = start(
+            std::io::Cursor::new(input),
+            StreamerOpts {
+                prefix: Some(prefix.clone()),
+                max_tar_size: 10 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        let parts = collect_parts(rx).await;
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(parts.len(), 1);
+
+        let listed = list_entries(&parts[0].1);
+        let want = format!("{prefix}{long_path}");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].0, want, "remapped path lost on long-name path");
+        assert_eq!(listed[0].1, 4);
+        assert!(res.files.contains_key(&want), "files map: {:?}", res.files);
+    }
+
+    /// PG basebackup occasionally embeds pax extended headers (utf-8 names,
+    /// large mtime resolutions). Verify the streamer reads through pax and
+    /// writes the correct effective path on output.
+    #[tokio::test]
+    async fn pax_extended_header_roundtrip() {
+        // Hand-craft an input tar with a pax 'x' extended-header entry that
+        // overrides the 'path' attribute, followed by the actual file entry
+        // with a placeholder short name. Mirrors what GNU tar emits when
+        // configured with --format=pax.
+        let real_path = "base/16384/very/deeply/nested/dir/relation_with_a_truly_overlong_name_of_more_than_one_hundred_and_twenty_chars_xxxxxx";
+        assert!(real_path.len() > 100);
+
+        // pax record: "<len> path=<real_path>\n" where <len> includes itself
+        let mut len = real_path.len() + " path=\n".len();
+        let mut digits = format!("{len}").len();
+        loop {
+            let cand = len + digits;
+            if format!("{cand}").len() == digits {
+                len = cand;
+                break;
+            }
+            digits += 1;
+        }
+        let pax_record = format!("{len} path={real_path}\n");
+        assert_eq!(pax_record.len(), len);
+
+        let mut input = Vec::new();
+        {
+            let mut pax_hdr = tar::Header::new_ustar();
+            pax_hdr.set_path("PaxHeader/dummy").unwrap();
+            pax_hdr.set_size(pax_record.len() as u64);
+            pax_hdr.set_mode(0o644);
+            pax_hdr.set_mtime(1_700_000_000);
+            pax_hdr.set_entry_type(tar::EntryType::XHeader);
+            pax_hdr.set_cksum();
+
+            let mut data_hdr = tar::Header::new_ustar();
+            data_hdr.set_path("placeholder.short").unwrap();
+            data_hdr.set_size(4);
+            data_hdr.set_mode(0o644);
+            data_hdr.set_mtime(1_700_000_000);
+            data_hdr.set_entry_type(tar::EntryType::Regular);
+            data_hdr.set_cksum();
+
+            let mut b = tar::Builder::new(&mut input);
+            b.append(&pax_hdr, pax_record.as_bytes()).unwrap();
+            b.append(&data_hdr, &b"DATA"[..]).unwrap();
+            b.finish().unwrap();
+        }
+
+        let (rx, h) = start(
+            std::io::Cursor::new(input),
+            StreamerOpts {
+                max_tar_size: 10 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        let parts = collect_parts(rx).await;
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(parts.len(), 1);
+
+        let listed = list_entries(&parts[0].1);
+        // Effective path (resolved from pax) must survive to the output
+        let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&real_path),
+            "pax-overridden path missing in output: {names:?}"
+        );
+        assert!(res.files.contains_key(real_path), "{:?}", res.files);
     }
 
     #[tokio::test]

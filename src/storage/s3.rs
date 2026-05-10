@@ -20,6 +20,7 @@ use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 
 use super::{AsyncReader, ObjectMeta, ObjectStream, Result, Storage, StorageError};
+use crate::retry::{RetryPolicy, with_retry};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -58,17 +59,27 @@ pub struct S3Storage {
     cfg: S3Config,
     client: Client,
     base: String,
+    retry_policy: RetryPolicy,
 }
 
 impl S3Storage {
     pub fn new(cfg: S3Config) -> Result<Self> {
+        Self::with_retry_policy(cfg, RetryPolicy::default())
+    }
+
+    pub fn with_retry_policy(cfg: S3Config, retry_policy: RetryPolicy) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| StorageError::Config(e.to_string()))?;
         let base = build_base_url(&cfg);
-        Ok(Self { cfg, client, base })
+        Ok(Self {
+            cfg,
+            client,
+            base,
+            retry_policy,
+        })
     }
 
     fn full_key(&self, key: &str) -> String {
@@ -237,39 +248,40 @@ impl S3Storage {
             let part_no_str = part_no.to_string();
             let chunk = Bytes::copy_from_slice(&buf[..filled]);
 
-            let resp = self
-                .signed_request(
-                    "PUT",
-                    &self.full_key(key),
-                    &[
-                        ("partNumber", part_no_str.as_str()),
-                        ("uploadId", upload_id.as_str()),
-                    ],
-                    chunk,
-                    &[],
-                )
-                .await;
+            // Per-part retry: chunk is already buffered, so transient failures
+            // (5xx, transport) replay the same body without re-reading source
+            let key_full = self.full_key(key);
+            let result = with_retry(&self.retry_policy, StorageError::is_transient, || async {
+                let resp = self
+                    .signed_request(
+                        "PUT",
+                        &key_full,
+                        &[
+                            ("partNumber", part_no_str.as_str()),
+                            ("uploadId", upload_id.as_str()),
+                        ],
+                        chunk.clone(),
+                        &[],
+                    )
+                    .await?;
+                let resp = check_status(resp).await?;
+                let etag = resp
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| StorageError::InvalidResponse("missing ETag".into()))?
+                    .to_string();
+                Ok::<String, StorageError>(etag)
+            })
+            .await;
 
-            let resp = match resp {
-                Ok(r) => r,
+            let etag = match result {
+                Ok(e) => e,
                 Err(e) => {
                     let _ = self.abort_multipart(key, &upload_id).await;
                     return Err(e);
                 }
             };
-            let resp = match check_status(resp).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = self.abort_multipart(key, &upload_id).await;
-                    return Err(e);
-                }
-            };
-            let etag = resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| StorageError::InvalidResponse("missing ETag".into()))?
-                .to_string();
             parts.push((part_no, etag));
 
             if filled < PART_SIZE {
@@ -387,15 +399,17 @@ impl Storage for S3Storage {
         let cfg = self.cfg.clone();
         let client = self.client.clone();
         let base = self.base.clone();
+        let retry_policy = self.retry_policy;
 
         let s = stream::unfold(
             (Some(String::new()), full_prefix, cfg, client, base),
-            |(token, prefix, cfg, client, base)| async move {
+            move |(token, prefix, cfg, client, base)| async move {
                 let token = token?;
                 let s = S3Storage {
                     cfg: cfg.clone(),
                     client: client.clone(),
                     base: base.clone(),
+                    retry_policy,
                 };
                 let mut q: Vec<(&str, &str)> =
                     vec![("list-type", "2"), ("prefix", prefix.as_str())];

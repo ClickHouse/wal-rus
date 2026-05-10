@@ -97,7 +97,8 @@ impl Settings {
                 Ok(Arc::new(s) as Arc<dyn Storage>)
             }
             StorageSettings::S3(c) => {
-                let s = s3::S3Storage::new(c.clone()).context("init s3 storage")?;
+                let s = s3::S3Storage::with_retry_policy(c.clone(), policy)
+                    .context("init s3 storage")?;
                 Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
             }
             StorageSettings::Gcs(c) => {

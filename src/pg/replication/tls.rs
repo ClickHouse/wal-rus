@@ -9,6 +9,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use rustls::CertificateError;
+use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
@@ -131,15 +133,17 @@ fn build_client_config(sslmode: SslMode) -> Result<ClientConfig> {
         } else {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
-        let cfg = builder.with_root_certificates(roots).with_no_client_auth();
         if sslmode.verifies_hostname() {
-            cfg
+            builder.with_root_certificates(roots).with_no_client_auth()
         } else {
-            // verify-ca: cert path validation, but skip hostname check
-            let mut cfg = cfg;
-            cfg.dangerous()
-                .set_certificate_verifier(Arc::new(SkipHostnameVerifier));
-            cfg
+            // verify-ca: full path validation, only the hostname check is suppressed
+            let inner = WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| anyhow!("build verify-ca verifier: {e}"))?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(SkipHostnameVerifier { inner }))
+                .with_no_client_auth()
         }
     } else {
         // prefer / require / allow: opportunistic encryption, no cert verification
@@ -215,42 +219,52 @@ impl ServerCertVerifier for NoVerifier {
     }
 }
 
-/// Verifies cert path against roots, but skips hostname check (sslmode=verify-ca)
+/// sslmode=verify-ca: delegate full path validation to webpki, suppress only
+/// the hostname/SNI mismatch error so a cert valid against the configured
+/// roots is accepted regardless of CN/SAN
 #[derive(Debug)]
-struct SkipHostnameVerifier;
+struct SkipHostnameVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+}
 
 impl ServerCertVerifier for SkipHostnameVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        // PG verify-ca semantics: ignore hostname mismatch only. Full cert path
-        // validation is currently dropped here for simplicity; pin to rustls's
-        // built-in verifier once we wire root store + revocation properly
-        Ok(ServerCertVerified::assertion())
+        match self
+            .inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+        {
+            Ok(v) => Ok(v),
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
+            Err(e) => Err(e),
+        }
     }
     fn verify_tls12_signature(
         &self,
-        _m: &[u8],
-        _c: &CertificateDer<'_>,
-        _d: &DigitallySignedStruct,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.inner.verify_tls12_signature(m, c, d)
     }
     fn verify_tls13_signature(
         &self,
-        _m: &[u8],
-        _c: &CertificateDer<'_>,
-        _d: &DigitallySignedStruct,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.inner.verify_tls13_signature(m, c, d)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        NoVerifier.supported_verify_schemes()
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -279,6 +293,26 @@ mod tests {
         ] {
             build_client_config(m).unwrap();
         }
+    }
+
+    /// verify-ca must reject malformed / unsigned certs (path validation)
+    /// and only suppress the hostname mismatch.
+    #[test]
+    fn verify_ca_rejects_bogus_cert() {
+        // Run only after the aws-lc-rs provider is installed by build_client_config above
+        let _ = build_client_config(SslMode::VerifyCa).unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let inner = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let v = SkipHostnameVerifier { inner };
+
+        let bogus = CertificateDer::from(vec![0u8; 64]);
+        let name = ServerName::try_from("example.com").unwrap();
+        let res = v.verify_server_cert(&bogus, &[], &name, &[], UnixTime::now());
+        assert!(res.is_err(), "garbage cert must not pass verify-ca");
     }
 
     #[tokio::test]

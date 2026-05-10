@@ -2,6 +2,10 @@
 //!
 //! Auth supports trust, cleartext password, and SCRAM-SHA-256. MD5 password
 //! is rejected (deprecated; modern PG defaults to SCRAM)
+//!
+//! Transport: TCP by default; if PGHOST begins with `/` it's interpreted as a
+//! libpq-style Unix socket directory & we connect to `<host>/.s.PGSQL.<port>`.
+//! TLS negotiation is skipped on Unix sockets to mirror libpq
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
@@ -9,7 +13,7 @@ use postgres_protocol::authentication::sasl::{ChannelBinding, SCRAM_SHA_256, Scr
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 
 use super::tls::{SocketStream, SslMode, maybe_upgrade};
 
@@ -72,18 +76,28 @@ impl ReplicationConn {
     }
 
     pub async fn connect(cfg: &PgConfig) -> Result<Self> {
-        let addr = format!("{}:{}", cfg.host, cfg.port);
-        let raw = TcpStream::connect(&addr)
-            .await
-            .with_context(|| format!("connect to {addr}"))?;
-        let (socket, tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode)
-            .await
-            .with_context(|| format!("tls negotiation against {addr}"))?;
-        if tls {
-            tracing::debug!(host = %cfg.host, "tls established for replication socket");
-        } else if cfg.sslmode != SslMode::Disable {
-            tracing::debug!(host = %cfg.host, "replication socket continued unencrypted");
-        }
+        let (socket, tls): (Box<dyn SocketStream>, bool) = if cfg.host.starts_with('/') {
+            let path = format!("{}/.s.PGSQL.{}", cfg.host.trim_end_matches('/'), cfg.port);
+            let sock = UnixStream::connect(&path)
+                .await
+                .with_context(|| format!("connect to unix:{path}"))?;
+            tracing::debug!(path = %path, "replication socket via unix domain");
+            (Box::new(sock), false)
+        } else {
+            let addr = format!("{}:{}", cfg.host, cfg.port);
+            let raw = TcpStream::connect(&addr)
+                .await
+                .with_context(|| format!("connect to {addr}"))?;
+            let (sock, used_tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode)
+                .await
+                .with_context(|| format!("tls negotiation against {addr}"))?;
+            if used_tls {
+                tracing::debug!(host = %cfg.host, "tls established for replication socket");
+            } else if cfg.sslmode != SslMode::Disable {
+                tracing::debug!(host = %cfg.host, "replication socket continued unencrypted");
+            }
+            (sock, used_tls)
+        };
         let mut conn = ReplicationConn {
             socket,
             rx: BytesMut::with_capacity(64 * 1024),
@@ -308,5 +322,27 @@ mod tests {
         assert_eq!(parse_server_version("18"), Some(180000));
         assert_eq!(parse_server_version("17beta1"), Some(170000));
         assert_eq!(parse_server_version("9.6.24"), Some(90624));
+    }
+
+    #[tokio::test]
+    async fn unix_socket_host_dispatches_to_unix_transport() {
+        // PGHOST starting with `/` routes through UnixStream::connect against
+        // <host>/.s.PGSQL.<port>. With a bogus directory, connect must fail
+        // with the unix-prefixed context (proves dispatch, no TCP attempt)
+        let cfg = PgConfig {
+            host: "/nonexistent/wal-rs-unix-test".into(),
+            port: 5432,
+            user: "u".into(),
+            password: None,
+            database: "u".into(),
+            application_name: "wal-rs-test".into(),
+            sslmode: SslMode::Prefer,
+        };
+        let err = ReplicationConn::connect(&cfg).await.err().unwrap();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("unix:"),
+            "expected unix-socket context, got: {s}"
+        );
     }
 }
