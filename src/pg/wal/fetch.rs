@@ -27,6 +27,9 @@ pub async fn handle(
     dst: &Path,
 ) -> Result<()> {
     let history = is_history_filename(name);
+    if !history && try_promote_prefetched(name, dst).await? {
+        return Ok(());
+    }
     let preferred = if history {
         compression::Method::None
     } else {
@@ -100,4 +103,35 @@ fn tmp_path(dst: &Path) -> PathBuf {
     let mut s = dst.as_os_str().to_owned();
     s.push(format!(".tmp.{}", std::process::id()));
     PathBuf::from(s)
+}
+
+/// When dst's parent looks like a pg_wal directory, check the wal-g prefetch
+/// area for a ready segment & promote via rename. Best-effort — any failure
+/// (or missing prefetch dir) falls through to the storage path
+async fn try_promote_prefetched(name: &str, dst: &Path) -> Result<bool> {
+    let Some(parent) = dst.parent() else {
+        return Ok(false);
+    };
+    let staged = super::prefetch::prefetched_path(parent, name);
+    match fs::metadata(&staged).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    if let Some(p) = dst.parent() {
+        fs::create_dir_all(p).await.ok();
+    }
+    fs::rename(&staged, dst).await.with_context(|| {
+        format!(
+            "promote prefetched {} -> {}",
+            staged.display(),
+            dst.display()
+        )
+    })?;
+    tracing::info!(
+        target = "wal_fetch",
+        "promoted prefetched {name} -> {}",
+        dst.display()
+    );
+    Ok(true)
 }

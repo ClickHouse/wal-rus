@@ -22,6 +22,44 @@ pub enum Cmd {
     WalPush { wal_filepath: PathBuf },
     /// Download WAL segment from storage to dst path
     WalFetch { name: String, dst: PathBuf },
+    /// Pre-stage upcoming WAL segments into <pg_wal>/.wal-g/prefetch so
+    /// subsequent `wal-fetch` calls promote by rename
+    WalPrefetch {
+        /// Segment name to walk forward from (downloads next `--count` segments)
+        seed: String,
+        /// Path to PostgreSQL `pg_wal` directory
+        pg_wal: PathBuf,
+        /// Number of segments to prefetch
+        #[arg(long, default_value_t = 8)]
+        count: u32,
+    },
+    /// Print archived timelines, segment ranges, gaps, & known backups
+    WalShow {
+        /// Output JSON instead of the human-readable table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify continuity & timeline alignment for archived WAL
+    WalVerify {
+        #[command(subcommand)]
+        op: WalVerifyOp,
+    },
+    /// Inverse of `wal-show` gaps: fetch missing segments into a local dir
+    WalRestore {
+        /// Destination directory for restored segments
+        dst: PathBuf,
+        /// Restrict restore to a single timeline (defaults to every timeline
+        /// that has at least one archived segment)
+        #[arg(long)]
+        timeline: Option<u32>,
+    },
+    /// Long-running START_REPLICATION consumer that archives segments
+    /// directly (alternative to archive_command)
+    WalReceive {
+        /// Directory used to assemble segments mid-flight; each completed
+        /// segment is shipped via the regular wal-push pipeline
+        archive_dir: PathBuf,
+    },
     /// List backups under basebackups_005/
     BackupList {
         /// Print summaries as JSON instead of a table
@@ -104,6 +142,26 @@ pub enum DaemonOp {
     WalFetch { name: String, dst: PathBuf },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum WalVerifyOp {
+    /// Latest backup's start LSN forward through the freshest archived
+    /// segment must contain no gaps
+    Integrity {
+        #[arg(long)]
+        json: bool,
+    },
+    /// HEAD timeline (latest archived) must match the latest backup's timeline
+    Timeline {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run every check
+    All {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 impl Cli {
     pub async fn run(self) -> Result<()> {
         match self.cmd {
@@ -116,6 +174,40 @@ impl Cli {
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
                 wal::fetch::handle(&s, storage, &name, &dst).await
+            }
+            Cmd::WalPrefetch {
+                seed,
+                pg_wal,
+                count,
+            } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                wal::prefetch::handle(&s, storage, &seed, &pg_wal, count).await
+            }
+            Cmd::WalShow { json } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                let format = if json {
+                    wal::show::Format::Json
+                } else {
+                    wal::show::Format::Plain
+                };
+                wal::show::handle(storage, format).await
+            }
+            Cmd::WalVerify { op } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                wal::verify::run(storage, op).await
+            }
+            Cmd::WalRestore { dst, timeline } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                wal::restore::handle(&s, storage, &dst, timeline).await
+            }
+            Cmd::WalReceive { archive_dir } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                wal::receive::handle(&s, storage, &archive_dir).await
             }
             Cmd::BackupList { json } => {
                 let s = Settings::from_env()?;

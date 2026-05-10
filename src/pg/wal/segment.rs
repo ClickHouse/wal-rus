@@ -11,8 +11,10 @@ use thiserror::Error;
 pub const DEFAULT_WAL_SEG_SIZE: u64 = 16 * 1024 * 1024;
 pub const SEGMENT_NAME_LEN: usize = 24;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentName {
+    // Order matters: timeline → log_id → seg_no so a sorted iteration matches
+    // PG's natural archive order (timeline boundaries split a chain)
     pub timeline: u32,
     pub log_id: u32,
     pub seg_no: u32,
@@ -54,6 +56,26 @@ impl SegmentName {
     /// Starting LSN of the segment given seg size in bytes
     pub fn start_lsn(&self, seg_size: u64) -> u64 {
         ((self.log_id as u64) << 32) | (self.seg_no as u64).wrapping_mul(seg_size)
+    }
+
+    /// Successor segment on the same timeline (rolls log_id when seg_no caps)
+    pub fn next(&self, seg_size: u64) -> Self {
+        debug_assert!(seg_size > 0 && seg_size.is_power_of_two());
+        let xlog_segs_per_xlog_id = (0x1_0000_0000u64 / seg_size) as u32;
+        let next_seg = self.seg_no + 1;
+        if next_seg >= xlog_segs_per_xlog_id {
+            SegmentName {
+                timeline: self.timeline,
+                log_id: self.log_id + 1,
+                seg_no: 0,
+            }
+        } else {
+            SegmentName {
+                timeline: self.timeline,
+                log_id: self.log_id,
+                seg_no: next_seg,
+            }
+        }
     }
 }
 
@@ -110,5 +132,20 @@ mod tests {
         assert!(!is_wal_filename("000000010000000000000001.partial"));
         assert!(is_history_filename("00000002.history"));
         assert!(!is_history_filename("readme.history"));
+    }
+
+    #[test]
+    fn next_segment_increments_seg_no() {
+        let s = SegmentName::parse("000000010000000000000005").unwrap();
+        let n = s.next(DEFAULT_WAL_SEG_SIZE);
+        assert_eq!(n.format(), "000000010000000000000006");
+    }
+
+    #[test]
+    fn next_segment_rolls_log_id() {
+        // 16 MiB segs: 256 per log_id, max seg_no = 0xFF
+        let s = SegmentName::parse("0000000100000007000000FF").unwrap();
+        let n = s.next(DEFAULT_WAL_SEG_SIZE);
+        assert_eq!(n.format(), "000000010000000800000000");
     }
 }

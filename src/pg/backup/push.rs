@@ -20,7 +20,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use postgres_protocol::message::backend::Message;
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::compression::{self, AsyncReader};
 use crate::config::Settings;
@@ -174,6 +175,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     } else {
         args.tar_size_threshold
     };
+    let upload_sem = Arc::new(Semaphore::new(settings.upload_concurrency.max(1)));
 
     let mut start_lsn = None;
     let mut backup_name: Option<String> = None;
@@ -230,6 +232,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                     tee_names,
                     max_tar_size: tar_size,
                     starting_file_no: file_no,
+                    queue_depth: settings.upload_queue,
                 };
                 let archive_label = if is_data_dir {
                     "base.tar".to_string()
@@ -238,36 +241,51 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                 };
                 tracing::info!(
                     target = "backup_push",
-                    "streaming {archive_label} via tarball streamer (threshold={tar_size} bytes)"
+                    "streaming {archive_label} via tarball streamer (threshold={tar_size} bytes, \
+                     upload_concurrency={}, upload_queue={})",
+                    settings.upload_concurrency,
+                    settings.upload_queue,
                 );
                 let (mut parts_rx, streamer_task) = tar_streamer::start(counted, streamer_opts);
 
+                let mut uploads: JoinSet<Result<u64>> = JoinSet::new();
                 while let Some(part_res) = parts_rx.recv().await {
                     let part =
                         part_res.with_context(|| format!("streamer part: {archive_label}"))?;
                     let key = tar_part_key(name, part.file_no, settings.compression.extension());
                     tracing::info!(target = "backup_push", "uploading {key} <- {archive_label}");
-                    let reader: AsyncReader = Box::pin(part.reader);
-                    let compressed = compression::encode(
-                        settings.compression,
-                        reader,
-                        settings.compression_level,
-                    );
-                    let put_counter = Arc::new(AtomicU64::new(0));
-                    let counting = wrap_counted_reader(compressed, put_counter.clone());
-                    let throttled = settings.throttle_network(counting);
-                    storage
-                        .put(&key, throttled, None)
-                        .await
-                        .with_context(|| format!("put {key}"))?;
-                    compressed_size += put_counter.load(Ordering::Relaxed) as i64;
                     file_no = file_no.max(part.file_no);
+
+                    let permit = upload_sem
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .context("acquire upload permit")?;
+                    let s = storage.clone();
+                    let cfg = settings.clone();
+                    uploads.spawn(async move {
+                        let _permit = permit;
+                        let reader: AsyncReader = Box::pin(part.reader);
+                        let compressed =
+                            compression::encode(cfg.compression, reader, cfg.compression_level);
+                        let counter = Arc::new(AtomicU64::new(0));
+                        let counting = wrap_counted_reader(compressed, counter.clone());
+                        let throttled = cfg.throttle_network(counting);
+                        s.put(&key, throttled, None)
+                            .await
+                            .with_context(|| format!("put {key}"))?;
+                        Ok(counter.load(Ordering::Relaxed))
+                    });
                 }
 
                 let result = streamer_task
                     .await
                     .context("streamer task join")?
                     .with_context(|| format!("streamer task: {archive_label}"))?;
+                while let Some(joined) = uploads.join_next().await {
+                    let bytes = joined.context("upload task join")??;
+                    compressed_size += bytes as i64;
+                }
                 file_no = result.last_file_no;
                 uncompressed_size += counter_handle.bytes() as i64;
                 for (name, meta) in result.files {

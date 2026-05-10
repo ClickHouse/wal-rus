@@ -14,6 +14,9 @@ pub struct Settings {
     pub compression: compression::Method,
     pub compression_level: i32,
     pub upload_concurrency: usize,
+    /// `WALG_UPLOAD_QUEUE`: buffer between part producer & uploader workers.
+    /// Caps how many parts may sit fully-finalized waiting for an uploader
+    pub upload_queue: usize,
     pub download_concurrency: usize,
     pub prevent_wal_overwrite: bool,
     pub retry: RetryPolicy,
@@ -55,6 +58,7 @@ impl Settings {
         };
         let compression_level = parse_env_int("WALG_COMPRESSION_LEVEL", 3)? as i32;
         let upload_concurrency = parse_env_int("WALG_UPLOAD_CONCURRENCY", 4)?.max(1) as usize;
+        let upload_queue = parse_env_int("WALG_UPLOAD_QUEUE", 2)?.max(1) as usize;
         let download_concurrency = parse_env_int("WALG_DOWNLOAD_CONCURRENCY", 4)?.max(1) as usize;
         let prevent_wal_overwrite = parse_env_bool("WALG_PREVENT_WAL_OVERWRITE", false)?;
         let retry = RetryPolicy::from_env();
@@ -66,6 +70,7 @@ impl Settings {
             compression,
             compression_level,
             upload_concurrency,
+            upload_queue,
             download_concurrency,
             prevent_wal_overwrite,
             retry,
