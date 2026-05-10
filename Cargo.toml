@@ -1,0 +1,58 @@
+[package]
+name = "wal-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust port of wal-g for PostgreSQL, optimized for no-overcommit hosts"
+
+[[bin]]
+name = "wal-rs"
+path = "src/main.rs"
+
+[lib]
+name = "wal_rs"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "net", "signal", "sync", "time", "process"] }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-compression = { version = "0.4", default-features = false, features = ["tokio", "zstd", "brotli", "lz4", "lzma"] }
+hex = "0.4"
+url = "2"
+percent-encoding = "2"
+base64 = "0.22"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "form", "query", "charset", "http2"] }
+hmac = "0.13"
+sha2 = "0.11"
+aws-lc-rs = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tar = "0.4"
+postgres-protocol = "0.6"
+stringprep = "0.1"
+fallible-iterator = "0.2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Enabled only on the VM test runner: hits a real PG cluster at PGPORT
+vm-test = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

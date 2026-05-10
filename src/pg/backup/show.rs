@@ -1,0 +1,161 @@
+//! backup-show & backup-mark
+//!
+//! Pure sentinel read / mutation, no replication protocol involved
+
+use anyhow::{Context, Result};
+use tokio::io::AsyncReadExt;
+
+use crate::compression::AsyncReader;
+use crate::pg::backup::{
+    BackupSentinelDtoV2, FilesMetadataDto, fetch::resolve_name, files_metadata_key, sentinel_key,
+};
+use crate::storage::DynStorage;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Plain,
+    Json,
+}
+
+/// `backup-show <name|LATEST>` -- pretty/JSON dump of one sentinel and a
+/// summary line from `files_metadata.json` (file count, tar-part count)
+pub async fn show(storage: DynStorage, name: &str, format: Format) -> Result<()> {
+    let resolved = resolve_name(&storage, name).await?;
+    let sentinel = fetch_sentinel(&storage, &resolved).await?;
+    // files_metadata is optional — older backups may not have it
+    let files = match fetch_files_metadata(&storage, &resolved).await {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!(
+                target = "backup_show",
+                "files_metadata missing or unparseable for {resolved}: {e:#}"
+            );
+            None
+        }
+    };
+
+    match format {
+        Format::Json => {
+            #[derive(serde::Serialize)]
+            struct Out<'a> {
+                name: &'a str,
+                sentinel: &'a BackupSentinelDtoV2,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                files_metadata: Option<&'a FilesMetadataDto>,
+            }
+            let out = Out {
+                name: &resolved,
+                sentinel: &sentinel,
+                files_metadata: files.as_ref(),
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Format::Plain => print_plain(&resolved, &sentinel, files.as_ref()),
+    }
+    Ok(())
+}
+
+/// `backup-mark <name> --permanent | --impermanent`
+/// Fetches the sentinel, flips `IsPermanent`, re-uploads. wal-g's behavior
+pub async fn mark(storage: DynStorage, name: &str, permanent: bool) -> Result<()> {
+    let resolved = resolve_name(&storage, name).await?;
+    let mut sentinel = fetch_sentinel(&storage, &resolved).await?;
+    if sentinel.is_permanent == permanent {
+        tracing::info!(
+            target = "backup_mark",
+            "{resolved} already IsPermanent={permanent}; no-op"
+        );
+        return Ok(());
+    }
+    sentinel.is_permanent = permanent;
+    let bytes = serde_json::to_vec(&sentinel)?;
+    let len = bytes.len() as u64;
+    let r: AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+    let key = sentinel_key(&resolved);
+    storage
+        .put(&key, r, Some(len))
+        .await
+        .with_context(|| format!("put {key}"))?;
+    println!("{resolved} IsPermanent={permanent}");
+    Ok(())
+}
+
+async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
+    let key = sentinel_key(name);
+    let mut r = storage
+        .get(&key)
+        .await
+        .with_context(|| format!("get {key}"))?;
+    let mut buf = Vec::with_capacity(4096);
+    r.read_to_end(&mut buf).await?;
+    serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))
+}
+
+async fn fetch_files_metadata(storage: &DynStorage, name: &str) -> Result<FilesMetadataDto> {
+    let key = files_metadata_key(name);
+    let mut r = storage
+        .get(&key)
+        .await
+        .with_context(|| format!("get {key}"))?;
+    let mut buf = Vec::with_capacity(16 * 1024);
+    r.read_to_end(&mut buf).await?;
+    serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))
+}
+
+fn print_plain(name: &str, s: &BackupSentinelDtoV2, files: Option<&FilesMetadataDto>) {
+    println!("name              {name}");
+    println!("start_time        {}", s.start_time);
+    println!("finish_time       {}", s.finish_time);
+    println!("hostname          {}", s.hostname);
+    println!("data_dir          {}", s.data_dir);
+    println!("pg_version        {}", s.sentinel.pg_version);
+    println!(
+        "system_identifier {}",
+        s.sentinel
+            .system_identifier
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
+    println!("is_permanent      {}", s.is_permanent);
+    println!(
+        "start_lsn         {}",
+        s.sentinel
+            .backup_start_lsn
+            .map(crate::pg::backup::format_pg_lsn)
+            .unwrap_or_else(|| "-".into())
+    );
+    println!(
+        "finish_lsn        {}",
+        s.sentinel
+            .backup_finish_lsn
+            .map(crate::pg::backup::format_pg_lsn)
+            .unwrap_or_else(|| "-".into())
+    );
+    println!("uncompressed_size {}", s.sentinel.uncompressed_size);
+    println!("compressed_size   {}", s.sentinel.compressed_size);
+    println!(
+        "files_metadata    {}",
+        if s.sentinel.files_metadata_disabled {
+            "disabled".into()
+        } else if let Some(f) = files {
+            format!(
+                "{} files across {} part(s)",
+                f.files.len(),
+                f.tar_file_sets.len()
+            )
+        } else {
+            "missing".into()
+        }
+    );
+    if let Some(spec) = s.sentinel.tablespace_spec.as_ref() {
+        println!(
+            "tablespaces       {} user-defined",
+            spec.tablespace_names.len()
+        );
+        for name in &spec.tablespace_names {
+            if let Some(loc) = spec.locations.get(name) {
+                println!("  {name:>10}  loc={}  link={}", loc.location, loc.symlink);
+            }
+        }
+    }
+}
