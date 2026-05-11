@@ -17,7 +17,7 @@ env:
   # break the cross-tool gate. Release artifacts live at
   # https://github.com/wal-g/wal-g/releases
   WALG_VERSION: v3.0.8
-  WALG_ASSET: wal-g-pg-ubuntu-22.04-amd64
+  WALG_ASSET: wal-g-pg-22.04-amd64
 
 jobs:
   build:

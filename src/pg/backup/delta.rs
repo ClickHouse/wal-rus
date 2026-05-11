@@ -414,8 +414,7 @@ async fn find_latest(storage: &DynStorage) -> Result<Option<(String, BackupSenti
             entries.push((name.to_string(), obj.last_modified));
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-    let Some((name, _)) = entries.into_iter().next() else {
+    let Some((name, _)) = entries.into_iter().max_by_key(|e| e.1) else {
         return Ok(None);
     };
     let v2 = fetch_sentinel(storage, &name).await?;

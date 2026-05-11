@@ -78,6 +78,8 @@ async fn backup_push_fetch_against_live_pg() {
         fast_checkpoint: true,
         no_verify_checksums: false,
         tar_size_threshold: 0,
+        delta_from_wal_summaries: false,
+        full: false,
     };
     backup::push::handle(&s, store.clone(), args)
         .await
@@ -194,6 +196,8 @@ async fn backup_with_user_tablespace_against_live_pg() {
         fast_checkpoint: true,
         no_verify_checksums: false,
         tar_size_threshold: 0,
+        delta_from_wal_summaries: false,
+        full: false,
     };
     let push_res = backup::push::handle(&s, store.clone(), args).await;
     // Some VM clusters have no user tablespace — that case is exercised by
