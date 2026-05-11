@@ -60,6 +60,10 @@ for port in "${PORTS[@]}"; do
     # is unset & out-of-scope to modify. Route through the Unix socket where
     # pg_hba grants `peer`, by sudo'ing the prebuilt test binary as postgres
     # (cargo test directly would write into postgres's HOME)
+    # `--test-threads=1` serializes tests within the binary. wal_receive's
+    # START_REPLICATION is sensitive to concurrent checkpoint pressure from
+    # other tests (the segment it asks for can be recycled out from under it),
+    # so serial execution is required for that test to be reliable.
     if [[ $port -eq 5433 ]]; then
         ssh -i "$VM_KEY" "$VM_HOST" "bash -s" <<EOF
 set -euo pipefail
@@ -67,17 +71,17 @@ TEST_BIN=\$(ls -t $VM_DEST/target/release/deps/vm_live-* 2>/dev/null | grep -v '
 [ -x "\$TEST_BIN" ] || { echo "vm_live binary not found under $VM_DEST/target/release/deps" >&2; exit 1; }
 sudo install -m 0755 "\$TEST_BIN" /tmp/wal-rs-vm_live
 sudo -n -u postgres env PGHOST=/var/run/postgresql PGPORT=$port PGUSER=postgres PGDATABASE=postgres \
-    /tmp/wal-rs-vm_live ${FILTER:-} --nocapture
+    /tmp/wal-rs-vm_live ${FILTER:-} --nocapture --test-threads=1
 EOF
     else
         if [[ -n "$FILTER" ]]; then
             ssh -i "$VM_KEY" "$VM_HOST" \
                 "PATH=\$HOME/.cargo/bin:\$PATH PGHOST=127.0.0.1 PGPORT=$port PGUSER=postgres PGDATABASE=postgres \
-                 cargo test --manifest-path $VM_DEST/Cargo.toml --release --features vm-test --test vm_live -- $FILTER --nocapture"
+                 cargo test --manifest-path $VM_DEST/Cargo.toml --release --features vm-test --test vm_live -- $FILTER --nocapture --test-threads=1"
         else
             ssh -i "$VM_KEY" "$VM_HOST" \
                 "PATH=\$HOME/.cargo/bin:\$PATH PGHOST=127.0.0.1 PGPORT=$port PGUSER=postgres PGDATABASE=postgres \
-                 cargo test --manifest-path $VM_DEST/Cargo.toml --release --features vm-test --test vm_live -- --nocapture"
+                 cargo test --manifest-path $VM_DEST/Cargo.toml --release --features vm-test --test vm_live -- --nocapture --test-threads=1"
         fi
     fi
 done
