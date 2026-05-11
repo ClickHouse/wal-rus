@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::compression;
+use crate::crypto::{self, DynCrypter};
 use crate::retry::RetryPolicy;
 use crate::storage::{DynStorage, Storage, fs::FsStorage, gcs, retrying::RetryingStorage, s3};
 
@@ -25,6 +26,11 @@ pub struct Settings {
     /// WALG_DISK_RATE_LIMIT in bytes/sec, 0 = unthrottled
     pub disk_rate_limit: u64,
     pub delta: DeltaSettings,
+    /// Optional libsodium crypter — set via `WALG_LIBSODIUM_KEY` / `_KEY_PATH`.
+    /// OpenPGP is intentionally not supported (see `src/crypto/mod.rs`);
+    /// detection of `WALG_PGP_*` is a hard error so plaintext writes can't
+    /// silently happen when the operator intended encryption
+    pub crypter: Option<DynCrypter>,
 }
 
 /// Delta-backup config: WALG_DELTA_MAX_STEPS / _ORIGIN / _FROM_NAME / _FROM_USER_DATA
@@ -65,6 +71,7 @@ impl Settings {
         let network_rate_limit = parse_env_int("WALG_NETWORK_RATE_LIMIT", 0)?.max(0) as u64;
         let disk_rate_limit = parse_env_int("WALG_DISK_RATE_LIMIT", 0)?.max(0) as u64;
         let delta = DeltaSettings::from_env()?;
+        let crypter = crypto::from_env()?;
         Ok(Settings {
             storage,
             compression,
@@ -77,7 +84,34 @@ impl Settings {
             network_rate_limit,
             disk_rate_limit,
             delta,
+            crypter,
         })
+    }
+
+    /// Wrap a plaintext reader with the configured encryption. No-op when
+    /// no crypter is configured
+    pub fn encrypt(
+        &self,
+        reader: crate::compression::AsyncReader,
+    ) -> crate::compression::AsyncReader {
+        match self.crypter.as_ref() {
+            Some(c) => c.encrypt_reader(reader),
+            None => reader,
+        }
+    }
+
+    /// Wrap a ciphertext reader with the configured decryption. No-op when
+    /// no crypter is configured. Bucket layout doesn't tell us whether a
+    /// given object is encrypted, so callers must apply this consistently;
+    /// mixed plaintext/ciphertext buckets are not supported (matches wal-g)
+    pub fn decrypt(
+        &self,
+        reader: crate::compression::AsyncReader,
+    ) -> crate::compression::AsyncReader {
+        match self.crypter.as_ref() {
+            Some(c) => c.decrypt_reader(reader),
+            None => reader,
+        }
     }
 
     /// Wrap an AsyncRead with WALG_NETWORK_RATE_LIMIT throttling. No-op when unset
@@ -111,8 +145,20 @@ impl Settings {
     }
 
     pub fn build_storage(&self) -> Result<DynStorage> {
-        let policy = self.retry;
-        match &self.storage {
+        Self::build_storage_for(&self.storage, self.retry)
+    }
+
+    /// Construct a storage handle for a destination URI like `file:///tmp/x`,
+    /// `s3://bucket/prefix`, `gs://bucket/prefix`. Inherits credentials &
+    /// retry policy from the current Settings; lets `copy` target a different
+    /// prefix or bucket without reconfiguring the global env
+    pub fn build_dst_storage(&self, uri: &str) -> Result<DynStorage> {
+        let dst = storage_from_uri(uri, &self.storage)?;
+        Self::build_storage_for(&dst, self.retry)
+    }
+
+    fn build_storage_for(s: &StorageSettings, policy: RetryPolicy) -> Result<DynStorage> {
+        match s {
             StorageSettings::Fs { path } => {
                 // local fs: skip retry wrapper; no transient failures worth retrying
                 let s = FsStorage::new(path).context("init fs storage")?;
@@ -133,6 +179,85 @@ impl Settings {
                 Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
             }
         }
+    }
+}
+
+/// Build `StorageSettings` from a destination URI, inheriting credentials
+/// from the source settings. Cross-scheme is allowed; cross-bucket within
+/// the same scheme is allowed too. Bare paths (`/tmp/foo`) are treated as fs
+fn storage_from_uri(uri: &str, src: &StorageSettings) -> Result<StorageSettings> {
+    if let Some(rest) = uri.strip_prefix("file://") {
+        return Ok(StorageSettings::Fs {
+            path: rest.to_string(),
+        });
+    }
+    if let Some(rest) = uri.strip_prefix("s3://") {
+        let (bucket, prefix) = split_bucket_prefix(rest);
+        let s3_src = match src {
+            StorageSettings::S3(c) => Some(c.clone()),
+            _ => None,
+        };
+        let region = s3_src
+            .as_ref()
+            .map(|c| c.region.clone())
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".into());
+        let access_key = s3_src
+            .as_ref()
+            .map(|c| c.access_key.clone())
+            .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
+            .ok_or_else(|| anyhow!("AWS_ACCESS_KEY_ID not set"))?;
+        let secret_key = s3_src
+            .as_ref()
+            .map(|c| c.secret_key.clone())
+            .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
+            .ok_or_else(|| anyhow!("AWS_SECRET_ACCESS_KEY not set"))?;
+        let session_token = s3_src
+            .as_ref()
+            .and_then(|c| c.session_token.clone())
+            .or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
+        let endpoint = s3_src
+            .as_ref()
+            .and_then(|c| c.endpoint.clone())
+            .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
+        let force_path_style = s3_src
+            .as_ref()
+            .map(|c| c.force_path_style)
+            .unwrap_or(endpoint.is_some());
+        return Ok(StorageSettings::S3(s3::S3Config {
+            bucket,
+            prefix,
+            region,
+            access_key,
+            secret_key,
+            session_token,
+            endpoint,
+            force_path_style,
+        }));
+    }
+    if let Some(rest) = uri.strip_prefix("gs://") {
+        let (bucket, prefix) = split_bucket_prefix(rest);
+        let credentials_path = match src {
+            StorageSettings::Gcs(c) => c.credentials_path.clone(),
+            _ => None,
+        }
+        .or_else(|| std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok());
+        return Ok(StorageSettings::Gcs(gcs::GcsConfig {
+            bucket,
+            prefix,
+            credentials_path,
+        }));
+    }
+    // bare path falls back to fs
+    Ok(StorageSettings::Fs {
+        path: uri.to_string(),
+    })
+}
+
+fn split_bucket_prefix(rest: &str) -> (String, String) {
+    match rest.split_once('/') {
+        Some((b, p)) => (b.to_string(), p.trim_end_matches('/').to_string()),
+        None => (rest.to_string(), String::new()),
     }
 }
 

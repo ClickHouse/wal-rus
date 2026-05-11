@@ -202,7 +202,8 @@ async fn unpack_part(
         .await
         .with_context(|| format!("get {key}"))?;
     let throttled = settings.throttle_network(body);
-    let decoded = compression::decode(method, throttled);
+    let decrypted = settings.decrypt(throttled);
+    let decoded = compression::decode(method, decrypted);
     let dst: PathBuf = dst.to_path_buf();
 
     let res: std::io::Result<()> = tokio::task::spawn_blocking(move || {

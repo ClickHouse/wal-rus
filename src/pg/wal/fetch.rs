@@ -46,7 +46,8 @@ pub async fn handle(
         .await
         .with_context(|| format!("get {key}"))?;
     let throttled = settings.throttle_network(body);
-    let mut decoded = compression::decode(method, throttled);
+    let decrypted = settings.decrypt(throttled);
+    let mut decoded = compression::decode(method, decrypted);
 
     let tmp = tmp_path(dst);
     if let Some(parent) = tmp.parent() {

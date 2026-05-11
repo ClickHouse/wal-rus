@@ -24,12 +24,14 @@ fn test_settings() -> Settings {
         compression: Method::Zstd,
         compression_level: 3,
         upload_concurrency: 1,
+        upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
         retry: wal_rs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
+        crypter: None,
     }
 }
 
@@ -395,4 +397,72 @@ async fn delta_parent_falls_back_when_max_steps_reached() {
         .await
         .unwrap();
     assert!(info.is_none(), "next would be increment 4 > max 3");
+}
+
+#[tokio::test]
+async fn fetch_decrypts_libsodium_tar_part() {
+    use async_compression::Level;
+    use async_compression::tokio::bufread::ZstdEncoder;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::BufReader;
+    use wal_rs::crypto::Crypter as _;
+    use wal_rs::crypto::libsodium::LibsodiumCrypter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let restore = dir.path().join("restore");
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+
+    // Build encrypted settings (libsodium + zstd) shared between seeding and fetch
+    let mut k = [0u8; 32];
+    for (i, b) in k.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(17).wrapping_add(3);
+    }
+    let crypter = std::sync::Arc::new(LibsodiumCrypter::new(k));
+    let mut s = test_settings();
+    s.crypter = Some(crypter.clone());
+
+    let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
+    let sentinel = make_sentinel_v2("/d");
+    // sentinel JSON is unencrypted (matches wal-g UploadDto path)
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&backup_name),
+        serde_json::to_vec(&sentinel).unwrap(),
+    )
+    .await;
+
+    let tar_bytes = build_tar(&[
+        ("file_a.txt", b"alpha"),
+        ("dir/file_b.bin", &vec![7u8; 2048]),
+    ]);
+
+    // Compress with zstd, then encrypt with libsodium — same order as
+    // backup_push (compress → encrypt → storage)
+    let raw = std::io::Cursor::new(tar_bytes);
+    let buffered = BufReader::new(raw);
+    let mut encoder = ZstdEncoder::with_quality(buffered, Level::Precise(3));
+    let mut compressed = Vec::new();
+    encoder.read_to_end(&mut compressed).await.unwrap();
+    let plain: wal_rs::compression::AsyncReader = Box::pin(std::io::Cursor::new(compressed));
+    let mut encrypted_reader = crypter.encrypt_reader(plain);
+    let mut encrypted = Vec::new();
+    encrypted_reader.read_to_end(&mut encrypted).await.unwrap();
+
+    put_bytes(
+        store.clone(),
+        &tar_part_key(&backup_name, 1, "zst"),
+        encrypted,
+    )
+    .await;
+
+    fetch_mod::handle(&s, store as Arc<dyn Storage>, &backup_name, &restore)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(restore.join("file_a.txt")).unwrap(), b"alpha");
+    assert_eq!(
+        std::fs::read(restore.join("dir/file_b.bin")).unwrap(),
+        vec![7u8; 2048]
+    );
 }

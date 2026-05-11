@@ -21,12 +21,14 @@ fn settings_for(path: &str) -> Settings {
         compression: Method::Zstd,
         compression_level: 3,
         upload_concurrency: 1,
+        upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
         retry: wal_rs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
+        crypter: None,
     }
 }
 

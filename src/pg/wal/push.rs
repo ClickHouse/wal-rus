@@ -42,7 +42,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -
     // a promotion. wal segments: gated by WALG_PREVENT_WAL_OVERWRITE.
     let must_compare = history || settings.prevent_wal_overwrite;
     if must_compare && storage.exists(&key).await.context("check existence")? {
-        let matches = compare_existing(&storage, &key, method, src_path)
+        let matches = compare_existing(settings, &storage, &key, method, src_path)
             .await
             .with_context(|| format!("content-compare {key}"))?;
         if matches {
@@ -66,9 +66,13 @@ pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -
     let reader: compression::AsyncReader = settings.throttle_disk(Box::pin(file));
 
     let compressed = compression::encode(method, reader, settings.compression_level);
-    let body = settings.throttle_network(compressed);
+    let encrypted = settings.encrypt(compressed);
+    let body = settings.throttle_network(encrypted);
 
-    let size_hint = if matches!(method, compression::Method::None) {
+    // Size hint disabled when either compression OR encryption is on, since
+    // both produce variable-length output (libsodium adds 24-byte header +
+    // 17-byte overhead per 8 KiB chunk)
+    let size_hint = if matches!(method, compression::Method::None) && settings.crypter.is_none() {
         Some(size)
     } else {
         None
@@ -92,13 +96,15 @@ pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -
 /// when identical, false when length or any byte differs. Streams both sides
 /// so a 16 MB segment doesn't materialize in memory
 async fn compare_existing(
+    settings: &Settings,
     storage: &DynStorage,
     key: &str,
     method: compression::Method,
     src_path: &Path,
 ) -> Result<bool> {
     let remote = storage.get(key).await.context("get for compare")?;
-    let mut decoded = compression::decode(method, remote);
+    let decrypted = settings.decrypt(remote);
+    let mut decoded = compression::decode(method, decrypted);
     let mut local = fs::File::open(src_path)
         .await
         .with_context(|| format!("open {} for compare", src_path.display()))?;

@@ -268,8 +268,9 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                         let reader: AsyncReader = Box::pin(part.reader);
                         let compressed =
                             compression::encode(cfg.compression, reader, cfg.compression_level);
+                        let encrypted = cfg.encrypt(compressed);
                         let counter = Arc::new(AtomicU64::new(0));
-                        let counting = wrap_counted_reader(compressed, counter.clone());
+                        let counting = wrap_counted_reader(encrypted, counter.clone());
                         let throttled = cfg.throttle_network(counting);
                         s.put(&key, throttled, None)
                             .await
@@ -342,8 +343,9 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         tracing::info!(target = "backup_push", "uploading {key} (pg_control tee)");
         let raw: AsyncReader = Box::pin(std::io::Cursor::new(bytes.to_vec()));
         let compressed = compression::encode(settings.compression, raw, settings.compression_level);
+        let encrypted = settings.encrypt(compressed);
         let put_counter = Arc::new(AtomicU64::new(0));
-        let counting = wrap_counted_reader(compressed, put_counter.clone());
+        let counting = wrap_counted_reader(encrypted, put_counter.clone());
         let throttled = settings.throttle_network(counting);
         storage
             .put(&key, throttled, None)
