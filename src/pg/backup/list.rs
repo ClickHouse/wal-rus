@@ -77,7 +77,7 @@ pub async fn collect(storage: DynStorage) -> Result<Vec<BackupSummary>> {
         };
         out.push(summary);
     }
-    out.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+    out.sort_by_key(|a| a.start_time);
     Ok(out)
 }
 

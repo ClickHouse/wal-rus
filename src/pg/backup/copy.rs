@@ -1,0 +1,188 @@
+//! Cross-prefix backup copy
+//!
+//! Copies one or all backups to a different prefix under the same storage
+//! backend (same credentials, same bucket). Cross-backend / cross-bucket
+//! copies fall back to stream-through with the same flow when a future
+//! caller supplies a second `DynStorage`
+//!
+//! The implementation walks source-side object listings (basebackup-relative
+//! +, optionally, WAL-relative) and pipes each `get` straight into a `put`
+//! against the destination storage. Server-side server-side copy
+//! (`x-amz-copy-source` / GCS `rewriteTo`) is a follow-up optimization
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+
+use crate::config::Settings;
+use crate::pg::backup::delete::{BackupRecord, collect_records};
+use crate::pg::backup::fetch::resolve_name;
+use crate::storage::DynStorage;
+
+#[derive(Debug, Clone)]
+pub struct CopyArgs {
+    /// `--backup-name <name>` or LATEST. When absent and `all=true`, copy every backup
+    pub backup_name: Option<String>,
+    /// `--all`: copy every backup (forbidden together with backup_name)
+    pub all: bool,
+    /// `--with-history`: copy WAL segments older than `start_lsn`, too
+    pub with_history: bool,
+}
+
+/// Copy from `src` to `dst`. `dst` is constructed by the caller (typically a
+/// second `build_storage` with an overridden prefix). When `dst` points at
+/// the same backend that's a same-cred cross-prefix copy; when different,
+/// the same stream-through path applies
+pub async fn handle(
+    settings: &Settings,
+    src: DynStorage,
+    dst: DynStorage,
+    args: CopyArgs,
+) -> Result<()> {
+    if args.all && args.backup_name.is_some() {
+        bail!("--all and --backup-name are mutually exclusive");
+    }
+    let backups = collect_records(&src).await?;
+    let to_copy: Vec<BackupRecord> = if args.all {
+        backups.clone()
+    } else {
+        let name = args
+            .backup_name
+            .as_deref()
+            .ok_or_else(|| anyhow!("--backup-name or --all is required"))?;
+        let resolved = resolve_name(&src, name).await?;
+        backups
+            .iter()
+            .find(|b| b.name == resolved)
+            .cloned()
+            .map(|b| vec![b])
+            .ok_or_else(|| anyhow!("backup {resolved} not found"))?
+    };
+
+    if to_copy.is_empty() {
+        tracing::info!(target = "copy", "no backups to copy");
+        return Ok(());
+    }
+
+    let mut keys: Vec<String> = Vec::new();
+    for b in &to_copy {
+        collect_backup_keys(&src, &b.name, &mut keys).await?;
+    }
+    if args.with_history || !args.all {
+        // wal-g semantics: for a specific backup the WAL window is
+        // [start_lsn, finish_lsn] by default, or all-older WAL with --with-history.
+        // Whole-bucket `--all` without history doesn't sweep WAL; otherwise we copy
+        // the windowed range (per resolved record).
+        for b in &to_copy {
+            collect_wal_keys(&src, b, args.with_history, &mut keys).await?;
+        }
+    }
+
+    let concurrency = settings.upload_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
+    for k in keys {
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .context("acquire copy permit")?;
+        let src = src.clone();
+        let dst = dst.clone();
+        let key = k.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let r = copy_one(&src, &dst, &key).await;
+            (key, r)
+        });
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    while let Some(joined) = tasks.join_next().await {
+        let (key, res) = joined.context("copy task join")?;
+        match res {
+            Ok(()) => tracing::info!(target = "copy", "copied {key}"),
+            Err(e) => {
+                tracing::warn!(target = "copy", "copy {key}: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn copy_one(src: &DynStorage, dst: &DynStorage, key: &str) -> Result<()> {
+    let body = src.get(key).await.with_context(|| format!("get {key}"))?;
+    dst.put(key, body, None)
+        .await
+        .with_context(|| format!("put {key}"))?;
+    Ok(())
+}
+
+async fn collect_backup_keys(src: &DynStorage, name: &str, out: &mut Vec<String>) -> Result<()> {
+    // Per-backup prefix holds files_metadata.json, metadata.json,
+    // tar_partitions/part_NNN.tar.*. The sentinel lives at `<basebackups>/`
+    let backup_prefix = format!("{}/{}/", crate::pg::BASEBACKUP_FOLDER, name);
+    let mut s = src
+        .list(&backup_prefix)
+        .await
+        .with_context(|| format!("list {backup_prefix}"))?;
+    while let Some(item) = s.next().await {
+        let obj = item.context("list iteration")?;
+        out.push(obj.key);
+    }
+    out.push(crate::pg::backup::sentinel_key(name));
+    Ok(())
+}
+
+async fn collect_wal_keys(
+    src: &DynStorage,
+    backup: &BackupRecord,
+    with_history: bool,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName, is_wal_filename};
+    let wal_prefix = format!("{}/", crate::pg::WAL_FOLDER);
+    let mut s = src
+        .list(&wal_prefix)
+        .await
+        .with_context(|| format!("list {wal_prefix}"))?;
+    let segs_per_log = 0x1_0000_0000u64 / DEFAULT_WAL_SEG_SIZE;
+    let start = backup.start_seg_no;
+    let finish = backup.finish_lsn / DEFAULT_WAL_SEG_SIZE;
+    while let Some(item) = s.next().await {
+        let obj = item.context("list iteration")?;
+        let bare = obj.key.rsplit('/').next().unwrap_or(&obj.key);
+        let name = match bare.rsplit_once('.') {
+            Some((stem, _)) if stem.len() == 24 => stem,
+            _ => bare,
+        };
+        if !is_wal_filename(name) {
+            // history files always copied (small, useful for downstream)
+            if name.ends_with(".history") || bare.ends_with(".history") {
+                out.push(obj.key);
+            }
+            continue;
+        }
+        let Ok(seg) = SegmentName::parse(name) else {
+            continue;
+        };
+        if seg.timeline != backup.timeline {
+            continue;
+        }
+        let global = (seg.log_id as u64) * segs_per_log + seg.seg_no as u64;
+        if with_history {
+            if global <= finish {
+                out.push(obj.key);
+            }
+        } else if global >= start && global <= finish {
+            out.push(obj.key);
+        }
+    }
+    Ok(())
+}

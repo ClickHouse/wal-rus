@@ -2,9 +2,6 @@
 //!
 //! Reader-to-reader transforms via tokio::bufread adapters; no thread bridge,
 //! no full-segment buffering. Memory cost ~= codec window size + tokio BufReader.
-//!
-//! Legacy codecs (brotli/lz4/lzma) exist for compatibility with buckets written
-//! by older wal-g deployments; zstd remains the default.
 
 use std::pin::Pin;
 

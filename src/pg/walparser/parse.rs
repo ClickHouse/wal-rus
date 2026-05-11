@@ -198,6 +198,7 @@ fn read_rel_file_node(c: &mut HdrCursor<'_>) -> Result<RelFileNode, ParseError> 
 
 fn read_block_image_header(
     c: &mut HdrCursor<'_>,
+    page_magic: u16,
 ) -> Result<XLogRecordBlockImageHeader, ParseError> {
     let image_length = c.read_u16("imageLength")?;
     let hole_offset = c.read_u16("imageHoleOffset")?;
@@ -208,33 +209,34 @@ fn read_block_image_header(
         hole_length: 0,
         info,
     };
-    if h.is_compressed() {
+    if h.is_compressed(page_magic) {
         if h.has_hole() {
             h.hole_length = c.read_u16("imageHoleLength")?;
         }
     } else {
         h.hole_length = BLOCK_SIZE.saturating_sub(h.image_length);
     }
-    check_image_header(&h)?;
+    check_image_header(&h, page_magic)?;
     Ok(h)
 }
 
-fn check_image_header(h: &XLogRecordBlockImageHeader) -> Result<(), ParseError> {
+fn check_image_header(h: &XLogRecordBlockImageHeader, page_magic: u16) -> Result<(), ParseError> {
     let has_hole = h.info & BKP_IMAGE_HAS_HOLE != 0;
+    let compressed = h.is_compressed(page_magic);
     if has_hole && (h.hole_offset == 0 || h.hole_length == 0 || h.image_length == BLOCK_SIZE) {
         return Err(ParseError::InconsistentImageHole);
     }
     if !has_hole && (h.hole_offset != 0 || h.hole_length != 0) {
         return Err(ParseError::InconsistentImageHole);
     }
-    if h.is_compressed() && h.image_length == BLOCK_SIZE {
+    if compressed && h.image_length == BLOCK_SIZE {
         return Err(ParseError::InconsistentImageLength {
             has_hole,
             compressed: true,
             len: h.image_length,
         });
     }
-    if !has_hole && !h.is_compressed() && h.image_length != BLOCK_SIZE {
+    if !has_hole && !compressed && h.image_length != BLOCK_SIZE {
         return Err(ParseError::InconsistentImageLength {
             has_hole,
             compressed: false,
@@ -263,6 +265,7 @@ fn read_block_header(
     block_id: u8,
     max_block_id: &mut i32,
     c: &mut HdrCursor<'_>,
+    page_magic: u16,
 ) -> Result<XLogRecordBlockHeader, ParseError> {
     if block_id > XLR_MAX_BLOCK_ID {
         return Err(ParseError::BadBlockId(block_id));
@@ -288,7 +291,7 @@ fn read_block_header(
     c.shrink(h.data_length as usize)?;
 
     if h.has_image() {
-        h.image_header = read_block_image_header(c)?;
+        h.image_header = read_block_image_header(c, page_magic)?;
         c.shrink(h.image_header.image_length as usize)?;
     }
     let loc = read_block_location(h.has_same_rel(), *last_rel, c)?;
@@ -299,7 +302,11 @@ fn read_block_header(
 
 /// Walk the header area of a record. Caller has already consumed the
 /// 24-byte header; `buf` points at the start of the body
-fn read_block_header_part(record: &mut XLogRecord, buf: &mut &[u8]) -> Result<(), ParseError> {
+fn read_block_header_part(
+    record: &mut XLogRecord,
+    buf: &mut &[u8],
+    page_magic: u16,
+) -> Result<(), ParseError> {
     let total = record.header.total_record_length as usize;
     if total < X_LOG_RECORD_HEADER_SIZE {
         return Err(ParseError::BadRecordLength(
@@ -330,7 +337,8 @@ fn read_block_header_part(record: &mut XLogRecord, buf: &mut &[u8]) -> Result<()
                 record.origin = o;
             }
             id => {
-                let h = read_block_header(&mut last_rel, id, &mut max_block_id, &mut c)?;
+                let h =
+                    read_block_header(&mut last_rel, id, &mut max_block_id, &mut c, page_magic)?;
                 record.blocks.push(XLogRecordBlock {
                     header: h,
                     image: Vec::new(),
@@ -367,23 +375,26 @@ fn read_xlog_record_main_data(len: u32, buf: &mut &[u8]) -> Result<Vec<u8>, Pars
 pub(crate) fn read_xlog_record_body(
     header: XLogRecordHeader,
     buf: &mut &[u8],
+    page_magic: u16,
 ) -> Result<XLogRecord, ParseError> {
     let mut record = XLogRecord {
         header,
         ..Default::default()
     };
-    read_block_header_part(&mut record, buf)?;
+    read_block_header_part(&mut record, buf, page_magic)?;
     read_block_data_and_images(&mut record, buf)?;
     record.main_data = read_xlog_record_main_data(record.main_data_len, buf)?;
     Ok(record)
 }
 
 /// Parse a complete record body from raw bytes (caller already concatenated
-/// the header + body across any page boundaries)
-pub fn parse_record_from_bytes(data: &[u8]) -> Result<XLogRecord, ParseError> {
+/// the header + body across any page boundaries). `page_magic` is the
+/// `XLogPageHeader.magic` of the page that *started* this record — controls
+/// FPI flag interpretation (PG 15 reshuffled bimg_info bits)
+pub fn parse_record_from_bytes(data: &[u8], page_magic: u16) -> Result<XLogRecord, ParseError> {
     let mut buf = data;
     let h = read_xlog_record_header(&mut buf)?;
-    read_xlog_record_body(h, &mut buf)
+    read_xlog_record_body(h, &mut buf, page_magic)
 }
 
 // ─── page helpers ───────────────────────────────────────────────────────────
@@ -643,7 +654,7 @@ mod tests {
         });
         bytes.extend_from_slice(&body);
 
-        let r = parse_record_from_bytes(&bytes).unwrap();
+        let r = parse_record_from_bytes(&bytes, super::super::types::XLP_PAGE_MAGIC_PG14).unwrap();
         assert_eq!(r.blocks.len(), 1);
         let b = &r.blocks[0];
         assert_eq!(b.header.location.rel.spc_node, 100);
@@ -653,5 +664,166 @@ mod tests {
         assert_eq!(b.data, block_data);
         assert_eq!(r.main_data, main_data);
         assert_eq!(r.main_data_len, main_data.len() as u32);
+    }
+
+    /// Regression: PG ≥ 15 sets bimg_info bit 0x02 (APPLY) on every FPI.
+    /// Pre-fix wal-rs treated 0x02 as IS_COMPRESSED → the strict
+    /// check_image_header path rejected `compressed && image_length ==
+    /// BLOCK_SIZE`. Encode a FPI with info=APPLY only, image_length =
+    /// BLOCK_SIZE, no hole. With PG-15+ magic the record must parse;
+    /// with PG-14 magic the same bytes must fail
+    #[test]
+    fn fpi_apply_bit_parses_on_pg15_rejects_on_pg14() {
+        use crate::pg::walparser::types::{
+            _BKP_IMAGE_APPLY_PG15, BKP_BLOCK_HAS_IMAGE, BLOCK_SIZE, RmId, X_LOG_RECORD_HEADER_SIZE,
+            XLP_PAGE_MAGIC_PG14, XLP_PAGE_MAGIC_PG15,
+        };
+
+        let image = vec![0xABu8; BLOCK_SIZE as usize];
+
+        let mut body: Vec<u8> = Vec::new();
+        // block 0 header: id=0, HAS_IMAGE, data_length=0
+        body.push(0);
+        body.push(BKP_BLOCK_HAS_IMAGE);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        // image header: length=BLOCK_SIZE, hole_offset=0, info=APPLY only
+        body.extend_from_slice(&(BLOCK_SIZE).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.push(_BKP_IMAGE_APPLY_PG15);
+        // rel(12) + block_no(4)
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&200u32.to_le_bytes());
+        body.extend_from_slice(&300u32.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes());
+        // image bytes
+        body.extend_from_slice(&image);
+
+        let total = X_LOG_RECORD_HEADER_SIZE + body.len();
+        let mut bytes = encode_record_header(&XLogRecordHeader {
+            total_record_length: total as u32,
+            resource_manager_id: RmId::Heap as u8,
+            ..Default::default()
+        });
+        bytes.extend_from_slice(&body);
+
+        let pg15 = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).expect("pg15+ accepts");
+        assert_eq!(pg15.blocks.len(), 1);
+        assert_eq!(pg15.blocks[0].image.len(), BLOCK_SIZE as usize);
+        assert!(
+            !pg15.blocks[0]
+                .header
+                .image_header
+                .is_compressed(XLP_PAGE_MAGIC_PG15)
+        );
+
+        let err = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG14).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::InconsistentImageLength {
+                    compressed: true,
+                    ..
+                }
+            ),
+            "want InconsistentImageLength(compressed=true), got {err:?}"
+        );
+    }
+
+    /// PG 14-style FPI: IS_COMPRESSED bit set (0x02), image shorter than
+    /// BLOCK_SIZE → must parse cleanly under PG-14 magic. Same record
+    /// under PG-15+ magic must reject (0x02 means APPLY, "uncompressed",
+    /// and `image_length != BLOCK_SIZE && !has_hole` is inconsistent)
+    #[test]
+    fn fpi_pg14_compressed_bit_parses_on_pg14_rejects_on_pg15() {
+        use crate::pg::walparser::types::{
+            BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_IS_COMPRESSED_PG14, RmId, X_LOG_RECORD_HEADER_SIZE,
+            XLP_PAGE_MAGIC_PG14, XLP_PAGE_MAGIC_PG15,
+        };
+
+        let compressed = vec![0xCDu8; 2048];
+
+        let mut body: Vec<u8> = Vec::new();
+        body.push(0);
+        body.push(BKP_BLOCK_HAS_IMAGE);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        // image header: length=2048, hole_offset=0, info=IS_COMPRESSED
+        body.extend_from_slice(&(compressed.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.push(BKP_IMAGE_IS_COMPRESSED_PG14);
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&200u32.to_le_bytes());
+        body.extend_from_slice(&300u32.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.extend_from_slice(&compressed);
+
+        let total = X_LOG_RECORD_HEADER_SIZE + body.len();
+        let mut bytes = encode_record_header(&XLogRecordHeader {
+            total_record_length: total as u32,
+            resource_manager_id: RmId::Heap as u8,
+            ..Default::default()
+        });
+        bytes.extend_from_slice(&body);
+
+        let pg14 = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG14).expect("pg14 accepts");
+        assert_eq!(pg14.blocks[0].image.len(), compressed.len());
+        assert!(
+            pg14.blocks[0]
+                .header
+                .image_header
+                .is_compressed(XLP_PAGE_MAGIC_PG14)
+        );
+
+        // PG15 reading PG14-compressed bytes: 0x02 means APPLY (uncompressed),
+        // so parser computes hole_length = BLOCK_SIZE - image_length on the
+        // !compressed branch, then check_image_header rejects because
+        // !has_hole but hole_length != 0
+        let err = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InconsistentImageHole),
+            "want InconsistentImageHole, got {err:?}"
+        );
+    }
+
+    /// PG 15+ pglz-compressed FPI (info=COMPRESS_PGLZ, bit 0x04). Must
+    /// parse under PG-15+ magic; under PG-14 magic the bit 0x04 was
+    /// "APPLY" (advisory, no compression) so the parser would expect a
+    /// full-BLOCK image, mismatching the 2048-byte payload
+    #[test]
+    fn fpi_pg15_pglz_parses_on_pg15() {
+        use crate::pg::walparser::types::{
+            BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_COMPRESS_PGLZ, RmId, X_LOG_RECORD_HEADER_SIZE,
+            XLP_PAGE_MAGIC_PG15,
+        };
+
+        let compressed = vec![0xEFu8; 2048];
+        let mut body: Vec<u8> = Vec::new();
+        body.push(0);
+        body.push(BKP_BLOCK_HAS_IMAGE);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&(compressed.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.push(BKP_IMAGE_COMPRESS_PGLZ);
+        body.extend_from_slice(&100u32.to_le_bytes());
+        body.extend_from_slice(&200u32.to_le_bytes());
+        body.extend_from_slice(&300u32.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.extend_from_slice(&compressed);
+
+        let total = X_LOG_RECORD_HEADER_SIZE + body.len();
+        let mut bytes = encode_record_header(&XLogRecordHeader {
+            total_record_length: total as u32,
+            resource_manager_id: RmId::Heap as u8,
+            ..Default::default()
+        });
+        bytes.extend_from_slice(&body);
+
+        let r = parse_record_from_bytes(&bytes, XLP_PAGE_MAGIC_PG15).expect("pg15 accepts pglz");
+        assert!(
+            r.blocks[0]
+                .header
+                .image_header
+                .is_compressed(XLP_PAGE_MAGIC_PG15)
+        );
+        assert_eq!(r.blocks[0].image.len(), compressed.len());
     }
 }

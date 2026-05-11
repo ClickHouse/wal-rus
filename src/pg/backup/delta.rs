@@ -414,8 +414,7 @@ async fn find_latest(storage: &DynStorage) -> Result<Option<(String, BackupSenti
             entries.push((name.to_string(), obj.last_modified));
         }
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-    let Some((name, _)) = entries.into_iter().next() else {
+    let Some((name, _)) = entries.into_iter().max_by_key(|e| e.1) else {
         return Ok(None);
     };
     let v2 = fetch_sentinel(storage, &name).await?;
@@ -458,6 +457,7 @@ async fn find_by_user_data(
 /// & aggregate the referenced block locations into a delta map.
 /// Segments are fetched from the `wal_005/` prefix (wal-rs layout)
 pub async fn build_delta_map_from_wal(
+    settings: &crate::config::Settings,
     storage: &DynStorage,
     timeline: u32,
     start_lsn: u64,
@@ -480,7 +480,8 @@ pub async fn build_delta_map_from_wal(
         }
         .format();
         let locations =
-            match fetch_and_parse_segment(storage, &name, compression, &mut parser).await {
+            match fetch_and_parse_segment(settings, storage, &name, compression, &mut parser).await
+            {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::warn!(target = "backup_push", "segment {name}: {e:#}; skipping");
@@ -497,6 +498,7 @@ fn lsn_to_seg(lsn: u64, seg_size: u64) -> u64 {
 }
 
 async fn fetch_and_parse_segment(
+    settings: &crate::config::Settings,
     storage: &DynStorage,
     name: &str,
     compression: compression::Method,
@@ -512,7 +514,8 @@ async fn fetch_and_parse_segment(
         .get(&key)
         .await
         .with_context(|| format!("get {key}"))?;
-    let decoded = compression::decode(compression, r);
+    let decrypted = settings.decrypt(r);
+    let decoded = compression::decode(compression, decrypted);
     let mut buf = Vec::new();
     let mut decoded = decoded;
     decoded.read_to_end(&mut buf).await?;

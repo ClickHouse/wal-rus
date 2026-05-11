@@ -8,6 +8,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod copy;
+pub mod delete;
 pub mod delta;
 pub mod fetch;
 pub mod increment;
@@ -127,6 +129,28 @@ pub fn looks_like_backup_name(s: &str) -> bool {
 pub fn name_from_sentinel_key(key: &str) -> Option<&str> {
     let bare = key.rsplit('/').next().unwrap_or(key);
     bare.strip_suffix(SENTINEL_SUFFIX)
+}
+
+/// Extract the leftmost backup name from an object key under the basebackups
+/// prefix. Mirrors wal-g's `utility.StripLeftmostBackupName`:
+/// split on `/`, take the first segment, drop the `_backup*` sentinel suffix
+///
+/// `basebackups_005/base_X_backup_stop_sentinel.json` -> `Some("base_X")`
+/// `basebackups_005/base_X/tar_partitions/part_001.tar.zst` -> `Some("base_X")`
+/// `basebackups_005/base_X_D_Y/files_metadata.json` -> `Some("base_X_D_Y")`
+pub fn strip_leftmost_backup_name(key: &str) -> Option<&str> {
+    let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
+    let rel = key.strip_prefix(&prefix).unwrap_or(key);
+    let rel = rel.trim_start_matches('/');
+    let first = rel.split('/').next()?;
+    // Drop sentinel & metadata suffixes that share `_backup` (sentinel,
+    // backup_log, etc). Delta backup names contain `_D_` which doesn't match
+    let stripped = first.split("_backup").next().unwrap_or(first);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
+    }
 }
 
 /// Tablespace map mirrored from wal-g `TablespaceSpec`. JSON shape:

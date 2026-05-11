@@ -113,13 +113,44 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Mark or unmark a backup as permanent (flips sentinel.IsPermanent)
+    /// Mark or unmark a backup as permanent (flips sentinel.IsPermanent).
+    /// Provide either a positional `name` (or `LATEST`) or `--target-user-data
+    /// <json>` to select by sentinel.UserData
     BackupMark {
         /// Backup name, or LATEST
-        name: String,
+        #[arg(conflicts_with = "target_user_data")]
+        name: Option<String>,
         /// Set IsPermanent=false
         #[arg(long)]
         impermanent: bool,
+        /// Select target backup by sentinel.UserData (JSON, deep-equal)
+        #[arg(long)]
+        target_user_data: Option<String>,
+    },
+    /// Retention. Default is dry-run; pass `--confirm` to execute
+    Delete {
+        #[command(subcommand)]
+        op: DeleteCli,
+        /// Actually delete (default is dry-run)
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Copy backups (and optionally their WAL window) to a destination prefix.
+    /// `--to` accepts `file:///path`, `s3://bucket/prefix`, `gs://bucket/prefix`,
+    /// or a bare path (treated as fs)
+    Copy {
+        /// Copy a single backup (name or LATEST)
+        #[arg(long, short = 'b', conflicts_with = "all")]
+        backup_name: Option<String>,
+        /// Copy every backup
+        #[arg(long, conflicts_with = "backup_name")]
+        all: bool,
+        /// Copy WAL segments older than the backup's start LSN
+        #[arg(long, short = 'w')]
+        with_history: bool,
+        /// Destination URI
+        #[arg(long, short = 't')]
+        to: String,
     },
     /// Run as a long-lived daemon over a unix socket
     Daemon {
@@ -133,6 +164,30 @@ pub enum Cmd {
         #[command(subcommand)]
         op: DaemonOp,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DeleteCli {
+    /// Delete every object older than the resolved target.
+    /// Accepts `[FIND_FULL] <backup_name|RFC3339_timestamp>`
+    Before { args: Vec<String> },
+    /// Keep N most-recent backups; remove older.
+    /// Accepts `[FULL|FIND_FULL] <N>`. `--after <ts|name>` additionally keeps
+    /// every backup at-or-newer than the boundary
+    Retain {
+        args: Vec<String>,
+        /// RFC3339 timestamp or backup-name prefix; survives in addition to the N newest
+        #[arg(long, short = 'a')]
+        after: Option<String>,
+    },
+    /// Wipe basebackups + WAL. Refuses when any permanent backup exists unless `FORCE`
+    Everything { args: Vec<String> },
+    /// Delete a single backup and (default) its dependants;
+    /// `FIND_FULL <name>` deletes the whole increment chain
+    Target { args: Vec<String> },
+    /// Find oldest non-permanent backup; delete everything older.
+    /// `ARCHIVES` / `BACKUPS` narrows the scope
+    Garbage { args: Vec<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -263,10 +318,84 @@ impl Cli {
                 };
                 backup::show::show(storage, &name, format).await
             }
-            Cmd::BackupMark { name, impermanent } => {
+            Cmd::BackupMark {
+                name,
+                impermanent,
+                target_user_data,
+            } => {
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
-                backup::show::mark(storage, &name, !impermanent).await
+                let resolved = match (name, target_user_data) {
+                    (Some(n), None) => n,
+                    (None, Some(ud)) => backup::show::resolve_by_user_data(&storage, &ud).await?,
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("specify backup name OR --target-user-data, not both")
+                    }
+                    (None, None) => {
+                        anyhow::bail!("backup name or --target-user-data required")
+                    }
+                };
+                backup::show::mark(storage, &resolved, !impermanent).await
+            }
+            Cmd::Delete { op, confirm } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                let delete_op = match op {
+                    DeleteCli::Before { args } => {
+                        let (modifier, target) = backup::delete::parse_modifier_args(&args)?;
+                        if matches!(modifier, backup::delete::DeleteModifier::Full) {
+                            anyhow::bail!("`delete before FULL` is not supported");
+                        }
+                        backup::delete::DeleteOp::Before { target, modifier }
+                    }
+                    DeleteCli::Retain { args, after } => {
+                        let (modifier, value) = backup::delete::parse_modifier_args(&args)?;
+                        let count: usize = value
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("retain count: {e}"))?;
+                        backup::delete::DeleteOp::Retain {
+                            count,
+                            modifier,
+                            after,
+                        }
+                    }
+                    DeleteCli::Everything { args } => {
+                        let force = backup::delete::parse_everything_force(&args)?;
+                        backup::delete::DeleteOp::Everything { force }
+                    }
+                    DeleteCli::Target { args } => {
+                        let (modifier, name) = backup::delete::parse_target_modifier(&args)?;
+                        backup::delete::DeleteOp::Target { name, modifier }
+                    }
+                    DeleteCli::Garbage { args } => {
+                        let scope = backup::delete::parse_garbage_scope(&args)?;
+                        backup::delete::DeleteOp::Garbage { scope }
+                    }
+                };
+                backup::delete::handle(storage, delete_op, confirm)
+                    .await
+                    .map(|_| ())
+            }
+            Cmd::Copy {
+                backup_name,
+                all,
+                with_history,
+                to,
+            } => {
+                let s = Settings::from_env()?;
+                let src = s.build_storage()?;
+                let dst = s.build_dst_storage(&to)?;
+                backup::copy::handle(
+                    &s,
+                    src,
+                    dst,
+                    backup::copy::CopyArgs {
+                        backup_name,
+                        all,
+                        with_history,
+                    },
+                )
+                .await
             }
             Cmd::Daemon { socket } => {
                 let s = Settings::from_env()?;

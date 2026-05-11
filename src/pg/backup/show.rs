@@ -2,12 +2,14 @@
 //!
 //! Pure sentinel read / mutation, no replication protocol involved
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 
 use crate::compression::AsyncReader;
 use crate::pg::backup::{
-    BackupSentinelDtoV2, FilesMetadataDto, fetch::resolve_name, files_metadata_key, sentinel_key,
+    BackupSentinelDtoV2, FilesMetadataDto, fetch::resolve_name, files_metadata_key,
+    name_from_sentinel_key, sentinel_key,
 };
 use crate::storage::DynStorage;
 
@@ -78,6 +80,53 @@ pub async fn mark(storage: DynStorage, name: &str, permanent: bool) -> Result<()
         .with_context(|| format!("put {key}"))?;
     println!("{resolved} IsPermanent={permanent}");
     Ok(())
+}
+
+/// Resolve a backup name from a `--target-user-data` JSON value. Walks every
+/// sentinel, deeply compares its `UserData` to the parsed target. Errors when
+/// nothing matches, or when two distinct backups share the value
+pub async fn resolve_by_user_data(storage: &DynStorage, user_data_str: &str) -> Result<String> {
+    let target: serde_json::Value = serde_json::from_str(user_data_str)
+        .with_context(|| format!("--target-user-data is not valid JSON: {user_data_str}"))?;
+    let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
+    let mut stream = storage
+        .list(&prefix)
+        .await
+        .with_context(|| format!("list {prefix}"))?;
+    let mut matches: Vec<String> = Vec::new();
+    while let Some(item) = stream.next().await {
+        let obj = item.context("list iteration")?;
+        let Some(name) = name_from_sentinel_key(&obj.key) else {
+            continue;
+        };
+        let name = name.to_string();
+        let sentinel = match fetch_sentinel(storage, &name).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target = "backup_mark",
+                    "skip {name} during user-data search: {e:#}"
+                );
+                continue;
+            }
+        };
+        let ud = sentinel
+            .sentinel
+            .user_data
+            .unwrap_or(serde_json::Value::Null);
+        if ud == target {
+            matches.push(name);
+        }
+    }
+    match matches.len() {
+        0 => Err(anyhow!("no backup found with user-data: {user_data_str}")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => bail!(
+            "{} backups match user-data: {}",
+            matches.len(),
+            matches.join(", ")
+        ),
+    }
 }
 
 async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {

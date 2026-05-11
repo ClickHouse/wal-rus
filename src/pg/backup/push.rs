@@ -25,8 +25,9 @@ use tokio::task::JoinSet;
 
 use crate::compression::{self, AsyncReader};
 use crate::config::Settings;
-use crate::pg::backup::delta;
-use crate::pg::backup::tar_streamer::{self, StreamerOpts, tablespace_prefix};
+use crate::pg::backup::delta::{self, PrevBackupInfo};
+use crate::pg::backup::increment::Format as IncrementFormat;
+use crate::pg::backup::tar_streamer::{self, DeltaContext, StreamerOpts, tablespace_prefix};
 use crate::pg::backup::{
     BACKUP_NAME_PREFIX, BackupSentinelDto, BackupSentinelDtoV2, ExtendedMetadataDto,
     FileDescription, FilesMetadataDto, METADATA_DATETIME_FORMAT, TablespaceSpec,
@@ -65,36 +66,33 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     let start_time = chrono::Utc::now();
 
     // Resolve a delta parent if WALG_DELTA_MAX_STEPS > 0 (or --delta-from-
-    // wal-summaries). The pre-flight runs eagerly so misconfig surfaces.
-    // Streamer-side increment emission is not yet wired (see PHASEC.md /
-    // PHASEC2.md): when a parent is found we log it & fall back to full,
-    // so the sentinel never claims a delta that the bucket can't deliver.
+    // wal-summaries). When found, build a delta map after BackupEvent::Start
+    // (its end-LSN is only known then) & feed it into the streamer
     //
     // `--full` short-circuits delta detection entirely (matches wal-g's
-    // `--full` flag). `--delta-from-wal-summaries` is mutually exclusive
+    // `--full` flag). `--delta-from-wal-summaries` flips the on-wire format
+    // from wal-g native `wi1` to PG17 INCREMENTAL
     let parent = if args.full {
         None
     } else {
         delta::configure_delta_parent(&storage, &settings.delta, args.is_permanent).await?
     };
+    let increment_format = if args.delta_from_wal_summaries {
+        IncrementFormat::Native
+    } else {
+        IncrementFormat::Wi1
+    };
     if let Some(p) = parent.as_ref() {
-        let mode = if args.delta_from_wal_summaries {
-            "wal-summaries + PG17 native"
-        } else {
-            "WAL-walk + wi1"
-        };
-        tracing::warn!(
+        tracing::info!(
             target = "backup_push",
-            "delta parent {} resolved (count={}, start_lsn={:X}, mode={mode}) but increment \
-             generation not yet implemented; producing a full backup",
+            "delta parent {} (count={}, start_lsn={:X}/{:X}, format={:?})",
             p.name,
             p.increment_count,
-            p.start_lsn,
+            p.start_lsn >> 32,
+            p.start_lsn as u32,
+            increment_format,
         );
-        // TODO(phase-c): pass parent + format flag into streamer
     }
-    let _drop_parent_for_now: Option<delta::PrevBackupInfo> = None;
-    let _ = _drop_parent_for_now;
 
     let cfg = PgConfig::from_env()?;
     tracing::info!(
@@ -121,9 +119,11 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
             .unwrap_or_default(),
     };
 
-    // `--delta-from-wal-summaries`: server-side preconditions + build the
-    // delta map up front so the BASE_BACKUP can run with a hot map. PG17 +
-    // summarize_wal=on are hard requirements; abort early on either miss
+    // `--delta-from-wal-summaries`: server-side preconditions checked up
+    // front. PG17 + summarize_wal=on are hard requirements; abort early on
+    // either miss. The map itself is built once BackupEvent::Start delivers
+    // the new start LSN, since `[parent.start_lsn, this.start_lsn)` is the
+    // input range for both wal-summary & WAL-walk paths
     if args.delta_from_wal_summaries {
         if pg_version < 170000 {
             bail!(
@@ -134,28 +134,11 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         if on.trim() != "on" {
             bail!("--delta-from-wal-summaries requires summarize_wal=on on the server");
         }
-        // TODO(phase-c2): build delta map from pg_wal/summaries & feed it
-        // into the streamer. The upper bound (this backup's start LSN) only
-        // becomes known after BackupEvent::Start fires, so the build either
-        // has to move into the event loop, or wait until START_REPLICATION
-        // returns the start LSN
-        match (parent.as_ref(), args.pgdata.as_ref()) {
-            (None, _) => tracing::info!(
-                target = "backup_push",
-                "no delta parent resolved; --delta-from-wal-summaries will produce a full backup"
-            ),
-            (Some(p), Some(pgdata)) => tracing::info!(
-                target = "backup_push",
-                "would build delta map from {}/pg_wal/summaries for [{:X}, ?) on timeline {}",
-                pgdata.display(),
-                p.start_lsn,
-                p.timeline,
-            ),
-            (Some(_), None) => tracing::warn!(
-                target = "backup_push",
-                "--delta-from-wal-summaries without --pgdata: WAL summaries live on the \
-                 PG host's filesystem, not reachable from a remote pusher; skipping",
-            ),
+        if parent.is_some() && args.pgdata.is_none() {
+            bail!(
+                "--delta-from-wal-summaries requires --pgdata: WAL summaries live on \
+                 the PG host filesystem & cannot be read remotely"
+            );
         }
     }
 
@@ -189,6 +172,9 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     let mut tar_file_sets: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut pg_control_tee: Option<Bytes> = None;
+    // Built when BackupEvent::Start arrives, then shared by every tablespace
+    // streamer for this push. Stays None for full backups
+    let mut delta_context: Option<DeltaContext> = None;
 
     while let Some(event) = rx.recv().await {
         let event = event?;
@@ -197,9 +183,18 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                 start_lsn = Some(info.start_lsn);
                 tablespace_list = info.tablespaces.clone();
                 let seg_size = crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
-                let name = format_backup_name(info.timeline, info.start_lsn, seg_size);
-                debug_assert!(name.starts_with(BACKUP_NAME_PREFIX));
-                backup_name = Some(name);
+                let base_name = format_backup_name(info.timeline, info.start_lsn, seg_size);
+                debug_assert!(base_name.starts_with(BACKUP_NAME_PREFIX));
+                // Delta backups get a `_D_<parent-without-base_>` suffix
+                // (wal-g convention). delete/list/show all key off this
+                let resolved_name = match parent.as_ref() {
+                    Some(p) => format!(
+                        "{base_name}_D_{}",
+                        p.name.strip_prefix(BACKUP_NAME_PREFIX).unwrap_or(&p.name),
+                    ),
+                    None => base_name.clone(),
+                };
+                backup_name = Some(resolved_name);
                 tracing::info!(
                     target = "backup_push",
                     "BASE_BACKUP started: lsn={:X}/{:X} timeline={} tablespaces={}",
@@ -208,6 +203,82 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                     info.timeline,
                     info.tablespaces.len()
                 );
+
+                // Build the delta map once we know the upper LSN bound. WAL
+                // walk vs wal-summaries decided by --delta-from-wal-summaries.
+                // Failures here drop us to a full backup rather than aborting
+                // (wal-g semantics: a partial delta is worse than a full)
+                if let Some(p) = parent.as_ref() {
+                    let span = info.start_lsn.saturating_sub(p.start_lsn);
+                    if info.start_lsn <= p.start_lsn {
+                        tracing::warn!(
+                            target = "backup_push",
+                            "new start LSN {:X} <= parent {:X}; producing a full backup",
+                            info.start_lsn,
+                            p.start_lsn,
+                        );
+                    } else if args.delta_from_wal_summaries {
+                        match build_delta_map_from_summaries(
+                            args.pgdata.as_deref(),
+                            info.timeline,
+                            p.start_lsn,
+                            info.start_lsn,
+                        ) {
+                            Ok(map) => {
+                                tracing::info!(
+                                    target = "backup_push",
+                                    "delta map built from wal-summaries: \
+                                     {} dirty page(s) over {} bytes of WAL",
+                                    map.len(),
+                                    span,
+                                );
+                                delta_context = Some(DeltaContext {
+                                    map: Arc::new(map),
+                                    format: increment_format,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target = "backup_push",
+                                    "delta map from wal-summaries failed ({e:#}); \
+                                     producing a full backup",
+                                );
+                            }
+                        }
+                    } else {
+                        match delta::build_delta_map_from_wal(
+                            settings,
+                            &storage,
+                            p.timeline,
+                            p.start_lsn,
+                            info.start_lsn,
+                            settings.compression,
+                        )
+                        .await
+                        {
+                            Ok(map) => {
+                                tracing::info!(
+                                    target = "backup_push",
+                                    "delta map built from WAL walk: \
+                                     {} dirty page(s) over {} bytes of WAL",
+                                    map.len(),
+                                    span,
+                                );
+                                delta_context = Some(DeltaContext {
+                                    map: Arc::new(map),
+                                    format: increment_format,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target = "backup_push",
+                                    "delta map from WAL walk failed ({e:#}); \
+                                     producing a full backup",
+                                );
+                            }
+                        }
+                    }
+                }
             }
             BackupEvent::Archive { meta, body } => {
                 let name = backup_name
@@ -233,6 +304,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                     max_tar_size: tar_size,
                     starting_file_no: file_no,
                     queue_depth: settings.upload_queue,
+                    delta_context: delta_context.clone(),
                 };
                 let archive_label = if is_data_dir {
                     "base.tar".to_string()
@@ -268,8 +340,9 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                         let reader: AsyncReader = Box::pin(part.reader);
                         let compressed =
                             compression::encode(cfg.compression, reader, cfg.compression_level);
+                        let encrypted = cfg.encrypt(compressed);
                         let counter = Arc::new(AtomicU64::new(0));
-                        let counting = wrap_counted_reader(compressed, counter.clone());
+                        let counting = wrap_counted_reader(encrypted, counter.clone());
                         let throttled = cfg.throttle_network(counting);
                         s.put(&key, throttled, None)
                             .await
@@ -342,8 +415,9 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         tracing::info!(target = "backup_push", "uploading {key} (pg_control tee)");
         let raw: AsyncReader = Box::pin(std::io::Cursor::new(bytes.to_vec()));
         let compressed = compression::encode(settings.compression, raw, settings.compression_level);
+        let encrypted = settings.encrypt(compressed);
         let put_counter = Arc::new(AtomicU64::new(0));
-        let counting = wrap_counted_reader(compressed, put_counter.clone());
+        let counting = wrap_counted_reader(encrypted, put_counter.clone());
         let throttled = settings.throttle_network(counting);
         storage
             .put(&key, throttled, None)
@@ -376,12 +450,27 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     let hostname = hostname().unwrap_or_default();
     let finish_time = chrono::Utc::now();
 
+    // Wire the parent linkage into the sentinel only when increment
+    // generation actually ran (delta_context is set). If the delta map
+    // build failed earlier, parent stays informational but the sentinel
+    // must claim FULL — otherwise restore would walk a chain whose
+    // increments don't exist
+    let (incr_from_lsn, incr_from_name, incr_full_name, incr_count) =
+        match (parent.as_ref(), delta_context.as_ref()) {
+            (Some(p), Some(_)) => (
+                Some(p.start_lsn),
+                Some(p.name.clone()),
+                Some(resolve_increment_full_name(p)),
+                Some(p.increment_count as i32),
+            ),
+            _ => (None, None, None, None),
+        };
     let sentinel = BackupSentinelDto {
         backup_start_lsn: Some(start_lsn),
-        increment_from_lsn: None,
-        increment_from: None,
-        increment_full_name: None,
-        increment_count: None,
+        increment_from_lsn: incr_from_lsn,
+        increment_from: incr_from_name,
+        increment_full_name: incr_full_name,
+        increment_count: incr_count,
         pg_version,
         backup_finish_lsn: Some(end_lsn),
         system_identifier: Some(system_identifier),
@@ -559,3 +648,38 @@ fn wrap_counted_reader(input: AsyncReader, counter: Arc<AtomicU64>) -> AsyncRead
 // silence unused-import warnings during partial builds
 #[allow(dead_code)]
 fn _bytes_marker(_: BytesMut) {}
+
+/// Pick the chain-root name to record under `DeltaFullName`.
+/// `PrevBackupInfo.increment_full_name` is empty when the parent IS the
+/// chain root (no further indirection in V2 sentinel), in which case the
+/// root *is* the parent
+fn resolve_increment_full_name(p: &PrevBackupInfo) -> String {
+    if p.increment_full_name.is_empty() {
+        p.name.clone()
+    } else {
+        p.increment_full_name.clone()
+    }
+}
+
+/// PG17 wal-summaries → delta map. Returns an error if --pgdata is absent
+/// since the summaries live on the server's filesystem
+fn build_delta_map_from_summaries(
+    pgdata: Option<&std::path::Path>,
+    timeline: u32,
+    first_used_lsn: u64,
+    first_not_used_lsn: u64,
+) -> Result<crate::pg::backup::delta::PagedFileDeltaMap> {
+    let pgdata = pgdata.ok_or_else(|| anyhow!("--delta-from-wal-summaries requires --pgdata"))?;
+    let map = crate::pg::wal_summaries::read_for_range(
+        pgdata,
+        timeline,
+        first_used_lsn,
+        first_not_used_lsn,
+    )
+    .with_context(|| {
+        format!(
+            "read WAL summaries [{first_used_lsn:X}, {first_not_used_lsn:X}) timeline {timeline}"
+        )
+    })?;
+    Ok(map)
+}

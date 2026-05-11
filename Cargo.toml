@@ -38,13 +38,13 @@ aws-lc-rs = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tar = "0.4"
 postgres-protocol = "0.6"
-stringprep = "0.1"
 fallible-iterator = "0.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 rustls-pki-types = "1"
 rustls-pemfile = "2"
 webpki-roots = "1"
+dryoc = { version = "0.7", default-features = false, features = ["u64_backend"] }
 
 [dev-dependencies]
 tempfile = "3"

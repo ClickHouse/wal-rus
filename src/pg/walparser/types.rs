@@ -40,10 +40,37 @@ pub const BKP_BLOCK_HAS_DATA: u8 = 0x20;
 pub const BKP_BLOCK_WILL_INIT: u8 = 0x40;
 pub const BKP_BLOCK_SAME_REL: u8 = 0x80;
 
-// XLogRecordBlockImageHeader.Info bits
+// XLogRecordBlockImageHeader.Info bits.
+//
+// Bit layout shifted in PG 15 (commit a14354c, "Add WAL compression
+// methods"). Caller passes `pg15_or_later` derived from page magic so
+// `is_compressed` reads the right bits.
+//
+// PG ≤ 14:
+//   0x01 HAS_HOLE
+//   0x02 IS_COMPRESSED (pglz only)
+//   0x04 APPLY (advisory, PG 13/14)
+//
+// PG ≥ 15:
+//   0x01 HAS_HOLE
+//   0x02 APPLY              <-- bit moved
+//   0x04 COMPRESS_PGLZ
+//   0x08 COMPRESS_LZ4
+//   0x10 COMPRESS_ZSTD
 pub const BKP_IMAGE_HAS_HOLE: u8 = 0x01;
-pub const BKP_IMAGE_IS_COMPRESSED: u8 = 0x02;
-pub const _BKP_IMAGE_APPLY: u8 = 0x04;
+pub const BKP_IMAGE_IS_COMPRESSED_PG14: u8 = 0x02;
+pub const _BKP_IMAGE_APPLY_PG15: u8 = 0x02;
+pub const BKP_IMAGE_COMPRESS_PGLZ: u8 = 0x04;
+pub const BKP_IMAGE_COMPRESS_LZ4: u8 = 0x08;
+pub const BKP_IMAGE_COMPRESS_ZSTD: u8 = 0x10;
+pub const BKP_IMAGE_COMPRESS_MASK_PG15: u8 =
+    BKP_IMAGE_COMPRESS_PGLZ | BKP_IMAGE_COMPRESS_LZ4 | BKP_IMAGE_COMPRESS_ZSTD;
+
+/// Page magic per PG major, monotonic. Only the values walparser uses
+/// are listed; `magic >= XLP_PAGE_MAGIC_PG15` reads "stream uses the
+/// PG-15-style FPI bit layout"
+pub const XLP_PAGE_MAGIC_PG14: u16 = 0xD10D;
+pub const XLP_PAGE_MAGIC_PG15: u16 = 0xD110;
 
 // XLogPageHeader.Info flag bits
 pub const XLP_FIRST_IS_CONT_RECORD: u16 = 0x0001;
@@ -223,8 +250,15 @@ impl XLogRecordBlockImageHeader {
     pub fn has_hole(&self) -> bool {
         self.info & BKP_IMAGE_HAS_HOLE != 0
     }
-    pub fn is_compressed(&self) -> bool {
-        self.info & BKP_IMAGE_IS_COMPRESSED != 0
+    /// FPI compression predicate. PG 15 reshuffled bimg_info bits; pass
+    /// the page magic from `XLogPageHeader.magic` so the right mask is
+    /// applied. Future bit shifts add another comparison here
+    pub fn is_compressed(&self, page_magic: u16) -> bool {
+        if page_magic >= XLP_PAGE_MAGIC_PG15 {
+            self.info & BKP_IMAGE_COMPRESS_MASK_PG15 != 0
+        } else {
+            self.info & BKP_IMAGE_IS_COMPRESSED_PG14 != 0
+        }
     }
 }
 

@@ -43,6 +43,10 @@ pub enum ReadLocationsError {
 pub struct WalParser {
     current_record_data: Vec<u8>,
     has_current_record_beginning: bool,
+    /// `XLogPageHeader.magic` observed on most recent valid page. Drives
+    /// FPI bit-layout selection (PG 15 reshuffled bimg_info). `None`
+    /// before any page is parsed; defaults to PG-14 layout when missing
+    page_magic: Option<u16>,
 }
 
 impl WalParser {
@@ -65,6 +69,12 @@ impl WalParser {
 
     pub fn has_current_record_beginning(&self) -> bool {
         self.has_current_record_beginning
+    }
+
+    /// Most recent page magic observed. Defaults to PG-14 layout if no
+    /// page header has been seen yet
+    pub fn page_magic(&self) -> u16 {
+        self.page_magic.unwrap_or(super::types::XLP_PAGE_MAGIC_PG14)
     }
 
     /// Parse all records starting on `page_data` (exactly one 8 KiB page).
@@ -109,7 +119,7 @@ impl WalParser {
         if header.total_record_length as usize != current_record_data.len() {
             return Err(ParseError::ContinuationNotFound.into());
         }
-        let current_record = parse_record_from_bytes(&current_record_data)?;
+        let current_record = parse_record_from_bytes(&current_record_data, self.page_magic())?;
 
         let mut records = Vec::with_capacity(page.records.len() + 1);
         records.push(current_record);
@@ -135,6 +145,7 @@ impl WalParser {
             }
             Err(e) => return Err(e.into()),
         };
+        self.page_magic = Some(header.magic);
         let consumed = page_data.len() - cursor.len();
         let mut ar = AlignedReader {
             buf: cursor,
@@ -162,7 +173,7 @@ impl WalParser {
         if self.has_current_record_beginning {
             let mut joined = self.current_record_data.clone();
             joined.extend_from_slice(&remaining_data);
-            if let Ok(record) = parse_record_from_bytes(&joined)
+            if let Ok(record) = parse_record_from_bytes(&joined, self.page_magic())
                 && record.is_wal_switch()
             {
                 return Ok(XLogPage {
@@ -197,6 +208,9 @@ impl WalParser {
         Ok(Self {
             current_record_data: data,
             has_current_record_beginning: has,
+            // save/load format is unchanged; page_magic is repopulated
+            // from the first page header observed after load
+            page_magic: None,
         })
     }
 }
@@ -210,6 +224,7 @@ fn read_xlog_page_inner(
     header: XLogPageHeader,
     remaining_data: Vec<u8>,
 ) -> Result<XLogPage, ParsePageError> {
+    let page_magic = header.magic;
     let mut records = Vec::new();
     loop {
         let res = try_read_xlog_record_data(ar);
@@ -224,7 +239,7 @@ fn read_xlog_page_inner(
                     });
                 }
                 if whole {
-                    let record = parse_record_from_bytes(&data)?;
+                    let record = parse_record_from_bytes(&data, page_magic)?;
                     let is_switch = record.is_wal_switch();
                     records.push(record);
                     if is_switch {
