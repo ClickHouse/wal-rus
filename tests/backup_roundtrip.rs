@@ -8,10 +8,12 @@ use wal_rs::compression::Method;
 use wal_rs::config::{DeltaSettings, Settings, StorageSettings};
 use wal_rs::pg::backup::delta as delta_mod;
 use wal_rs::pg::backup::fetch as fetch_mod;
+use wal_rs::pg::backup::increment::write_increment_header;
 use wal_rs::pg::backup::list as list_mod;
 use wal_rs::pg::backup::{
-    BackupSentinelDto, BackupSentinelDtoV2, METADATA_DATETIME_FORMAT, TablespaceSpec,
-    format_backup_name, sentinel_key, tar_part_key,
+    BackupSentinelDto, BackupSentinelDtoV2, FileDescription, FilesMetadataDto,
+    METADATA_DATETIME_FORMAT, TablespaceSpec, files_metadata_key, format_backup_name, sentinel_key,
+    tar_part_key,
 };
 use wal_rs::storage::Storage;
 use wal_rs::storage::fs::FsStorage;
@@ -465,4 +467,278 @@ async fn fetch_decrypts_libsodium_tar_part() {
         std::fs::read(restore.join("dir/file_b.bin")).unwrap(),
         vec![7u8; 2048]
     );
+}
+
+#[tokio::test]
+async fn fetch_applies_delta_chain_wi1() {
+    // Full → wi1-delta chain on a 4-block paged file under base/16384/16400.
+    // After fetch, blocks 1 and 3 should reflect the delta's content, while
+    // blocks 0 and 2 should still carry the full backup's contents
+    const BLCKSZ: usize = 8192;
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let restore = dir.path().join("restore");
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+
+    let mut s = test_settings();
+    s.compression = Method::None;
+
+    // Full backup: 4 blocks, each filled with marker 0xAA, first 4 bytes
+    // = block number
+    let full_name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
+    let mut full_body = vec![0xAAu8; 4 * BLCKSZ];
+    for b in 0u32..4 {
+        let off = (b as usize) * BLCKSZ;
+        full_body[off..off + 4].copy_from_slice(&b.to_le_bytes());
+    }
+    let full_tar = build_tar(&[("base/16384/16400", &full_body)]);
+
+    let full_sentinel = make_sentinel_v2("/d");
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&full_name),
+        serde_json::to_vec(&full_sentinel).unwrap(),
+    )
+    .await;
+    put_bytes(store.clone(), &tar_part_key(&full_name, 1, ""), full_tar).await;
+    // Empty files_metadata.json: nothing incremented in a full backup
+    let full_meta = FilesMetadataDto::default();
+    put_bytes(
+        store.clone(),
+        &files_metadata_key(&full_name),
+        serde_json::to_vec(&full_meta).unwrap(),
+    )
+    .await;
+
+    // Delta: rewrite block 1 with 0xBB-marker and block 3 with 0xCC-marker
+    let mut block1 = vec![0xBBu8; BLCKSZ];
+    block1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let mut block3 = vec![0xCCu8; BLCKSZ];
+    block3[0..4].copy_from_slice(&3u32.to_le_bytes());
+    let mut increment = Vec::new();
+    write_increment_header(&mut increment, (4 * BLCKSZ) as u64, &[1, 3]).unwrap();
+    increment.extend_from_slice(&block1);
+    increment.extend_from_slice(&block3);
+
+    let delta_name = format!(
+        "{}_D_{}",
+        format_backup_name(1, 0x0200_0000, 16 * 1024 * 1024),
+        full_name.strip_prefix("base_").unwrap(),
+    );
+    let mut delta_sentinel = make_sentinel_v2("/d");
+    delta_sentinel.sentinel.increment_from = Some(full_name.clone());
+    delta_sentinel.sentinel.increment_from_lsn = Some(0x0100_0000);
+    delta_sentinel.sentinel.increment_full_name = Some(full_name.clone());
+    delta_sentinel.sentinel.increment_count = Some(1);
+    delta_sentinel.sentinel.backup_start_lsn = Some(0x0200_0000);
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&delta_name),
+        serde_json::to_vec(&delta_sentinel).unwrap(),
+    )
+    .await;
+
+    let delta_tar = build_tar(&[("base/16384/16400", &increment)]);
+    put_bytes(store.clone(), &tar_part_key(&delta_name, 1, ""), delta_tar).await;
+    // Delta's files_metadata.json claims the file is incremented
+    let mut delta_meta = FilesMetadataDto::default();
+    delta_meta.files.insert(
+        "base/16384/16400".into(),
+        FileDescription {
+            is_incremented: true,
+            is_skipped: false,
+            mtime: Utc::now(),
+            updates_count: 0,
+        },
+    );
+    put_bytes(
+        store.clone(),
+        &files_metadata_key(&delta_name),
+        serde_json::to_vec(&delta_meta).unwrap(),
+    )
+    .await;
+
+    fetch_mod::handle(&s, store as Arc<dyn Storage>, &delta_name, &restore)
+        .await
+        .unwrap();
+
+    let restored = std::fs::read(restore.join("base/16384/16400")).unwrap();
+    assert_eq!(restored.len(), 4 * BLCKSZ);
+    // block 0: full backup's 0xAA
+    assert!(
+        restored[4..BLCKSZ].iter().all(|&b| b == 0xAA),
+        "block 0 should carry the full backup contents"
+    );
+    // block 1: delta's 0xBB
+    assert_eq!(&restored[BLCKSZ..BLCKSZ + 4], &1u32.to_le_bytes());
+    assert!(
+        restored[BLCKSZ + 4..2 * BLCKSZ].iter().all(|&b| b == 0xBB),
+        "block 1 should carry the delta contents"
+    );
+    // block 2: full backup's 0xAA (untouched by delta)
+    assert!(
+        restored[2 * BLCKSZ + 4..3 * BLCKSZ]
+            .iter()
+            .all(|&b| b == 0xAA),
+        "block 2 should remain from the full backup"
+    );
+    // block 3: delta's 0xCC
+    assert_eq!(&restored[3 * BLCKSZ..3 * BLCKSZ + 4], &3u32.to_le_bytes());
+    assert!(
+        restored[3 * BLCKSZ + 4..].iter().all(|&b| b == 0xCC),
+        "block 3 should carry the delta contents"
+    );
+}
+
+#[tokio::test]
+async fn fetch_walks_three_step_chain() {
+    // full → delta1 → delta2. Verify chain walk visits all three and last
+    // writer wins per-block. delta1 changes block 1; delta2 also changes
+    // block 1 (must overwrite delta1's bytes) plus block 2 (untouched in
+    // delta1, so must reach from delta2 directly)
+    const BLCKSZ: usize = 8192;
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let restore = dir.path().join("restore");
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+
+    let mut s = test_settings();
+    s.compression = Method::None;
+
+    // Full: 3 blocks marker 0xAA + block number stamp
+    let full_name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
+    let mut full_body = vec![0xAAu8; 3 * BLCKSZ];
+    for b in 0u32..3 {
+        let off = b as usize * BLCKSZ;
+        full_body[off..off + 4].copy_from_slice(&b.to_le_bytes());
+    }
+    let full_tar = build_tar(&[("base/16384/16400", &full_body)]);
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&full_name),
+        serde_json::to_vec(&make_sentinel_v2("/d")).unwrap(),
+    )
+    .await;
+    put_bytes(store.clone(), &tar_part_key(&full_name, 1, ""), full_tar).await;
+    put_bytes(
+        store.clone(),
+        &files_metadata_key(&full_name),
+        serde_json::to_vec(&FilesMetadataDto::default()).unwrap(),
+    )
+    .await;
+
+    // delta1: rewrite block 1 with 0xBB
+    let mut delta1_block1 = vec![0xBBu8; BLCKSZ];
+    delta1_block1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let mut delta1_inc = Vec::new();
+    write_increment_header(&mut delta1_inc, (3 * BLCKSZ) as u64, &[1]).unwrap();
+    delta1_inc.extend_from_slice(&delta1_block1);
+
+    let delta1_name = format!(
+        "{}_D_{}",
+        format_backup_name(1, 0x0200_0000, 16 * 1024 * 1024),
+        full_name.strip_prefix("base_").unwrap(),
+    );
+    let mut s1 = make_sentinel_v2("/d");
+    s1.sentinel.increment_from = Some(full_name.clone());
+    s1.sentinel.increment_from_lsn = Some(0x0100_0000);
+    s1.sentinel.increment_full_name = Some(full_name.clone());
+    s1.sentinel.increment_count = Some(1);
+    s1.sentinel.backup_start_lsn = Some(0x0200_0000);
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&delta1_name),
+        serde_json::to_vec(&s1).unwrap(),
+    )
+    .await;
+    put_bytes(
+        store.clone(),
+        &tar_part_key(&delta1_name, 1, ""),
+        build_tar(&[("base/16384/16400", &delta1_inc)]),
+    )
+    .await;
+    let mut m1 = FilesMetadataDto::default();
+    m1.files.insert(
+        "base/16384/16400".into(),
+        FileDescription {
+            is_incremented: true,
+            is_skipped: false,
+            mtime: Utc::now(),
+            updates_count: 0,
+        },
+    );
+    put_bytes(
+        store.clone(),
+        &files_metadata_key(&delta1_name),
+        serde_json::to_vec(&m1).unwrap(),
+    )
+    .await;
+
+    // delta2: rewrite block 1 with 0xDD (overwrites delta1) AND block 2 0xEE
+    let mut delta2_block1 = vec![0xDDu8; BLCKSZ];
+    delta2_block1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let mut delta2_block2 = vec![0xEEu8; BLCKSZ];
+    delta2_block2[0..4].copy_from_slice(&2u32.to_le_bytes());
+    let mut delta2_inc = Vec::new();
+    write_increment_header(&mut delta2_inc, (3 * BLCKSZ) as u64, &[1, 2]).unwrap();
+    delta2_inc.extend_from_slice(&delta2_block1);
+    delta2_inc.extend_from_slice(&delta2_block2);
+
+    let delta2_name = format!(
+        "{}_D_{}",
+        format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024),
+        delta1_name.strip_prefix("base_").unwrap(),
+    );
+    let mut s2 = make_sentinel_v2("/d");
+    s2.sentinel.increment_from = Some(delta1_name.clone());
+    s2.sentinel.increment_from_lsn = Some(0x0200_0000);
+    s2.sentinel.increment_full_name = Some(full_name.clone());
+    s2.sentinel.increment_count = Some(2);
+    s2.sentinel.backup_start_lsn = Some(0x0300_0000);
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&delta2_name),
+        serde_json::to_vec(&s2).unwrap(),
+    )
+    .await;
+    put_bytes(
+        store.clone(),
+        &tar_part_key(&delta2_name, 1, ""),
+        build_tar(&[("base/16384/16400", &delta2_inc)]),
+    )
+    .await;
+    let mut m2 = FilesMetadataDto::default();
+    m2.files.insert(
+        "base/16384/16400".into(),
+        FileDescription {
+            is_incremented: true,
+            is_skipped: false,
+            mtime: Utc::now(),
+            updates_count: 0,
+        },
+    );
+    put_bytes(
+        store.clone(),
+        &files_metadata_key(&delta2_name),
+        serde_json::to_vec(&m2).unwrap(),
+    )
+    .await;
+
+    fetch_mod::handle(&s, store as Arc<dyn Storage>, &delta2_name, &restore)
+        .await
+        .unwrap();
+
+    let restored = std::fs::read(restore.join("base/16384/16400")).unwrap();
+    assert_eq!(restored.len(), 3 * BLCKSZ);
+    // block 0: untouched 0xAA
+    assert!(restored[4..BLCKSZ].iter().all(|&b| b == 0xAA));
+    // block 1: delta2's 0xDD (delta1's 0xBB must NOT win)
+    assert_eq!(&restored[BLCKSZ..BLCKSZ + 4], &1u32.to_le_bytes());
+    assert!(
+        restored[BLCKSZ + 4..2 * BLCKSZ].iter().all(|&b| b == 0xDD),
+        "block 1 final state must be delta2's 0xDD, not delta1's 0xBB"
+    );
+    // block 2: delta2's 0xEE
+    assert_eq!(&restored[2 * BLCKSZ..2 * BLCKSZ + 4], &2u32.to_le_bytes());
+    assert!(restored[2 * BLCKSZ + 4..].iter().all(|&b| b == 0xEE));
 }

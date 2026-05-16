@@ -26,96 +26,13 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::Settings;
 use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
+use crate::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use crate::pg::wal::push;
 use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 use crate::storage::DynStorage;
 
-/// Microseconds between 1970-01-01 and 2000-01-01 (PG epoch). Standby status
-/// updates carry timestamps in PG's microsecond-since-2000 format
-const PG_EPOCH_USEC: i64 = 946_684_800_000_000;
-
 /// Status update cadence — wal-g defaults to 10s; we match
 const STATUS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-#[derive(Debug, Clone, Copy)]
-struct WalFrame<'a> {
-    start_lsn: u64,
-    _server_wal_end: u64,
-    _send_time: i64,
-    data: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct KeepaliveFrame {
-    _server_wal_end: u64,
-    _send_time: i64,
-    reply_requested: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Frame<'a> {
-    Wal(WalFrame<'a>),
-    Keepalive(KeepaliveFrame),
-}
-
-/// Decode a server CopyData frame. The first byte selects the variant
-fn decode_frame(payload: &[u8]) -> Result<Frame<'_>> {
-    if payload.is_empty() {
-        bail!("empty CopyData payload");
-    }
-    match payload[0] {
-        b'w' => {
-            if payload.len() < 1 + 24 {
-                bail!("WAL data frame too short: {} bytes", payload.len());
-            }
-            let p = &payload[1..];
-            let start_lsn = u64::from_be_bytes(p[0..8].try_into().unwrap());
-            let server_wal_end = u64::from_be_bytes(p[8..16].try_into().unwrap());
-            let send_time = i64::from_be_bytes(p[16..24].try_into().unwrap());
-            Ok(Frame::Wal(WalFrame {
-                start_lsn,
-                _server_wal_end: server_wal_end,
-                _send_time: send_time,
-                data: &p[24..],
-            }))
-        }
-        b'k' => {
-            if payload.len() < 1 + 17 {
-                bail!("keepalive frame too short: {} bytes", payload.len());
-            }
-            let p = &payload[1..];
-            let server_wal_end = u64::from_be_bytes(p[0..8].try_into().unwrap());
-            let send_time = i64::from_be_bytes(p[8..16].try_into().unwrap());
-            let reply_requested = p[16] != 0;
-            Ok(Frame::Keepalive(KeepaliveFrame {
-                _server_wal_end: server_wal_end,
-                _send_time: send_time,
-                reply_requested,
-            }))
-        }
-        tag => bail!("unknown CopyData tag: {:?}", tag as char),
-    }
-}
-
-/// Build a standby status update reply (`r` CopyData payload)
-fn build_status_update(write_lsn: u64, flush_lsn: u64, apply_lsn: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(34);
-    out.push(b'r');
-    out.extend_from_slice(&write_lsn.to_be_bytes());
-    out.extend_from_slice(&flush_lsn.to_be_bytes());
-    out.extend_from_slice(&apply_lsn.to_be_bytes());
-    out.extend_from_slice(&now_pg_microseconds().to_be_bytes());
-    out.push(0); // no immediate reply requested
-    out
-}
-
-fn now_pg_microseconds() -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    now - PG_EPOCH_USEC
-}
 
 /// Accumulate WAL bytes into segment-sized files on disk; rotate on
 /// boundary crossings. Each fully-written segment is shipped via the

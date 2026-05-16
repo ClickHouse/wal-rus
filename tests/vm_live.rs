@@ -407,7 +407,11 @@ async fn retain_full_one_against_live_pg() {
         .expect("delete retain FULL 1");
 
     let post = backup::list::collect(store).await.unwrap();
-    assert_eq!(post.len(), 1, "retain FULL 1 should leave exactly one backup");
+    assert_eq!(
+        post.len(),
+        1,
+        "retain FULL 1 should leave exactly one backup"
+    );
     assert_eq!(post[0].name, kept_name, "expected newest backup to survive");
 }
 
@@ -429,9 +433,8 @@ async fn wal_receive_archives_segment_against_live_pg() {
     let s_recv = s.clone();
     let store_recv = store.clone();
     let archive_path = archive_dir.clone();
-    let mut receive_task = tokio::spawn(async move {
-        wal::receive::handle(&s_recv, store_recv, &archive_path).await
-    });
+    let mut receive_task =
+        tokio::spawn(async move { wal::receive::handle(&s_recv, store_recv, &archive_path).await });
 
     // Let START_REPLICATION establish before forcing segment rotations
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -449,7 +452,15 @@ async fn wal_receive_archives_segment_against_live_pg() {
     for _ in 0..3 {
         let out = std::process::Command::new("psql")
             .args([
-                "-h", &pghost, "-p", &pgport, "-U", &pguser, "-d", &pgdb, "-Atqc",
+                "-h",
+                &pghost,
+                "-p",
+                &pgport,
+                "-U",
+                &pguser,
+                "-d",
+                &pgdb,
+                "-Atqc",
                 "SELECT pg_switch_wal()",
             ])
             .output()

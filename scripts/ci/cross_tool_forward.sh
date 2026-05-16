@@ -43,6 +43,6 @@ for _ in $(seq 1 60); do
 done
 
 pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump2.sql"
-diff "$WORKROOT/dump1.sql" "$WORKROOT/dump2.sql"
+diff -I '^\\\(restrict\|unrestrict\) ' "$WORKROOT/dump1.sql" "$WORKROOT/dump2.sql"
 
 echo "cross_tool_forward OK"

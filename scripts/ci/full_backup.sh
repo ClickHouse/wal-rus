@@ -40,6 +40,8 @@ for _ in $(seq 1 60); do
 done
 
 pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump2.sql"
-diff "$WORKROOT/dump1.sql" "$WORKROOT/dump2.sql"
+# pg_dumpall in PG 17.x/18 emits per-invocation random tokens via
+# psql \restrict/\unrestrict (CVE-2025-1094 hardening); ignore those lines
+diff -I '^\\\(restrict\|unrestrict\) ' "$WORKROOT/dump1.sql" "$WORKROOT/dump2.sql"
 
 echo "full_backup OK"

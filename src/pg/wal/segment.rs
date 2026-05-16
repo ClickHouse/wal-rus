@@ -84,10 +84,12 @@ pub fn is_wal_filename(name: &str) -> bool {
     name.len() == SEGMENT_NAME_LEN && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+// wal-g uses a plain suffix check (strings.HasSuffix(path, ".history"))
+// in wal_push_handler.go, so match that for bucket interop & archive_command
+// drop-in compat. Real PG history files are %08X.history but the archive
+// command path doesn't enforce the format
 pub fn is_history_filename(name: &str) -> bool {
     name.ends_with(".history")
-        && name.len() >= ".history".len() + 8
-        && name[..8].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -131,7 +133,10 @@ mod tests {
         assert!(is_wal_filename("000000010000000000000001"));
         assert!(!is_wal_filename("000000010000000000000001.partial"));
         assert!(is_history_filename("00000002.history"));
-        assert!(!is_history_filename("readme.history"));
+        // matches wal-g's strings.HasSuffix semantics, not the strict PG format
+        assert!(is_history_filename("readme.history"));
+        assert!(!is_history_filename("00000002"));
+        assert!(!is_history_filename("00000002.partial"));
     }
 
     #[test]

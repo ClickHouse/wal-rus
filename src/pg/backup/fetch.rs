@@ -5,6 +5,7 @@
 //! pg_control.tar applies last (sorted in `list_tar_parts`) so an
 //! interrupted restore can't leave a stale pg_control behind
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,9 +15,10 @@ use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
 use crate::config::Settings;
+use crate::pg::backup::increment::apply_increment_in_place;
 use crate::pg::backup::{
-    BackupSentinelDtoV2, LATEST, TablespaceSpec, name_from_sentinel_key, sentinel_key,
-    tar_partitions_prefix,
+    BackupSentinelDtoV2, FilesMetadataDto, LATEST, TablespaceSpec, files_metadata_key,
+    name_from_sentinel_key, sentinel_key, tar_partitions_prefix,
 };
 use crate::storage::DynStorage;
 
@@ -51,7 +53,12 @@ pub async fn handle_with_args(
         dst.display()
     );
 
-    let sentinel = fetch_sentinel(&storage, &resolved).await?;
+    // Walk the delta chain leaf → root then reverse. The leaf sentinel
+    // carries Spec/tablespace_mappings; intermediate ancestors share the
+    // same Spec (Spec is a function of `pgdata`, not of LSN) so applying
+    // symlinks from the leaf covers all parts
+    let chain = build_chain(&storage, &resolved).await?;
+    let leaf_sentinel = chain.last().expect("chain has leaf").1.clone();
 
     tokio::fs::create_dir_all(dst)
         .await
@@ -60,23 +67,92 @@ pub async fn handle_with_args(
     // Restore tablespace symlinks BEFORE extracting parts so the tar crate
     // writes through the symlink rather than materializing a real dir at
     // pg_tblspc/<oid>. wal-g does the same in `EnsureSymlinkExist`
-    if let Some(spec) = sentinel.sentinel.tablespace_spec.as_ref() {
+    if let Some(spec) = leaf_sentinel.sentinel.tablespace_spec.as_ref() {
         restore_tablespace_symlinks(dst, spec, &args.tablespace_mappings).await?;
     }
 
-    let parts = list_tar_parts(&storage, &resolved).await?;
-    if parts.is_empty() {
-        bail!(
-            "backup {resolved} has no tar parts under {}/",
-            tar_partitions_prefix(&resolved)
+    if chain.len() > 1 {
+        tracing::info!(
+            target = "backup_fetch",
+            "delta chain depth {}: {}",
+            chain.len(),
+            chain
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ")
         );
     }
-    tracing::info!(target = "backup_fetch", "found {} tar part(s)", parts.len());
 
-    for key in parts {
-        unpack_part(settings, &storage, &key, dst).await?;
+    for (name, _) in &chain {
+        let parts = list_tar_parts(&storage, name).await?;
+        if parts.is_empty() {
+            bail!(
+                "backup {name} has no tar parts under {}/",
+                tar_partitions_prefix(name)
+            );
+        }
+        // Increment lookup: paged files that came down wi1/native-encoded
+        // need apply_increment_in_place rather than overwrite. Pulled once
+        // per backup; small (~hundreds of KB even for big clusters)
+        let incremented = fetch_incremented_set(&storage, name).await?;
+        tracing::info!(
+            target = "backup_fetch",
+            "found {} tar part(s) for {name} ({} incremented file(s))",
+            parts.len(),
+            incremented.len(),
+        );
+        for key in &parts {
+            unpack_part(settings, &storage, key, dst, &incremented).await?;
+        }
     }
     Ok(())
+}
+
+/// Walk the delta chain via sentinel `increment_from`, root-first.
+/// Returns `[(name, sentinel)]` from chain root to the requested leaf.
+/// A full backup yields a single-entry vec
+async fn build_chain(
+    storage: &DynStorage,
+    leaf: &str,
+) -> Result<Vec<(String, BackupSentinelDtoV2)>> {
+    let mut out: Vec<(String, BackupSentinelDtoV2)> = Vec::new();
+    let mut cur = leaf.to_string();
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        if !seen.insert(cur.clone()) {
+            bail!("delta chain has a cycle at {cur}");
+        }
+        let s = fetch_sentinel(storage, &cur).await?;
+        let parent = s.sentinel.increment_from.clone();
+        out.push((cur, s));
+        match parent {
+            Some(p) => cur = p,
+            None => break,
+        }
+        if out.len() > 64 {
+            bail!("delta chain longer than 64 steps; refusing to walk further");
+        }
+    }
+    out.reverse();
+    Ok(out)
+}
+
+async fn fetch_incremented_set(storage: &DynStorage, name: &str) -> Result<HashSet<String>> {
+    let key = files_metadata_key(name);
+    let mut r = match storage.get(&key).await {
+        Ok(r) => r,
+        Err(_) => return Ok(HashSet::new()),
+    };
+    let mut buf = Vec::with_capacity(4096);
+    r.read_to_end(&mut buf).await?;
+    let meta: FilesMetadataDto =
+        serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))?;
+    Ok(meta
+        .files
+        .into_iter()
+        .filter_map(|(k, v)| if v.is_incremented { Some(k) } else { None })
+        .collect())
 }
 
 pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
@@ -195,6 +271,7 @@ async fn unpack_part(
     storage: &DynStorage,
     key: &str,
     dst: &Path,
+    incremented: &HashSet<String>,
 ) -> Result<()> {
     let method = method_from_key(key);
     let body = storage
@@ -205,11 +282,12 @@ async fn unpack_part(
     let decrypted = settings.decrypt(throttled);
     let decoded = compression::decode(method, decrypted);
     let dst: PathBuf = dst.to_path_buf();
+    let incremented = incremented.clone();
 
     let res: std::io::Result<()> = tokio::task::spawn_blocking(move || {
         let sync_r = SyncIoBridge::new(decoded);
         let mut archive = tar::Archive::new(sync_r);
-        unpack_manual(&mut archive, &dst)
+        unpack_manual(&mut archive, &dst, &incremented)
     })
     .await
     .context("tar unpack join")?;
@@ -225,6 +303,7 @@ async fn unpack_part(
 fn unpack_manual<R: std::io::Read>(
     archive: &mut tar::Archive<R>,
     dst: &Path,
+    incremented: &HashSet<String>,
 ) -> std::io::Result<()> {
     use std::io::Write;
     use std::path::Component;
@@ -268,13 +347,39 @@ fn unpack_manual<R: std::io::Read>(
             }
         } else if etype.is_file() || etype.is_hard_link() {
             // ignore hard links to keep this simple; PG basebackup doesn't emit any
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&target)?;
-            std::io::copy(&mut entry, &mut f)?;
-            f.flush()?;
+            let path_key = rel.to_string_lossy().into_owned();
+            if incremented.contains(&path_key) {
+                // Increment path: apply onto whatever the earlier chain step
+                // left in place. The target must already exist (chain root
+                // wrote the full file). open() in r+w (not truncate)
+                let mut f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&target)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("apply increment {path_key}: open target: {e}"),
+                        )
+                    })?;
+                let (final_size, _, _) =
+                    apply_increment_in_place(&mut entry, &mut f).map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("apply increment {path_key}: {e}"),
+                        )
+                    })?;
+                f.set_len(final_size)?;
+                f.flush()?;
+            } else {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&target)?;
+                std::io::copy(&mut entry, &mut f)?;
+                f.flush()?;
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

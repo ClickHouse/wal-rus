@@ -28,7 +28,9 @@ pub use state::{
     read_locations_from, write_locations_to,
 };
 pub use types::{
-    BLOCK_SIZE, BlockLocation, Oid, RelFileNode, RmId, TimeLineId, WAL_PAGE_SIZE, XLogPage,
-    XLogPageHeader, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordBlockImageHeader,
-    XLogRecordHeader, XLogRecordPtr,
+    BLOCK_SIZE, BlockLocation, Oid, RelFileNode, RmId, TimeLineId, WAL_PAGE_SIZE,
+    X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, X_LOG_SWITCH, XLP_FIRST_IS_CONT_RECORD,
+    XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG14, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
+    XLR_BLOCK_ID_DATA_SHORT, XLR_INFO_MASK, XLogPage, XLogPageHeader, XLogRecord, XLogRecordBlock,
+    XLogRecordBlockHeader, XLogRecordBlockImageHeader, XLogRecordHeader, XLogRecordPtr,
 };
