@@ -3,9 +3,9 @@
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use tokio::io::AsyncReadExt;
 
-use crate::pg::backup::{BackupSentinelDtoV2, name_from_sentinel_key, sentinel_key};
+use crate::pg::backup::fetch::fetch_sentinel;
+use crate::pg::backup::name_from_sentinel_key;
 use crate::storage::DynStorage;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -82,15 +82,7 @@ pub async fn collect(storage: DynStorage) -> Result<Vec<BackupSummary>> {
 }
 
 async fn fetch_summary(storage: &DynStorage, name: &str) -> Result<BackupSummary> {
-    let key = sentinel_key(name);
-    let mut r = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let mut buf = Vec::with_capacity(4096);
-    r.read_to_end(&mut buf).await?;
-    let v2: BackupSentinelDtoV2 =
-        serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))?;
+    let v2 = fetch_sentinel(storage, name).await?;
     Ok(BackupSummary {
         name: name.to_string(),
         start_time: Some(v2.start_time),

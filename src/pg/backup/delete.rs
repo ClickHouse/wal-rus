@@ -15,11 +15,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde::Serialize;
-use tokio::io::AsyncReadExt;
 
-use crate::pg::backup::{
-    BackupSentinelDtoV2, LATEST, name_from_sentinel_key, sentinel_key, strip_leftmost_backup_name,
-};
+use crate::pg::backup::fetch::fetch_sentinel;
+use crate::pg::backup::{LATEST, name_from_sentinel_key, strip_leftmost_backup_name};
 use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 use crate::storage::DynStorage;
 
@@ -103,16 +101,7 @@ pub async fn collect_records(storage: &DynStorage) -> Result<Vec<BackupRecord>> 
 }
 
 async fn fetch_record(storage: &DynStorage, name: &str) -> Result<BackupRecord> {
-    let key = sentinel_key(name);
-    let mut r = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let mut buf = Vec::with_capacity(4096);
-    r.read_to_end(&mut buf).await?;
-    let v2: BackupSentinelDtoV2 =
-        serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))?;
-
+    let v2 = fetch_sentinel(storage, name).await?;
     let (timeline, start_seg_no) = try_extract_timeline_seg_no(name)
         .ok_or_else(|| anyhow!("cannot derive timeline / segment from backup name {name}"))?;
     Ok(BackupRecord {

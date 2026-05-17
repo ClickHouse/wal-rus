@@ -15,6 +15,7 @@ use std::io::{self, Read, Write};
 
 use thiserror::Error;
 
+use super::all_zero;
 use super::parse::{
     AlignedReader, ExtractError, ParseError, extract_block_locations, parse_record_from_bytes,
     read_xlog_page_header, read_xlog_record_header, try_read_xlog_record_data,
@@ -213,10 +214,6 @@ impl WalParser {
             page_magic: None,
         })
     }
-}
-
-fn all_zero(data: &[u8]) -> bool {
-    data.iter().all(|&b| b == 0)
 }
 
 fn read_xlog_page_inner(

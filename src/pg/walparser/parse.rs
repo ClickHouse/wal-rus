@@ -10,6 +10,7 @@
 
 use thiserror::Error;
 
+use super::all_zero;
 use super::types::{
     BKP_IMAGE_HAS_HOLE, BLOCK_SIZE, BlockLocation, RM_NEXT_FREE_ID, RelFileNode, WAL_PAGE_SIZE,
     X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG,
@@ -147,10 +148,6 @@ fn read_u32(buf: &mut &[u8], field: &'static str) -> Result<u32, ParseError> {
 }
 fn read_u64(buf: &mut &[u8], field: &'static str) -> Result<u64, ParseError> {
     Ok(u64::from_le_bytes(take(buf, 8, field)?.try_into().unwrap()))
-}
-
-fn all_zero(buf: &[u8]) -> bool {
-    buf.iter().all(|&b| b == 0)
 }
 
 pub(crate) fn read_xlog_record_header(buf: &mut &[u8]) -> Result<XLogRecordHeader, ParseError> {

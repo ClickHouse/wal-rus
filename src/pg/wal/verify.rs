@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::cli::WalVerifyOp;
 use crate::pg::backup::list as backup_list;
+use crate::pg::backup::parse_timeline_from_backup_name;
 use crate::pg::wal::show::{self, GapInfo};
 use crate::storage::DynStorage;
 
@@ -154,14 +155,6 @@ pub async fn check_timeline(storage: DynStorage) -> Result<TimelineReport> {
         current_timeline: current,
         latest_backup_timeline: latest_backup_tli,
     })
-}
-
-fn parse_timeline_from_backup_name(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix(crate::pg::backup::BACKUP_NAME_PREFIX)?;
-    if rest.len() < 8 {
-        return None;
-    }
-    u32::from_str_radix(&rest[..8], 16).ok()
 }
 
 fn print_integrity(r: &IntegrityReport) {

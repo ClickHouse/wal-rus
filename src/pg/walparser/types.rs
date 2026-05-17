@@ -260,6 +260,43 @@ impl XLogRecordBlockImageHeader {
             self.info & BKP_IMAGE_IS_COMPRESSED_PG14 != 0
         }
     }
+    /// Resolve PG-15+ compression method, or `None` for uncompressed.
+    /// PG-14 fixtures collapse to `Some(Pglz)` when IS_COMPRESSED_PG14
+    /// set; walshadow rejects PG ≤ 14 captures, so PG-14 branch is
+    /// defensive-only
+    pub fn compression_method(&self, page_magic: u16) -> Option<FpiCompressionMethod> {
+        if page_magic >= XLP_PAGE_MAGIC_PG15 {
+            if self.info & BKP_IMAGE_COMPRESS_PGLZ != 0 {
+                Some(FpiCompressionMethod::Pglz)
+            } else if self.info & BKP_IMAGE_COMPRESS_LZ4 != 0 {
+                Some(FpiCompressionMethod::Lz4)
+            } else if self.info & BKP_IMAGE_COMPRESS_ZSTD != 0 {
+                Some(FpiCompressionMethod::Zstd)
+            } else {
+                None
+            }
+        } else {
+            compression_method_pg14(self.info)
+        }
+    }
+}
+
+#[cold]
+fn compression_method_pg14(info: u8) -> Option<FpiCompressionMethod> {
+    if info & BKP_IMAGE_IS_COMPRESSED_PG14 != 0 {
+        Some(FpiCompressionMethod::Pglz)
+    } else {
+        None
+    }
+}
+
+/// FPI codec dispatch. Walshadow's `fpi.rs` matches on this to pick
+/// the decoder; mirrors `BKP_IMAGE_COMPRESS_*` flag set
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpiCompressionMethod {
+    Pglz,
+    Lz4,
+    Zstd,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -346,6 +383,80 @@ mod tests {
         assert!(!h.has_consistent_remaining_data_len());
         h.info = 0;
         assert!(h.has_consistent_remaining_data_len());
+    }
+
+    #[test]
+    fn compression_method_pg15() {
+        let mut h = XLogRecordBlockImageHeader {
+            info: 0,
+            ..Default::default()
+        };
+        // no bits set -> None
+        assert_eq!(h.compression_method(XLP_PAGE_MAGIC_PG15), None);
+
+        h.info = BKP_IMAGE_COMPRESS_PGLZ;
+        assert_eq!(
+            h.compression_method(XLP_PAGE_MAGIC_PG15),
+            Some(FpiCompressionMethod::Pglz),
+        );
+
+        h.info = BKP_IMAGE_COMPRESS_LZ4;
+        assert_eq!(
+            h.compression_method(XLP_PAGE_MAGIC_PG15),
+            Some(FpiCompressionMethod::Lz4),
+        );
+
+        h.info = BKP_IMAGE_COMPRESS_ZSTD;
+        assert_eq!(
+            h.compression_method(XLP_PAGE_MAGIC_PG15),
+            Some(FpiCompressionMethod::Zstd),
+        );
+
+        // APPLY-only (0x02) alongside HAS_HOLE is uncompressed
+        h.info = _BKP_IMAGE_APPLY_PG15 | BKP_IMAGE_HAS_HOLE;
+        assert_eq!(h.compression_method(XLP_PAGE_MAGIC_PG15), None);
+
+        // codec bit + APPLY + HAS_HOLE still resolves codec
+        h.info = _BKP_IMAGE_APPLY_PG15 | BKP_IMAGE_HAS_HOLE | BKP_IMAGE_COMPRESS_ZSTD;
+        assert_eq!(
+            h.compression_method(XLP_PAGE_MAGIC_PG15),
+            Some(FpiCompressionMethod::Zstd),
+        );
+    }
+
+    #[test]
+    fn compression_method_pg14() {
+        // PG-14 layout: bit 0x02 means IS_COMPRESSED (pglz)
+        let mut h = XLogRecordBlockImageHeader {
+            info: BKP_IMAGE_IS_COMPRESSED_PG14,
+            ..Default::default()
+        };
+        assert_eq!(
+            h.compression_method(XLP_PAGE_MAGIC_PG14),
+            Some(FpiCompressionMethod::Pglz),
+        );
+
+        // PG-14 magic ignores PG-15 codec bits
+        h.info = BKP_IMAGE_COMPRESS_LZ4;
+        assert_eq!(h.compression_method(XLP_PAGE_MAGIC_PG14), None);
+
+        h.info = 0;
+        assert_eq!(h.compression_method(XLP_PAGE_MAGIC_PG14), None);
+    }
+
+    #[test]
+    fn compression_method_magic_split() {
+        // Same info byte resolves differently across the magic split.
+        // Bit 0x02: PG-14 -> Pglz, PG-15 -> APPLY (no codec, None)
+        let h = XLogRecordBlockImageHeader {
+            info: BKP_IMAGE_IS_COMPRESSED_PG14,
+            ..Default::default()
+        };
+        assert_eq!(
+            h.compression_method(XLP_PAGE_MAGIC_PG14),
+            Some(FpiCompressionMethod::Pglz),
+        );
+        assert_eq!(h.compression_method(XLP_PAGE_MAGIC_PG15), None);
     }
 
     #[test]

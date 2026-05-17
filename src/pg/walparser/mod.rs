@@ -28,9 +28,18 @@ pub use state::{
     read_locations_from, write_locations_to,
 };
 pub use types::{
-    BLOCK_SIZE, BlockLocation, Oid, RelFileNode, RmId, TimeLineId, WAL_PAGE_SIZE,
-    X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, X_LOG_SWITCH, XLP_FIRST_IS_CONT_RECORD,
-    XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG14, XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG,
-    XLR_BLOCK_ID_DATA_SHORT, XLR_INFO_MASK, XLogPage, XLogPageHeader, XLogRecord, XLogRecordBlock,
-    XLogRecordBlockHeader, XLogRecordBlockImageHeader, XLogRecordHeader, XLogRecordPtr,
+    BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_COMPRESS_LZ4, BKP_IMAGE_COMPRESS_MASK_PG15,
+    BKP_IMAGE_COMPRESS_PGLZ, BKP_IMAGE_COMPRESS_ZSTD, BKP_IMAGE_HAS_HOLE,
+    BKP_IMAGE_IS_COMPRESSED_PG14, BLOCK_SIZE, BlockLocation, FpiCompressionMethod, Oid,
+    RelFileNode, RmId, TimeLineId, WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE,
+    X_LOG_SWITCH, XLP_FIRST_IS_CONT_RECORD, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG14,
+    XLP_PAGE_MAGIC_PG15, XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT, XLR_INFO_MASK, XLogPage,
+    XLogPageHeader, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader, XLogRecordBlockImageHeader,
+    XLogRecordHeader, XLogRecordPtr,
 };
+
+/// All-zero pages mark the unwritten tail of a WAL segment; both parse.rs
+/// (page header check) and state.rs (continuation-record skip) need it
+pub(crate) fn all_zero(buf: &[u8]) -> bool {
+    buf.iter().all(|&b| b == 0)
+}
