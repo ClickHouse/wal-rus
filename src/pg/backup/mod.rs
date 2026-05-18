@@ -99,6 +99,17 @@ pub fn format_backup_name(timeline: u32, start_lsn: u64, seg_size: u64) -> Strin
     )
 }
 
+/// Inverse of [`format_backup_name`]: parse the timeline ID from the first
+/// 8 hex chars after the `base_` prefix. Returns `None` when the name lacks
+/// the prefix, is too short, or contains non-hex digits.
+pub fn parse_timeline_from_backup_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(BACKUP_NAME_PREFIX)?;
+    if rest.len() < 8 {
+        return None;
+    }
+    u32::from_str_radix(&rest[..8], 16).ok()
+}
+
 /// Parse `0/1A2B3C4D` (postgres pg_lsn text form) into u64
 pub fn parse_pg_lsn(s: &str) -> Result<u64> {
     let s = s.trim();
@@ -151,6 +162,24 @@ pub fn strip_leftmost_backup_name(key: &str) -> Option<&str> {
     } else {
         Some(stripped)
     }
+}
+
+/// Fetch `key` from `storage` and deserialize as JSON into `T`. `buf_hint` is
+/// the initial allocation for the in-memory buffer (callers know the rough
+/// blob size). Error chain: `get {key}` → underlying read error → `parse {key}`
+pub(crate) async fn load_json<T: serde::de::DeserializeOwned>(
+    storage: &crate::storage::DynStorage,
+    key: &str,
+    buf_hint: usize,
+) -> Result<T> {
+    use tokio::io::AsyncReadExt;
+    let mut r = storage
+        .get(key)
+        .await
+        .with_context(|| format!("get {key}"))?;
+    let mut buf = Vec::with_capacity(buf_hint);
+    r.read_to_end(&mut buf).await?;
+    serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))
 }
 
 /// Tablespace map mirrored from wal-g `TablespaceSpec`. JSON shape:

@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use tokio::io::AsyncReadExt;
 use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
@@ -140,14 +139,12 @@ async fn build_chain(
 
 async fn fetch_incremented_set(storage: &DynStorage, name: &str) -> Result<HashSet<String>> {
     let key = files_metadata_key(name);
-    let mut r = match storage.get(&key).await {
-        Ok(r) => r,
+    // Older backups may omit files_metadata.json; treat any load failure as
+    // empty rather than propagating (matches wal-g's tolerant behaviour)
+    let meta: FilesMetadataDto = match crate::pg::backup::load_json(storage, &key, 4096).await {
+        Ok(m) => m,
         Err(_) => return Ok(HashSet::new()),
     };
-    let mut buf = Vec::with_capacity(4096);
-    r.read_to_end(&mut buf).await?;
-    let meta: FilesMetadataDto =
-        serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))?;
     Ok(meta
         .files
         .into_iter()
@@ -178,17 +175,8 @@ pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no backups found"))
 }
 
-async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
-    let key = sentinel_key(name);
-    let mut r = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let mut buf = Vec::with_capacity(4096);
-    r.read_to_end(&mut buf).await?;
-    let v2: BackupSentinelDtoV2 =
-        serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))?;
-    Ok(v2)
+pub async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
+    crate::pg::backup::load_json(storage, &sentinel_key(name), 4096).await
 }
 
 async fn restore_tablespace_symlinks(
@@ -249,7 +237,7 @@ fn apply_mapping(location: &str, mappings: &[(String, String)]) -> String {
     location.to_string()
 }
 
-async fn list_tar_parts(storage: &DynStorage, name: &str) -> Result<Vec<String>> {
+pub async fn list_tar_parts(storage: &DynStorage, name: &str) -> Result<Vec<String>> {
     let prefix = format!("{}/", tar_partitions_prefix(name));
     let mut stream = storage.list(&prefix).await?;
     let mut keys = Vec::new();

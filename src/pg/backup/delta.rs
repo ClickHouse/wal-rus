@@ -29,7 +29,8 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 use crate::compression;
-use crate::pg::backup::{BackupSentinelDtoV2, name_from_sentinel_key, sentinel_key};
+use crate::pg::backup::fetch::fetch_sentinel;
+use crate::pg::backup::{BackupSentinelDtoV2, name_from_sentinel_key};
 use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 use crate::pg::walparser::{
     BlockLocation, ParsePageError, RelFileNode, WalParser, extract_locations_from_wal_file,
@@ -387,17 +388,6 @@ async fn select_candidate(
         return find_by_user_data(storage, user_data_str).await;
     }
     find_latest(storage).await
-}
-
-async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
-    let key = sentinel_key(name);
-    let mut r = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let mut buf = Vec::with_capacity(4096);
-    r.read_to_end(&mut buf).await?;
-    serde_json::from_slice(&buf).with_context(|| format!("parse sentinel {key}"))
 }
 
 async fn find_latest(storage: &DynStorage) -> Result<Option<(String, BackupSentinelDtoV2)>> {

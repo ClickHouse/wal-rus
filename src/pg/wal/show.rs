@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::pg::WAL_FOLDER;
 use crate::pg::backup::list as backup_list;
+use crate::pg::backup::parse_timeline_from_backup_name;
 use crate::pg::wal::segment::{
     DEFAULT_WAL_SEG_SIZE, SEGMENT_NAME_LEN, SegmentName, is_wal_filename,
 };
@@ -119,15 +120,6 @@ async fn list_segments(
         }
     }
     Ok(by_tli)
-}
-
-fn parse_timeline_from_backup_name(name: &str) -> Option<u32> {
-    // `base_TTTTTTTT...`
-    let rest = name.strip_prefix(crate::pg::backup::BACKUP_NAME_PREFIX)?;
-    if rest.len() < 8 {
-        return None;
-    }
-    u32::from_str_radix(&rest[..8], 16).ok()
 }
 
 fn summarize_timeline(

@@ -4,12 +4,12 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use tokio::io::AsyncReadExt;
 
 use crate::compression::AsyncReader;
 use crate::pg::backup::{
-    BackupSentinelDtoV2, FilesMetadataDto, fetch::resolve_name, files_metadata_key,
-    name_from_sentinel_key, sentinel_key,
+    BackupSentinelDtoV2, FilesMetadataDto,
+    fetch::{fetch_sentinel, resolve_name},
+    files_metadata_key, load_json, name_from_sentinel_key, sentinel_key,
 };
 use crate::storage::DynStorage;
 
@@ -129,26 +129,8 @@ pub async fn resolve_by_user_data(storage: &DynStorage, user_data_str: &str) -> 
     }
 }
 
-async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
-    let key = sentinel_key(name);
-    let mut r = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let mut buf = Vec::with_capacity(4096);
-    r.read_to_end(&mut buf).await?;
-    serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))
-}
-
 async fn fetch_files_metadata(storage: &DynStorage, name: &str) -> Result<FilesMetadataDto> {
-    let key = files_metadata_key(name);
-    let mut r = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let mut buf = Vec::with_capacity(16 * 1024);
-    r.read_to_end(&mut buf).await?;
-    serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))
+    load_json(storage, &files_metadata_key(name), 16 * 1024).await
 }
 
 fn print_plain(name: &str, s: &BackupSentinelDtoV2, files: Option<&FilesMetadataDto>) {
