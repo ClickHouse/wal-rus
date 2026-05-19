@@ -26,6 +26,12 @@ pub struct BaseBackupOpts {
     pub fast_checkpoint: bool,
     pub no_verify_checksums: bool,
     pub max_rate_kib: Option<i32>,
+    /// Include WAL segments covering `[start_lsn, end_lsn]` inside the
+    /// data-dir archive. PG15+ paren-form: `WAL true`. PG14- positional
+    /// form: bare `WAL` keyword (presence ≡ true). With this on, a
+    /// downstream standby reaches consistent recovery from the tar
+    /// alone, no `restore_command` needed for the bootstrap window
+    pub wal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -198,7 +204,7 @@ fn build_base_backup_sql(opts: &BaseBackupOpts, pg_version: i32) -> String {
                 "spread"
             }
         ));
-        parts.push("WAL false".into());
+        parts.push(format!("WAL {}", opts.wal));
         parts.push("TABLESPACE_MAP true".into());
         parts.push("MANIFEST 'no'".into());
         if opts.no_verify_checksums {
@@ -212,6 +218,9 @@ fn build_base_backup_sql(opts: &BaseBackupOpts, pg_version: i32) -> String {
         let mut parts: Vec<String> = vec![format!("LABEL {label}")];
         if opts.fast_checkpoint {
             parts.push("FAST".into());
+        }
+        if opts.wal {
+            parts.push("WAL".into());
         }
         parts.push("TABLESPACE_MAP".into());
         if opts.no_verify_checksums {
@@ -627,6 +636,7 @@ mod tests {
             fast_checkpoint: true,
             no_verify_checksums: false,
             max_rate_kib: None,
+            wal: false,
         };
         let s = build_base_backup_sql(&opts, 150000);
         assert!(s.starts_with("BASE_BACKUP ("));
@@ -637,6 +647,23 @@ mod tests {
         assert!(!s.contains("VERIFY_CHECKSUMS"));
     }
 
+    /// PG15+ `WAL true` flips the option from default-false to inlining
+    /// WAL segments in the data-dir tar. Server parses via `defGetBoolean`
+    /// so the lowercase literal is required
+    #[test]
+    fn build_sql_v15_wal_true() {
+        let opts = BaseBackupOpts {
+            label: "wal-rs".into(),
+            fast_checkpoint: true,
+            no_verify_checksums: false,
+            max_rate_kib: None,
+            wal: true,
+        };
+        let s = build_base_backup_sql(&opts, 150000);
+        assert!(s.contains("WAL true"));
+        assert!(!s.contains("WAL false"));
+    }
+
     #[test]
     fn build_sql_compat_form() {
         let opts = BaseBackupOpts {
@@ -644,6 +671,7 @@ mod tests {
             fast_checkpoint: true,
             no_verify_checksums: true,
             max_rate_kib: Some(8192),
+            wal: false,
         };
         let s = build_base_backup_sql(&opts, 140005);
         assert!(s.starts_with("BASE_BACKUP "));
@@ -653,6 +681,24 @@ mod tests {
         assert!(s.contains("TABLESPACE_MAP"));
         assert!(s.contains("NOVERIFY_CHECKSUMS"));
         assert!(s.contains("MAX_RATE 8192"));
+        // bare `WAL` keyword omitted when off (PG12-14 grammar: presence ≡ true)
+        assert!(!s.split_whitespace().any(|tok| tok == "WAL"));
+    }
+
+    /// PG14- positional form has no `WAL false` spelling — keyword's
+    /// presence alone toggles inline-WAL on
+    #[test]
+    fn build_sql_compat_wal_true() {
+        let opts = BaseBackupOpts {
+            label: "wal-rs".into(),
+            fast_checkpoint: false,
+            no_verify_checksums: false,
+            max_rate_kib: None,
+            wal: true,
+        };
+        let s = build_base_backup_sql(&opts, 140005);
+        assert!(s.starts_with("BASE_BACKUP "));
+        assert!(s.split_whitespace().any(|tok| tok == "WAL"));
     }
 
     #[test]
@@ -809,6 +855,7 @@ mod tests {
             fast_checkpoint: true,
             no_verify_checksums: false,
             max_rate_kib: None,
+            wal: false,
         };
         let pump = tokio::spawn(run_base_backup(conn, opts, tx));
 
