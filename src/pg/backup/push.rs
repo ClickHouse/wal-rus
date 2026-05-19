@@ -148,6 +148,9 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         fast_checkpoint: args.fast_checkpoint,
         no_verify_checksums: args.no_verify_checksums,
         max_rate_kib: None,
+        // wal-g push uploads tablespaces separately and ships WAL via
+        // `wal-push`; inlining the segments would duplicate them
+        wal: false,
     };
 
     let (tx, mut rx) = mpsc::channel::<Result<BackupEvent>>(2);
