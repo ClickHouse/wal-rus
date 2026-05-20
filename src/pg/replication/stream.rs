@@ -84,6 +84,35 @@ pub fn decode_frame(payload: &[u8]) -> Result<Frame<'_>> {
     }
 }
 
+/// Build a server-direction `'w'` XLogData payload. walsender
+/// server frames each per-record byte slice into this envelope;
+/// the walreceiver on the other side decodes it via [`decode_frame`].
+/// Mirrors postgres's `XLogSendPhysical` wire layout (1 tag byte +
+/// u64 start_lsn + u64 server_wal_end + i64 send_time + payload).
+/// `send_time` is set from [`now_pg_microseconds`].
+pub fn encode_wal_data_frame(start_lsn: u64, server_wal_end: u64, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 24 + data.len());
+    out.push(b'w');
+    out.extend_from_slice(&start_lsn.to_be_bytes());
+    out.extend_from_slice(&server_wal_end.to_be_bytes());
+    out.extend_from_slice(&now_pg_microseconds().to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// Build a server-direction `'k'` keepalive payload carrying the
+/// current `server_wal_end` high-water mark. `reply_requested` set
+/// only when the listener task wants to demand a `'r'` status from
+/// a slow client.
+pub fn encode_keepalive_frame(server_wal_end: u64, reply_requested: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 17);
+    out.push(b'k');
+    out.extend_from_slice(&server_wal_end.to_be_bytes());
+    out.extend_from_slice(&now_pg_microseconds().to_be_bytes());
+    out.push(if reply_requested { 1 } else { 0 });
+    out
+}
+
 /// Build a `'r'` standby status update payload. `reply_requested = 0`
 /// since clients never demand a server response to a status update
 pub fn build_status_update(write_lsn: u64, flush_lsn: u64, apply_lsn: u64) -> Vec<u8> {

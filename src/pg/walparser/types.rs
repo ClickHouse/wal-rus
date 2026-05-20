@@ -262,8 +262,7 @@ impl XLogRecordBlockImageHeader {
     }
     /// Resolve PG-15+ compression method, or `None` for uncompressed.
     /// PG-14 fixtures collapse to `Some(Pglz)` when IS_COMPRESSED_PG14
-    /// set; walshadow rejects PG ≤ 14 captures, so PG-14 branch is
-    /// defensive-only
+    /// set
     pub fn compression_method(&self, page_magic: u16) -> Option<FpiCompressionMethod> {
         if page_magic >= XLP_PAGE_MAGIC_PG15 {
             if self.info & BKP_IMAGE_COMPRESS_PGLZ != 0 {
@@ -290,8 +289,7 @@ fn compression_method_pg14(info: u8) -> Option<FpiCompressionMethod> {
     }
 }
 
-/// FPI codec dispatch. Walshadow's `fpi.rs` matches on this to pick
-/// the decoder; mirrors `BKP_IMAGE_COMPRESS_*` flag set
+/// FPI codec dispatch; mirrors `BKP_IMAGE_COMPRESS_*` flag set
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FpiCompressionMethod {
     Pglz,

@@ -6,13 +6,15 @@
 
 pub mod base_backup;
 pub mod conn;
+pub mod server;
 pub mod stream;
 pub mod tls;
 
 pub use base_backup::{ArchiveMeta, BackupEvent, BaseBackupOpts, run_base_backup};
 pub use conn::{PgConfig, ReplicationConn};
+pub use server::{Identity as WalSenderIdentity, ServerError as WalSenderError, WalSenderConn};
 pub use stream::{
     Frame, KeepaliveFrame, PG_EPOCH_USEC, WalDataFrame, build_status_update, decode_frame,
-    now_pg_microseconds,
+    encode_keepalive_frame, encode_wal_data_frame, now_pg_microseconds,
 };
 pub use tls::SslMode;
