@@ -512,8 +512,13 @@ impl BlockingSender {
         if self.scratch.is_empty() {
             return Ok(());
         }
-        let chunk = Bytes::copy_from_slice(&self.scratch);
-        self.scratch.clear();
+        // Move the scratch Vec into a Bytes owner, swap in a fresh
+        // buffer for the next chunk. Avoids the per-CHUNK_BYTES memcpy
+        // that `Bytes::copy_from_slice` does
+        let chunk = Bytes::from(std::mem::replace(
+            &mut self.scratch,
+            Vec::with_capacity(CHUNK_BYTES),
+        ));
         self.tx.blocking_send(Ok(chunk)).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "part consumer dropped")
         })

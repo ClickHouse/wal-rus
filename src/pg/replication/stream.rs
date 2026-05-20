@@ -92,12 +92,24 @@ pub fn decode_frame(payload: &[u8]) -> Result<Frame<'_>> {
 /// `send_time` is set from [`now_pg_microseconds`].
 pub fn encode_wal_data_frame(start_lsn: u64, server_wal_end: u64, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 24 + data.len());
+    encode_wal_data_frame_into(&mut out, start_lsn, server_wal_end, data);
+    out
+}
+
+/// In-place sibling of [`encode_wal_data_frame`]. Appends the same
+/// `'w'` envelope onto `out` so callers can frame straight into a
+/// per-connection send queue without an intermediate `Vec`.
+pub fn encode_wal_data_frame_into(
+    out: &mut Vec<u8>,
+    start_lsn: u64,
+    server_wal_end: u64,
+    data: &[u8],
+) {
     out.push(b'w');
     out.extend_from_slice(&start_lsn.to_be_bytes());
     out.extend_from_slice(&server_wal_end.to_be_bytes());
     out.extend_from_slice(&now_pg_microseconds().to_be_bytes());
     out.extend_from_slice(data);
-    out
 }
 
 /// Build a server-direction `'k'` keepalive payload carrying the
@@ -106,11 +118,16 @@ pub fn encode_wal_data_frame(start_lsn: u64, server_wal_end: u64, data: &[u8]) -
 /// a slow client.
 pub fn encode_keepalive_frame(server_wal_end: u64, reply_requested: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 17);
+    encode_keepalive_frame_into(&mut out, server_wal_end, reply_requested);
+    out
+}
+
+/// In-place sibling of [`encode_keepalive_frame`].
+pub fn encode_keepalive_frame_into(out: &mut Vec<u8>, server_wal_end: u64, reply_requested: bool) {
     out.push(b'k');
     out.extend_from_slice(&server_wal_end.to_be_bytes());
     out.extend_from_slice(&now_pg_microseconds().to_be_bytes());
     out.push(if reply_requested { 1 } else { 0 });
-    out
 }
 
 /// Build a `'r'` standby status update payload. `reply_requested = 0`

@@ -26,7 +26,7 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, anyhow};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
 use crate::pg::backup::fetch::fetch_sentinel;
@@ -506,12 +506,23 @@ async fn fetch_and_parse_segment(
         .with_context(|| format!("get {key}"))?;
     let decrypted = settings.decrypt(r);
     let decoded = compression::decode(compression, decrypted);
-    let mut buf = Vec::new();
-    let mut decoded = decoded;
-    decoded.read_to_end(&mut buf).await?;
-    let locations = extract_locations_from_wal_file(parser, std::io::Cursor::new(buf))
-        .with_context(|| format!("parse segment {name}"))?;
-    Ok(locations)
+
+    // Bridge the async reader to sync inside spawn_blocking so
+    // extract_locations_from_wal_file streams page-by-page rather than
+    // materialising the 16 MiB segment in a Vec. Parser is moved in and
+    // returned via the join handle so caller-side stitching state
+    // survives across segments
+    let parser_in = std::mem::take(parser);
+    let (parser_out, locs) = tokio::task::spawn_blocking(move || {
+        let mut parser_in = parser_in;
+        let sync_r = SyncIoBridge::new(decoded);
+        let res = extract_locations_from_wal_file(&mut parser_in, sync_r);
+        (parser_in, res)
+    })
+    .await
+    .context("join segment walk")?;
+    *parser = parser_out;
+    locs.with_context(|| format!("parse segment {name}"))
 }
 
 #[cfg(test)]

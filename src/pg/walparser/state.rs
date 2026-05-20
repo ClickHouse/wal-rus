@@ -17,10 +17,14 @@ use thiserror::Error;
 
 use super::all_zero;
 use super::parse::{
-    AlignedReader, ExtractError, ParseError, extract_block_locations, parse_record_from_bytes,
-    read_xlog_page_header, read_xlog_record_header, try_read_xlog_record_data,
+    AlignedReader, ExtractError, ParseError, for_each_block_location_in_record,
+    parse_record_from_bytes, read_xlog_page_header, read_xlog_record_header,
+    try_read_xlog_record_data,
 };
-use super::types::{BlockLocation, WAL_PAGE_SIZE, XLogPage, XLogPageHeader, XLogRecord};
+use super::types::{
+    BlockLocation, RmId, WAL_PAGE_SIZE, X_LOG_SWITCH, XLR_INFO_MASK, XLogPage, XLogPageHeader,
+    XLogRecord,
+};
 
 #[derive(Debug, Error)]
 pub enum ParsePageError {
@@ -90,7 +94,7 @@ impl WalParser {
     pub fn parse_records_from_page(
         &mut self,
         page_data: &[u8],
-    ) -> Result<(Vec<u8>, Vec<XLogRecord>), ParsePageError> {
+    ) -> Result<(Vec<u8>, Vec<XLogRecord<'static>>), ParsePageError> {
         let page = match self.parse_page(page_data) {
             Ok(p) => p,
             Err(ParsePageError::Parse(ParseError::PartialPage))
@@ -120,7 +124,11 @@ impl WalParser {
         if header.total_record_length as usize != current_record_data.len() {
             return Err(ParseError::ContinuationNotFound.into());
         }
-        let current_record = parse_record_from_bytes(&current_record_data, self.page_magic())?;
+        // state.rs returns owned records — the input slices it parses
+        // from are scratch buffers that don't outlive this function,
+        // so we materialise.
+        let current_record =
+            parse_record_from_bytes(&current_record_data, self.page_magic())?.into_owned();
 
         let mut records = Vec::with_capacity(page.records.len() + 1);
         records.push(current_record);
@@ -129,7 +137,7 @@ impl WalParser {
         Ok((Vec::new(), records))
     }
 
-    fn parse_page(&mut self, page_data: &[u8]) -> Result<XLogPage, ParsePageError> {
+    fn parse_page(&mut self, page_data: &[u8]) -> Result<XLogPage<'static>, ParsePageError> {
         if page_data.len() < WAL_PAGE_SIZE as usize / 2 {
             return Err(ParseError::PartialPage.into());
         }
@@ -220,7 +228,7 @@ fn read_xlog_page_inner(
     ar: &mut AlignedReader<'_>,
     header: XLogPageHeader,
     remaining_data: Vec<u8>,
-) -> Result<XLogPage, ParsePageError> {
+) -> Result<XLogPage<'static>, ParsePageError> {
     let page_magic = header.magic;
     let mut records = Vec::new();
     loop {
@@ -236,7 +244,7 @@ fn read_xlog_page_inner(
                     });
                 }
                 if whole {
-                    let record = parse_record_from_bytes(&data, page_magic)?;
+                    let record = parse_record_from_bytes(&data, page_magic)?.into_owned();
                     let is_switch = record.is_wal_switch();
                     records.push(record);
                     if is_switch {
@@ -285,18 +293,123 @@ pub fn extract_locations_from_wal_file<R: Read>(
         match read_exact_or_eof(&mut r, &mut page_buf)? {
             ReadStatus::Eof => return Ok(out),
             ReadStatus::Short(n) => {
-                let (_, records) = parser
-                    .parse_records_from_page(&page_buf[..n])
+                process_locations_from_page(parser, &page_buf[..n], |loc| out.push(loc))
                     .map_err(parse_to_extract)?;
-                out.extend(extract_block_locations(&records));
                 return Ok(out);
             }
             ReadStatus::Full => {
-                let (_, records) = parser
-                    .parse_records_from_page(&page_buf)
+                process_locations_from_page(parser, &page_buf, |loc| out.push(loc))
                     .map_err(parse_to_extract)?;
-                out.extend(extract_block_locations(&records));
             }
+        }
+    }
+}
+
+/// Locations-only sibling of [`WalParser::parse_records_from_page`].
+/// Walks the same page-/record-stitching state machine but emits
+/// `BlockLocation`s through `f` instead of materialising every record's
+/// block image / data / main_data into owned `Vec`s. Reduces the
+/// allocation cost of `extract_locations_from_wal_file` from
+/// O(record bodies) to O(#records) header-walks + the existing partial
+/// record stitching buffer
+pub fn process_locations_from_page<F: FnMut(BlockLocation)>(
+    parser: &mut WalParser,
+    page_data: &[u8],
+    mut f: F,
+) -> Result<(), ParsePageError> {
+    if page_data.len() < WAL_PAGE_SIZE as usize / 2 {
+        return Ok(());
+    }
+    let mut cursor: &[u8] = page_data;
+    let header = match read_xlog_page_header(&mut cursor) {
+        Ok(h) => h,
+        Err(ParseError::ZeroPageHeader) => {
+            if all_zero(page_data) {
+                return Ok(());
+            }
+            return Err(ParseError::ZeroPageHeader.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    parser.page_magic = Some(header.magic);
+    let consumed = page_data.len() - cursor.len();
+    let mut ar = AlignedReader {
+        buf: cursor,
+        consumed,
+    };
+    ar.read_to_alignment()?;
+
+    let want = std::cmp::min(header.remaining_data_len as usize, WAL_PAGE_SIZE as usize);
+    let take_n = want.min(ar.buf.len());
+    let remaining_data = ar.take(take_n, "pageRemainingData")?;
+    let page_magic = header.magic;
+
+    // Short tail: prev record continues but we ran out of bytes — buffer
+    // & wait for the next page (matches parse_records_from_page)
+    if remaining_data.len() != header.remaining_data_len as usize {
+        parser.current_record_data.extend_from_slice(remaining_data);
+        return Ok(());
+    }
+
+    // Stitch buffered head (if any) with this page's trailing bytes.
+    // Take parser.current_record_data unconditionally so orphan
+    // tail-without-head bytes get drained, matching the existing
+    // parse_records_from_page semantics
+    let had_beginning = parser.has_current_record_beginning;
+    let mut stitched = std::mem::take(&mut parser.current_record_data);
+    stitched.extend_from_slice(remaining_data);
+    parser.has_current_record_beginning = false;
+
+    if had_beginning {
+        let rec_header = read_xlog_record_header(&mut stitched.as_slice())?;
+        if rec_header.total_record_length as usize != stitched.len() {
+            return Err(ParseError::ContinuationNotFound.into());
+        }
+        for_each_block_location_in_record(&stitched, page_magic, &mut f)?;
+        // WAL_SWITCH: rest of page (and segment) is padding
+        if rec_header.resource_manager_id == RmId::Xlog as u8
+            && (rec_header.info & !XLR_INFO_MASK) == X_LOG_SWITCH
+        {
+            return Ok(());
+        }
+    }
+
+    walk_locations_xlog_page_inner(parser, &mut ar, page_magic, f)
+}
+
+fn walk_locations_xlog_page_inner<F: FnMut(BlockLocation)>(
+    parser: &mut WalParser,
+    ar: &mut AlignedReader<'_>,
+    page_magic: u16,
+    mut f: F,
+) -> Result<(), ParsePageError> {
+    loop {
+        match try_read_xlog_record_data(ar) {
+            Ok((data, whole)) => {
+                if data.is_empty() && !whole {
+                    return Ok(());
+                }
+                if whole {
+                    let rec_header = read_xlog_record_header(&mut data.as_slice())?;
+                    for_each_block_location_in_record(&data, page_magic, &mut f)?;
+                    if rec_header.resource_manager_id == RmId::Xlog as u8
+                        && (rec_header.info & !XLR_INFO_MASK) == X_LOG_SWITCH
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                // Partial record: buffer head for stitching on the next page
+                parser.set_current_record_data(data);
+                return Ok(());
+            }
+            Err(ParseError::ZeroRecordHeader) => {
+                if all_zero(ar.buf) {
+                    return Ok(());
+                }
+                return Err(ParseError::ZeroRecordHeader.into());
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -515,5 +628,11 @@ mod tests {
         assert_eq!(locs.len(), 2);
         assert_eq!(locs[0], BlockLocation::new(100, 200, 300, 7));
         assert_eq!(locs[1], BlockLocation::new(100, 200, 300, 42));
+
+        // process_locations_from_page must emit the same locations
+        let mut parser2 = WalParser::new();
+        let mut locs2 = Vec::new();
+        process_locations_from_page(&mut parser2, &page, |loc| locs2.push(loc)).unwrap();
+        assert_eq!(locs2, locs);
     }
 }
