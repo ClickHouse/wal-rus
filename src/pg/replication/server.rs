@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -72,17 +72,22 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let _params = read_startup(sock).await?;
-    write_auth_ok(sock).await?;
-    write_parameter_status(sock, "server_version", "16.3").await?;
-    write_parameter_status(sock, "server_encoding", "UTF8").await?;
-    write_parameter_status(sock, "client_encoding", "UTF8").await?;
-    write_parameter_status(sock, "DateStyle", "ISO, MDY").await?;
-    write_parameter_status(sock, "integer_datetimes", "on").await?;
-    write_parameter_status(sock, "TimeZone", "UTC").await?;
-    write_parameter_status(sock, "standard_conforming_strings", "on").await?;
-    write_parameter_status(sock, "in_hot_standby", "off").await?;
-    write_backend_key_data(sock, 1, 1).await?;
-    write_ready_for_query(sock, b'I').await?;
+    // Batch the startup-response messages into one BytesMut and flush
+    // once. Each encode_* helper appends without allocating a private
+    // Vec / issuing its own syscall
+    let mut tx = BytesMut::with_capacity(512);
+    encode_auth_ok(&mut tx);
+    encode_parameter_status(&mut tx, "server_version", "16.3");
+    encode_parameter_status(&mut tx, "server_encoding", "UTF8");
+    encode_parameter_status(&mut tx, "client_encoding", "UTF8");
+    encode_parameter_status(&mut tx, "DateStyle", "ISO, MDY");
+    encode_parameter_status(&mut tx, "integer_datetimes", "on");
+    encode_parameter_status(&mut tx, "TimeZone", "UTC");
+    encode_parameter_status(&mut tx, "standard_conforming_strings", "on");
+    encode_parameter_status(&mut tx, "in_hot_standby", "off");
+    encode_backend_key_data(&mut tx, 1, 1);
+    encode_ready_for_query(&mut tx, b'I');
+    flush_tx(sock, &mut tx).await?;
 
     let mut rx = BytesMut::with_capacity(8192);
     loop {
@@ -90,7 +95,7 @@ where
         match msg.kind {
             b'Q' => {
                 let query = parse_simple_query(&msg.body)?;
-                if let Some(start) = dispatch_query(sock, &query, identity).await? {
+                if let Some(start) = dispatch_query(sock, &mut tx, &query, identity).await? {
                     return Ok(start);
                 }
             }
@@ -105,11 +110,23 @@ where
     }
 }
 
+async fn flush_tx<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    tx: &mut BytesMut,
+) -> Result<(), ServerError> {
+    if tx.is_empty() {
+        return Ok(());
+    }
+    sock.write_all(tx).await?;
+    tx.clear();
+    Ok(())
+}
+
 /// One framed message read from the wire (tag + body).
 #[derive(Debug)]
 struct TypedMessage {
     kind: u8,
-    body: Vec<u8>,
+    body: Bytes,
 }
 
 async fn read_typed_message<S>(sock: &mut S, rx: &mut BytesMut) -> Result<TypedMessage, ServerError>
@@ -134,12 +151,9 @@ where
             return Err(ServerError::Protocol("eof inside message body".into()));
         }
     }
-    let mut frame = rx.split_to(total);
-    frame.advance(5); // tag + length consumed
-    Ok(TypedMessage {
-        kind,
-        body: frame.to_vec(),
-    })
+    let mut frame = rx.split_to(total).freeze();
+    frame.advance(5); // tag + length consumed; freeze gave us a Bytes
+    Ok(TypedMessage { kind, body: frame })
 }
 
 /// Read the initial `StartupMessage` (untyped — length + protocol
@@ -218,8 +232,13 @@ fn parse_simple_query(body: &[u8]) -> Result<String, ServerError> {
 /// query was `START_REPLICATION` (the handshake completes); `None`
 /// for `IDENTIFY_SYSTEM`, `TIMELINE_HISTORY`, and any inert query
 /// (the caller loops for the next query).
+///
+/// All response bytes are appended to the shared `tx` buffer and
+/// flushed once per query — replaces N small per-message syscalls
+/// (and per-helper Vec allocs) with one
 async fn dispatch_query<S>(
     sock: &mut S,
+    tx: &mut BytesMut,
     query: &str,
     identity: &Identity,
 ) -> Result<Option<StartReplication>, ServerError>
@@ -229,27 +248,32 @@ where
     let trimmed = query.trim();
     let upper = trimmed.to_uppercase();
     if upper.starts_with("IDENTIFY_SYSTEM") {
-        write_identify_system(sock, identity).await?;
-        write_ready_for_query(sock, b'I').await?;
+        encode_identify_system(tx, identity);
+        encode_ready_for_query(tx, b'I');
+        flush_tx(sock, tx).await?;
         Ok(None)
     } else if upper.starts_with("TIMELINE_HISTORY") {
-        write_timeline_history(sock, identity).await?;
-        write_ready_for_query(sock, b'I').await?;
+        encode_timeline_history(tx, identity);
+        encode_ready_for_query(tx, b'I');
+        flush_tx(sock, tx).await?;
         Ok(None)
     } else if upper.starts_with("START_REPLICATION") {
         let start = parse_start_replication(trimmed)?;
         // Switch to CopyBoth.
-        write_copy_both_response(sock).await?;
+        encode_copy_both_response(tx);
+        flush_tx(sock, tx).await?;
         Ok(Some(start))
     } else if upper.starts_with("SHOW ") || upper.starts_with("BEGIN") || upper.starts_with("END") {
         // PG walreceiver issues SHOW data_directory_mode (or similar)
         // probes on startup with newer versions; ack with empty result.
-        write_empty_query(sock).await?;
-        write_ready_for_query(sock, b'I').await?;
+        encode_empty_query(tx);
+        encode_ready_for_query(tx, b'I');
+        flush_tx(sock, tx).await?;
         Ok(None)
     } else {
-        write_error_response(sock, "0A000", &format!("unsupported query: {trimmed}")).await?;
-        write_ready_for_query(sock, b'I').await?;
+        encode_error_response(tx, "0A000", &format!("unsupported query: {trimmed}"));
+        encode_ready_for_query(tx, b'I');
+        flush_tx(sock, tx).await?;
         Err(ServerError::Unsupported(trimmed.to_string()))
     }
 }
@@ -300,63 +324,41 @@ fn parse_start_replication(query: &str) -> Result<StartReplication, ServerError>
 }
 
 // --- wire-encoder helpers ---------------------------------------------------
+//
+// Encoders append directly into a shared BytesMut so the handshake /
+// query dispatch flushes once per phase, instead of one syscall + one
+// fresh Vec per message
 
-async fn write_auth_ok<S: AsyncWrite + Unpin>(sock: &mut S) -> Result<(), ServerError> {
-    let mut buf = Vec::with_capacity(9);
-    buf.push(b'R');
-    buf.extend_from_slice(&8u32.to_be_bytes());
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    sock.write_all(&buf).await?;
-    Ok(())
+fn encode_auth_ok(tx: &mut BytesMut) {
+    tx.extend_from_slice(b"R");
+    tx.extend_from_slice(&8u32.to_be_bytes());
+    tx.extend_from_slice(&0u32.to_be_bytes());
 }
 
-async fn write_parameter_status<S: AsyncWrite + Unpin>(
-    sock: &mut S,
-    name: &str,
-    value: &str,
-) -> Result<(), ServerError> {
+fn encode_parameter_status(tx: &mut BytesMut, name: &str, value: &str) {
     let payload_len = 4 + name.len() + 1 + value.len() + 1;
-    let mut buf = Vec::with_capacity(1 + payload_len);
-    buf.push(b'S');
-    buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
-    buf.extend_from_slice(name.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(value.as_bytes());
-    buf.push(0);
-    sock.write_all(&buf).await?;
-    Ok(())
+    tx.extend_from_slice(b"S");
+    tx.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    tx.extend_from_slice(name.as_bytes());
+    tx.extend_from_slice(b"\0");
+    tx.extend_from_slice(value.as_bytes());
+    tx.extend_from_slice(b"\0");
 }
 
-async fn write_backend_key_data<S: AsyncWrite + Unpin>(
-    sock: &mut S,
-    pid: u32,
-    key: u32,
-) -> Result<(), ServerError> {
-    let mut buf = Vec::with_capacity(13);
-    buf.push(b'K');
-    buf.extend_from_slice(&12u32.to_be_bytes());
-    buf.extend_from_slice(&pid.to_be_bytes());
-    buf.extend_from_slice(&key.to_be_bytes());
-    sock.write_all(&buf).await?;
-    Ok(())
+fn encode_backend_key_data(tx: &mut BytesMut, pid: u32, key: u32) {
+    tx.extend_from_slice(b"K");
+    tx.extend_from_slice(&12u32.to_be_bytes());
+    tx.extend_from_slice(&pid.to_be_bytes());
+    tx.extend_from_slice(&key.to_be_bytes());
 }
 
-async fn write_ready_for_query<S: AsyncWrite + Unpin>(
-    sock: &mut S,
-    txn_status: u8,
-) -> Result<(), ServerError> {
-    let mut buf = Vec::with_capacity(6);
-    buf.push(b'Z');
-    buf.extend_from_slice(&5u32.to_be_bytes());
-    buf.push(txn_status);
-    sock.write_all(&buf).await?;
-    Ok(())
+fn encode_ready_for_query(tx: &mut BytesMut, txn_status: u8) {
+    tx.extend_from_slice(b"Z");
+    tx.extend_from_slice(&5u32.to_be_bytes());
+    tx.extend_from_slice(&[txn_status]);
 }
 
-async fn write_identify_system<S: AsyncWrite + Unpin>(
-    sock: &mut S,
-    identity: &Identity,
-) -> Result<(), ServerError> {
+fn encode_identify_system(tx: &mut BytesMut, identity: &Identity) {
     // RowDescription: 4 fields (systemid text, timeline int4, xlogpos text, dbname text)
     let fields = [
         ("systemid", 25u32), // text
@@ -364,164 +366,133 @@ async fn write_identify_system<S: AsyncWrite + Unpin>(
         ("xlogpos", 25u32),
         ("dbname", 25u32),
     ];
-    let mut row_desc = Vec::new();
-    row_desc.push(b'T');
-    let row_desc_len_pos = row_desc.len();
-    row_desc.extend_from_slice(&0u32.to_be_bytes()); // placeholder length
-    row_desc.extend_from_slice(&(fields.len() as u16).to_be_bytes());
+    let row_desc_tag_pos = tx.len();
+    tx.extend_from_slice(b"T");
+    let row_desc_len_pos = tx.len();
+    tx.extend_from_slice(&0u32.to_be_bytes()); // placeholder length
+    tx.extend_from_slice(&(fields.len() as u16).to_be_bytes());
     for (name, oid) in fields {
-        row_desc.extend_from_slice(name.as_bytes());
-        row_desc.push(0);
-        row_desc.extend_from_slice(&0u32.to_be_bytes()); // table oid
-        row_desc.extend_from_slice(&0u16.to_be_bytes()); // attnum
-        row_desc.extend_from_slice(&oid.to_be_bytes());
-        row_desc.extend_from_slice(&(-1i16).to_be_bytes()); // type length
-        row_desc.extend_from_slice(&(-1i32).to_be_bytes()); // typmod
-        row_desc.extend_from_slice(&0u16.to_be_bytes()); // format = text
+        tx.extend_from_slice(name.as_bytes());
+        tx.extend_from_slice(b"\0");
+        tx.extend_from_slice(&0u32.to_be_bytes()); // table oid
+        tx.extend_from_slice(&0u16.to_be_bytes()); // attnum
+        tx.extend_from_slice(&oid.to_be_bytes());
+        tx.extend_from_slice(&(-1i16).to_be_bytes()); // type length
+        tx.extend_from_slice(&(-1i32).to_be_bytes()); // typmod
+        tx.extend_from_slice(&0u16.to_be_bytes()); // format = text
     }
-    let payload_len = row_desc.len() - row_desc_len_pos - 4 + 4;
-    row_desc[row_desc_len_pos..row_desc_len_pos + 4]
-        .copy_from_slice(&((payload_len + 4 - 4) as u32).to_be_bytes());
-    let payload_len = row_desc.len() - 1 - 4; // bytes after header
-    row_desc[row_desc_len_pos..row_desc_len_pos + 4]
-        .copy_from_slice(&((payload_len + 4) as u32).to_be_bytes());
-    sock.write_all(&row_desc).await?;
+    let payload_len = (tx.len() - row_desc_tag_pos - 1) as u32;
+    tx[row_desc_len_pos..row_desc_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
 
     // DataRow with the 4 column values.
     let xlogpos_str = format_pg_lsn(identity.xlogpos);
-    let columns: [Option<String>; 4] = [
-        Some(identity.system_id.clone()),
-        Some(identity.timeline.to_string()),
-        Some(xlogpos_str),
-        identity.dbname.clone(),
+    let columns: [Option<&str>; 4] = [
+        Some(identity.system_id.as_str()),
+        None, // timeline rendered below (needs a String)
+        Some(xlogpos_str.as_str()),
+        identity.dbname.as_deref(),
     ];
-    let mut row = Vec::new();
-    row.push(b'D');
-    let row_len_pos = row.len();
-    row.extend_from_slice(&0u32.to_be_bytes());
-    row.extend_from_slice(&(columns.len() as u16).to_be_bytes());
-    for col in columns {
-        match col {
+    let timeline_str = identity.timeline.to_string();
+    let row_tag_pos = tx.len();
+    tx.extend_from_slice(b"D");
+    let row_len_pos = tx.len();
+    tx.extend_from_slice(&0u32.to_be_bytes());
+    tx.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+    for (idx, col) in columns.iter().enumerate() {
+        let val = if idx == 1 {
+            Some(timeline_str.as_str())
+        } else {
+            *col
+        };
+        match val {
             Some(s) => {
-                row.extend_from_slice(&(s.len() as i32).to_be_bytes());
-                row.extend_from_slice(s.as_bytes());
+                tx.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                tx.extend_from_slice(s.as_bytes());
             }
-            None => row.extend_from_slice(&(-1i32).to_be_bytes()),
+            None => tx.extend_from_slice(&(-1i32).to_be_bytes()),
         }
     }
-    let payload_len = row.len() - 1 - 4;
-    row[row_len_pos..row_len_pos + 4].copy_from_slice(&((payload_len + 4) as u32).to_be_bytes());
-    sock.write_all(&row).await?;
+    let payload_len = (tx.len() - row_tag_pos - 1) as u32;
+    tx[row_len_pos..row_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
 
-    write_command_complete(sock, "IDENTIFY_SYSTEM").await?;
-    Ok(())
+    encode_command_complete(tx, "IDENTIFY_SYSTEM");
 }
 
-async fn write_timeline_history<S: AsyncWrite + Unpin>(
-    sock: &mut S,
-    identity: &Identity,
-) -> Result<(), ServerError> {
+fn encode_timeline_history(tx: &mut BytesMut, identity: &Identity) {
     // RowDescription: 2 fields (filename text, content bytea)
     let fields = [("filename", 25u32), ("content", 17u32)];
-    let mut row_desc = Vec::new();
-    row_desc.push(b'T');
-    let row_desc_len_pos = row_desc.len();
-    row_desc.extend_from_slice(&0u32.to_be_bytes());
-    row_desc.extend_from_slice(&(fields.len() as u16).to_be_bytes());
+    let row_desc_tag_pos = tx.len();
+    tx.extend_from_slice(b"T");
+    let row_desc_len_pos = tx.len();
+    tx.extend_from_slice(&0u32.to_be_bytes());
+    tx.extend_from_slice(&(fields.len() as u16).to_be_bytes());
     for (name, oid) in fields {
-        row_desc.extend_from_slice(name.as_bytes());
-        row_desc.push(0);
-        row_desc.extend_from_slice(&0u32.to_be_bytes());
-        row_desc.extend_from_slice(&0u16.to_be_bytes());
-        row_desc.extend_from_slice(&oid.to_be_bytes());
-        row_desc.extend_from_slice(&(-1i16).to_be_bytes());
-        row_desc.extend_from_slice(&(-1i32).to_be_bytes());
-        row_desc.extend_from_slice(&0u16.to_be_bytes());
+        tx.extend_from_slice(name.as_bytes());
+        tx.extend_from_slice(b"\0");
+        tx.extend_from_slice(&0u32.to_be_bytes());
+        tx.extend_from_slice(&0u16.to_be_bytes());
+        tx.extend_from_slice(&oid.to_be_bytes());
+        tx.extend_from_slice(&(-1i16).to_be_bytes());
+        tx.extend_from_slice(&(-1i32).to_be_bytes());
+        tx.extend_from_slice(&0u16.to_be_bytes());
     }
-    let payload_len = row_desc.len() - 1 - 4;
-    row_desc[row_desc_len_pos..row_desc_len_pos + 4]
-        .copy_from_slice(&((payload_len + 4) as u32).to_be_bytes());
-    sock.write_all(&row_desc).await?;
+    let payload_len = (tx.len() - row_desc_tag_pos - 1) as u32;
+    tx[row_desc_len_pos..row_desc_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
 
     // DataRow: filename = "<timeline>.history", content = "".
     let filename = format!("{:08X}.history", identity.timeline);
     let content: &[u8] = b"";
-    let mut row = Vec::new();
-    row.push(b'D');
-    let row_len_pos = row.len();
-    row.extend_from_slice(&0u32.to_be_bytes());
-    row.extend_from_slice(&2u16.to_be_bytes());
-    row.extend_from_slice(&(filename.len() as i32).to_be_bytes());
-    row.extend_from_slice(filename.as_bytes());
-    row.extend_from_slice(&(content.len() as i32).to_be_bytes());
-    row.extend_from_slice(content);
-    let payload_len = row.len() - 1 - 4;
-    row[row_len_pos..row_len_pos + 4].copy_from_slice(&((payload_len + 4) as u32).to_be_bytes());
-    sock.write_all(&row).await?;
+    let row_tag_pos = tx.len();
+    tx.extend_from_slice(b"D");
+    let row_len_pos = tx.len();
+    tx.extend_from_slice(&0u32.to_be_bytes());
+    tx.extend_from_slice(&2u16.to_be_bytes());
+    tx.extend_from_slice(&(filename.len() as i32).to_be_bytes());
+    tx.extend_from_slice(filename.as_bytes());
+    tx.extend_from_slice(&(content.len() as i32).to_be_bytes());
+    tx.extend_from_slice(content);
+    let payload_len = (tx.len() - row_tag_pos - 1) as u32;
+    tx[row_len_pos..row_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
 
-    write_command_complete(sock, "TIMELINE_HISTORY").await?;
-    Ok(())
+    encode_command_complete(tx, "TIMELINE_HISTORY");
 }
 
-async fn write_command_complete<S: AsyncWrite + Unpin>(
-    sock: &mut S,
-    tag: &str,
-) -> Result<(), ServerError> {
+fn encode_command_complete(tx: &mut BytesMut, tag: &str) {
     let payload_len = 4 + tag.len() + 1;
-    let mut buf = Vec::with_capacity(1 + payload_len);
-    buf.push(b'C');
-    buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
-    buf.extend_from_slice(tag.as_bytes());
-    buf.push(0);
-    sock.write_all(&buf).await?;
-    Ok(())
+    tx.extend_from_slice(b"C");
+    tx.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    tx.extend_from_slice(tag.as_bytes());
+    tx.extend_from_slice(b"\0");
 }
 
-async fn write_empty_query<S: AsyncWrite + Unpin>(sock: &mut S) -> Result<(), ServerError> {
-    let mut buf = Vec::with_capacity(5);
-    buf.push(b'I');
-    buf.extend_from_slice(&4u32.to_be_bytes());
-    sock.write_all(&buf).await?;
-    Ok(())
+fn encode_empty_query(tx: &mut BytesMut) {
+    tx.extend_from_slice(b"I");
+    tx.extend_from_slice(&4u32.to_be_bytes());
 }
 
-async fn write_copy_both_response<S: AsyncWrite + Unpin>(sock: &mut S) -> Result<(), ServerError> {
+fn encode_copy_both_response(tx: &mut BytesMut) {
     // 'W' | u32 length | u8 format (0 = text) | u16 ncols (0)
     let payload_len = 4 + 1 + 2;
-    let mut buf = Vec::with_capacity(1 + payload_len);
-    buf.push(b'W');
-    buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
-    buf.push(0);
-    buf.extend_from_slice(&0u16.to_be_bytes());
-    sock.write_all(&buf).await?;
-    Ok(())
+    tx.extend_from_slice(b"W");
+    tx.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    tx.extend_from_slice(&[0]);
+    tx.extend_from_slice(&0u16.to_be_bytes());
 }
 
-async fn write_error_response<S: AsyncWrite + Unpin>(
-    sock: &mut S,
-    code: &str,
-    message: &str,
-) -> Result<(), ServerError> {
-    let payload = {
-        let mut v = Vec::new();
-        v.push(b'S');
-        v.extend_from_slice(b"ERROR\0");
-        v.push(b'C');
-        v.extend_from_slice(code.as_bytes());
-        v.push(0);
-        v.push(b'M');
-        v.extend_from_slice(message.as_bytes());
-        v.push(0);
-        v.push(0);
-        v
-    };
-    let len = 4 + payload.len();
-    let mut buf = Vec::with_capacity(1 + len);
-    buf.push(b'E');
-    buf.extend_from_slice(&(len as u32).to_be_bytes());
-    buf.extend_from_slice(&payload);
-    sock.write_all(&buf).await?;
-    Ok(())
+fn encode_error_response(tx: &mut BytesMut, code: &str, message: &str) {
+    let payload_len = 1 + b"ERROR\0".len() + 1 + code.len() + 1 + 1 + message.len() + 1 + 1;
+    let len = 4 + payload_len;
+    tx.extend_from_slice(b"E");
+    tx.extend_from_slice(&(len as u32).to_be_bytes());
+    tx.extend_from_slice(b"S");
+    tx.extend_from_slice(b"ERROR\0");
+    tx.extend_from_slice(b"C");
+    tx.extend_from_slice(code.as_bytes());
+    tx.extend_from_slice(b"\0");
+    tx.extend_from_slice(b"M");
+    tx.extend_from_slice(message.as_bytes());
+    tx.extend_from_slice(b"\0");
+    tx.extend_from_slice(b"\0");
 }
 
 fn format_pg_lsn(lsn: u64) -> String {
@@ -573,6 +544,11 @@ where
 {
     sock: S,
     rx: BytesMut,
+    /// Reused send buffer so `write_raw` doesn't allocate per frame.
+    /// Multiple frames can be staged via [`Self::enqueue_raw`] /
+    /// [`Self::enqueue_framed`] and shipped together with
+    /// [`Self::flush`]
+    tx: BytesMut,
 }
 
 impl<S> WalSenderConn<S>
@@ -583,23 +559,51 @@ where
         Self {
             sock,
             rx: BytesMut::with_capacity(8192),
+            tx: BytesMut::with_capacity(8192),
         }
+    }
+
+    /// Append a server-direction CopyData payload (`'w'` XLogData or
+    /// `'k'` keepalive) into the send buffer under the `'d'` CopyData
+    /// envelope. Does not flush — call [`Self::flush`] explicitly when
+    /// staging multiple frames
+    pub fn enqueue_raw(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let payload_len = (4 + bytes.len()) as u32;
+        self.tx.extend_from_slice(b"d");
+        self.tx.extend_from_slice(&payload_len.to_be_bytes());
+        self.tx.extend_from_slice(bytes);
+    }
+
+    /// Append already-CopyData-framed bytes (caller pre-built the `'d'`
+    /// envelope). Used when callers frame ahead of the conn to batch
+    /// multiple frames without staging copies
+    pub fn enqueue_framed(&mut self, bytes: &[u8]) {
+        self.tx.extend_from_slice(bytes);
+    }
+
+    /// Drain the staged tx buffer onto the wire and clear it
+    pub async fn flush(&mut self) -> Result<(), ServerError> {
+        if self.tx.is_empty() {
+            return Ok(());
+        }
+        self.sock.write_all(&self.tx).await?;
+        self.tx.clear();
+        Ok(())
     }
 
     /// Frame `bytes` (a server-direction CopyData payload —
     /// `'w'` XLogData or `'k'` keepalive) under PG's `d` CopyData
-    /// envelope and ship.
+    /// envelope and ship. Convenience: equivalent to
+    /// `enqueue_raw(bytes); flush()`
     pub async fn write_raw(&mut self, bytes: &[u8]) -> Result<(), ServerError> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let payload_len = 4 + bytes.len();
-        let mut buf = Vec::with_capacity(1 + payload_len);
-        buf.push(b'd');
-        buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
-        buf.extend_from_slice(bytes);
-        self.sock.write_all(&buf).await?;
-        Ok(())
+        self.enqueue_raw(bytes);
+        self.flush().await
     }
 
     /// Ship already-CopyData-framed bytes verbatim (no further
@@ -616,8 +620,9 @@ where
 
     /// Drain inbound bytes, returning the next complete CopyData
     /// payload's body (without the `'d'` envelope) once available.
-    /// Returns `Ok(None)` on clean close.
-    pub async fn try_recv_frame(&mut self) -> Result<Option<Vec<u8>>, ServerError> {
+    /// Returns `Ok(None)` on clean close. Body is a `Bytes` slice into
+    /// the read buffer (refcounted, no copy)
+    pub async fn try_recv_frame(&mut self) -> Result<Option<Bytes>, ServerError> {
         loop {
             if let Some(body) = parse_one_copy_data(&mut self.rx)? {
                 return Ok(Some(body));
@@ -634,7 +639,7 @@ where
     }
 }
 
-fn parse_one_copy_data(rx: &mut BytesMut) -> Result<Option<Vec<u8>>, ServerError> {
+fn parse_one_copy_data(rx: &mut BytesMut) -> Result<Option<Bytes>, ServerError> {
     if rx.len() < 5 {
         return Ok(None);
     }
@@ -651,9 +656,9 @@ fn parse_one_copy_data(rx: &mut BytesMut) -> Result<Option<Vec<u8>>, ServerError
     }
     match kind {
         b'd' => {
-            let mut frame = rx.split_to(total);
+            let mut frame = rx.split_to(total).freeze();
             frame.advance(5);
-            Ok(Some(frame.to_vec()))
+            Ok(Some(frame))
         }
         b'c' => {
             let _ = rx.split_to(total);

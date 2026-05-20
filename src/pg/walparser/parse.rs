@@ -12,10 +12,11 @@ use thiserror::Error;
 
 use super::all_zero;
 use super::types::{
-    BKP_IMAGE_HAS_HOLE, BLOCK_SIZE, BlockLocation, RM_NEXT_FREE_ID, RelFileNode, WAL_PAGE_SIZE,
-    X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG,
-    XLR_BLOCK_ID_DATA_SHORT, XLR_BLOCK_ID_ORIGIN, XLR_MAX_BLOCK_ID, XLogPageHeader, XLogRecord,
-    XLogRecordBlock, XLogRecordBlockHeader, XLogRecordBlockImageHeader, XLogRecordHeader,
+    BKP_IMAGE_HAS_HOLE, BLOCK_SIZE, BlockLocation, RM_NEXT_FREE_ID, RelFileNode, RmId,
+    WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, X_LOG_SWITCH,
+    XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT, XLR_BLOCK_ID_ORIGIN, XLR_INFO_MASK,
+    XLR_MAX_BLOCK_ID, XLogPageHeader, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
+    XLogRecordBlockImageHeader, XLogRecordHeader,
 };
 
 #[derive(Debug, Error)]
@@ -400,6 +401,56 @@ pub fn parse_record_from_bytes(data: &[u8], page_magic: u16) -> Result<XLogRecor
     let mut buf = data;
     let h = read_xlog_record_header(&mut buf)?;
     read_xlog_record_body(h, &mut buf, page_magic)
+}
+
+/// Walk a record's header area emitting `BlockLocation`s via `f`, without
+/// allocating per-block `Cow` payloads. Image / data / main_data bodies are
+/// skipped via the `HdrCursor::shrink` accounting just like the records
+/// path, but never materialised. Used by `extract_locations_from_wal_file`
+/// (delta-map build) where only locations are needed
+pub fn for_each_block_location_in_record<F: FnMut(BlockLocation)>(
+    record_data: &[u8],
+    page_magic: u16,
+    mut f: F,
+) -> Result<(), ParseError> {
+    let mut buf = record_data;
+    let header = read_xlog_record_header(&mut buf)?;
+    // WAL_SWITCH: header-only record, no blocks
+    if header.resource_manager_id == RmId::Xlog as u8
+        && (header.info & !XLR_INFO_MASK) == X_LOG_SWITCH
+    {
+        return Ok(());
+    }
+    let total = header.total_record_length as usize;
+    if total < X_LOG_RECORD_HEADER_SIZE {
+        return Err(ParseError::BadRecordLength(header.total_record_length));
+    }
+    let body_len = total - X_LOG_RECORD_HEADER_SIZE;
+    let mut c = HdrCursor::new(buf, body_len);
+    let mut last_rel: Option<RelFileNode> = None;
+    let mut max_block_id: i32 = -1;
+    while c.remaining > 0 {
+        let block_id = c.read_u8("blockId")?;
+        match block_id {
+            XLR_BLOCK_ID_DATA_SHORT => {
+                let len = c.read_u8("mainDataLen8")?;
+                c.shrink(len as usize)?;
+            }
+            XLR_BLOCK_ID_DATA_LONG => {
+                let len = c.read_u32("mainDataLen32")?;
+                c.shrink(len as usize)?;
+            }
+            XLR_BLOCK_ID_ORIGIN => {
+                let _ = c.read_u16("origin")?;
+            }
+            id => {
+                let h =
+                    read_block_header(&mut last_rel, id, &mut max_block_id, &mut c, page_magic)?;
+                f(h.location);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ─── page helpers ───────────────────────────────────────────────────────────

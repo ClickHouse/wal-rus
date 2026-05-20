@@ -170,8 +170,12 @@ struct EncryptReader {
     /// Ciphertext (and the leading header) waiting to be drained
     out: Vec<u8>,
     out_pos: usize,
-    /// Plaintext buffered before next push
+    /// Plaintext scratch sized once at construction so polls read
+    /// directly into [`Self::in_buf`] via a slice of `in_buf[in_filled..]`
+    /// without allocating per-poll. `in_filled` tracks the meaningful
+    /// prefix; the rest of `in_buf` is initialised but garbage
     in_buf: Vec<u8>,
+    in_filled: usize,
     eof: bool,
     finalized: bool,
 }
@@ -184,7 +188,8 @@ impl EncryptReader {
             key,
             out: Vec::with_capacity(CHUNK_SIZE + ABYTES + HEADER_BYTES),
             out_pos: 0,
-            in_buf: Vec::with_capacity(CHUNK_SIZE),
+            in_buf: vec![0u8; CHUNK_SIZE],
+            in_filled: 0,
             eof: false,
             finalized: false,
         }
@@ -203,11 +208,22 @@ impl EncryptReader {
     fn push_chunk(&mut self, last: bool) -> std::io::Result<()> {
         let s = self.stream.as_mut().expect("init_if_needed called");
         let tag = if last { Tag::FINAL } else { Tag::MESSAGE };
+        // dryoc's `Bytes` impl needs a `Sized` Input — `&[u8]` qualifies,
+        // so pass-by-double-reference here to keep the call zero-copy
+        let plaintext: &[u8] = &self.in_buf[..self.in_filled];
         let ct: Vec<u8> = s
-            .push(&self.in_buf, None, tag)
+            .push(&plaintext, None, tag)
             .map_err(|e| std::io::Error::other(format!("libsodium push: {e}")))?;
-        self.out.extend_from_slice(&ct);
-        self.in_buf.clear();
+        // When out is fully drained (out_pos == len), adopt dryoc's Vec
+        // directly instead of copying via extend_from_slice. The header
+        // path & rare partial-drain interleavings still extend
+        if self.out_pos == self.out.len() {
+            self.out = ct;
+            self.out_pos = 0;
+        } else {
+            self.out.extend_from_slice(&ct);
+        }
+        self.in_filled = 0;
         if last {
             self.finalized = true;
         }
@@ -240,10 +256,10 @@ impl AsyncRead for EncryptReader {
                 return Poll::Ready(Ok(()));
             }
 
-            // 2) Top up the plaintext buffer
-            let need = CHUNK_SIZE - me.in_buf.len();
-            let mut scratch = vec![0u8; need];
-            let mut tmp = ReadBuf::new(&mut scratch);
+            // 2) Top up the plaintext buffer — read into the
+            //    pre-allocated slice me.in_buf[in_filled..], no
+            //    per-poll alloc and no copy into in_buf afterwards
+            let mut tmp = ReadBuf::new(&mut me.in_buf[me.in_filled..]);
             match Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -253,11 +269,11 @@ impl AsyncRead for EncryptReader {
             if n == 0 {
                 me.eof = true;
             } else {
-                me.in_buf.extend_from_slice(&tmp.filled()[..n]);
+                me.in_filled += n;
             }
 
             // 3) Push a chunk
-            if me.in_buf.len() == CHUNK_SIZE && !me.eof {
+            if me.in_filled == CHUNK_SIZE && !me.eof {
                 me.push_chunk(false)?;
             } else if me.eof {
                 me.push_chunk(true)?;
@@ -271,13 +287,17 @@ struct DecryptReader {
     inner: AsyncReader,
     stream: Option<DryocStream<Pull>>,
     key: [u8; KEY_BYTES],
-    /// Header bytes accumulated until init_pull runs
-    header_buf: Vec<u8>,
+    /// Header bytes accumulated until init_pull runs. Pre-allocated,
+    /// length-tracked by `header_filled` to avoid per-poll allocs
+    header_buf: [u8; HEADER_BYTES],
+    header_filled: usize,
     /// Plaintext queued for the caller
     out: Vec<u8>,
     out_pos: usize,
-    /// Ciphertext buffered before next pull
+    /// Ciphertext scratch sized once at construction; `in_filled` is
+    /// the meaningful prefix
     in_buf: Vec<u8>,
+    in_filled: usize,
     eof: bool,
     finalized: bool,
 }
@@ -288,10 +308,12 @@ impl DecryptReader {
             inner,
             stream: None,
             key,
-            header_buf: Vec::with_capacity(HEADER_BYTES),
+            header_buf: [0u8; HEADER_BYTES],
+            header_filled: 0,
             out: Vec::with_capacity(CHUNK_SIZE),
             out_pos: 0,
-            in_buf: Vec::with_capacity(CHUNK_SIZE + ABYTES),
+            in_buf: vec![0u8; CHUNK_SIZE + ABYTES],
+            in_filled: 0,
             eof: false,
             finalized: false,
         }
@@ -299,11 +321,19 @@ impl DecryptReader {
 
     fn pull_chunk(&mut self) -> std::io::Result<()> {
         let s = self.stream.as_mut().expect("init done");
+        // See comment in `push_chunk` re: `&&[u8]` shape
+        let ciphertext: &[u8] = &self.in_buf[..self.in_filled];
         let (pt, tag): (Vec<u8>, Tag) = s
-            .pull(&self.in_buf, None)
+            .pull(&ciphertext, None)
             .map_err(|e| std::io::Error::other(format!("libsodium pull: {e}")))?;
-        self.out.extend_from_slice(&pt);
-        self.in_buf.clear();
+        if self.out_pos == self.out.len() {
+            // Drained; adopt dryoc's Vec without copying
+            self.out = pt;
+            self.out_pos = 0;
+        } else {
+            self.out.extend_from_slice(&pt);
+        }
+        self.in_filled = 0;
         if matches!(tag, Tag::FINAL) {
             self.finalized = true;
         }
@@ -333,11 +363,10 @@ impl AsyncRead for DecryptReader {
             if me.finalized {
                 return Poll::Ready(Ok(()));
             }
-            // 2) Header phase
+            // 2) Header phase — read directly into the pre-allocated
+            //    header_buf slice, no per-poll scratch
             if me.stream.is_none() {
-                let need = HEADER_BYTES - me.header_buf.len();
-                let mut scratch = vec![0u8; need];
-                let mut tmp = ReadBuf::new(&mut scratch);
+                let mut tmp = ReadBuf::new(&mut me.header_buf[me.header_filled..]);
                 match Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -350,22 +379,19 @@ impl AsyncRead for DecryptReader {
                         "libsodium: EOF before 24-byte header",
                     )));
                 }
-                me.header_buf.extend_from_slice(&tmp.filled()[..n]);
-                if me.header_buf.len() == HEADER_BYTES {
+                me.header_filled += n;
+                if me.header_filled == HEADER_BYTES {
                     let key: Key = me.key.into();
-                    let mut hdr_bytes = [0u8; HEADER_BYTES];
-                    hdr_bytes.copy_from_slice(&me.header_buf);
-                    let hdr: Header = hdr_bytes.into();
+                    let hdr: Header = me.header_buf.into();
                     me.stream = Some(DryocStream::<Pull>::init_pull(&key, &hdr));
                 }
                 continue;
             }
 
-            // 3) Read up to one full ciphertext chunk
+            // 3) Read up to one full ciphertext chunk — into the
+            //    pre-allocated tail of in_buf
             let target = CHUNK_SIZE + ABYTES;
-            let need = target - me.in_buf.len();
-            let mut scratch = vec![0u8; need];
-            let mut tmp = ReadBuf::new(&mut scratch);
+            let mut tmp = ReadBuf::new(&mut me.in_buf[me.in_filled..]);
             match Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -375,20 +401,20 @@ impl AsyncRead for DecryptReader {
             if n == 0 {
                 me.eof = true;
             } else {
-                me.in_buf.extend_from_slice(&tmp.filled()[..n]);
+                me.in_filled += n;
             }
-            if me.in_buf.len() == target {
+            if me.in_filled == target {
                 me.pull_chunk()?;
                 continue; // loop back to drain
             }
             if me.eof {
-                if me.in_buf.is_empty() {
+                if me.in_filled == 0 {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "libsodium: ciphertext ended without FINAL tag",
                     )));
                 }
-                if me.in_buf.len() < ABYTES {
+                if me.in_filled < ABYTES {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "libsodium: truncated tail chunk",
