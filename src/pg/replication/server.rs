@@ -90,9 +90,8 @@ where
         match msg.kind {
             b'Q' => {
                 let query = parse_simple_query(&msg.body)?;
-                match dispatch_query(sock, &query, identity).await? {
-                    Some(start) => return Ok(start),
-                    None => {}
+                if let Some(start) = dispatch_query(sock, &query, identity).await? {
+                    return Ok(start);
                 }
             }
             b'X' => return Err(ServerError::Protocol("client closed during startup".into())),
@@ -163,7 +162,7 @@ where
     const SSL_REQUEST_CODE: u32 = 80877103;
     const GSSENC_REQUEST_CODE: u32 = 80877104;
     if protocol == SSL_REQUEST_CODE || protocol == GSSENC_REQUEST_CODE {
-        sock.write_all(&[b'N']).await?;
+        sock.write_all(b"N").await?;
         sock.flush().await?;
         return Box::pin(read_startup(sock)).await;
     }
