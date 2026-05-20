@@ -170,17 +170,36 @@ impl XLogRecordHeader {
     }
 }
 
-/// XLogRecord — header + decoded block headers + main data
-#[derive(Debug, Clone, Default)]
-pub struct XLogRecord {
+/// XLogRecord — header + decoded block headers + main data.
+///
+/// The bulk byte fields (`main_data`, per-block `image` / `data`) use
+/// [`Cow<'a, [u8]>`] so the parser can borrow zero-copy into the
+/// caller's input buffer; constructors that genuinely need ownership
+/// (tests, callers that store records across borrow lifetimes) wrap
+/// `Cow::Owned`. Use [`Self::into_owned`] to materialise a
+/// `XLogRecord<'static>` when crossing a borrow boundary.
+#[derive(Debug, Clone)]
+pub struct XLogRecord<'a> {
     pub header: XLogRecordHeader,
     pub main_data_len: u32,
     pub origin: u16,
-    pub blocks: Vec<XLogRecordBlock>,
-    pub main_data: Vec<u8>,
+    pub blocks: Vec<XLogRecordBlock<'a>>,
+    pub main_data: std::borrow::Cow<'a, [u8]>,
 }
 
-impl XLogRecord {
+impl<'a> Default for XLogRecord<'a> {
+    fn default() -> Self {
+        Self {
+            header: XLogRecordHeader::default(),
+            main_data_len: 0,
+            origin: 0,
+            blocks: Vec::new(),
+            main_data: std::borrow::Cow::Borrowed(&[]),
+        }
+    }
+}
+
+impl<'a> XLogRecord<'a> {
     pub fn is_zero(&self) -> bool {
         self.header.is_zero()
             && self.main_data_len == 0
@@ -194,14 +213,47 @@ impl XLogRecord {
         self.header.resource_manager_id == RmId::Xlog as u8
             && (self.header.info & !XLR_INFO_MASK) == X_LOG_SWITCH
     }
+
+    /// Collapse every borrowed payload into owned `Vec<u8>`s so the
+    /// record outlives the source buffer. Test sinks that store
+    /// records call this to bump the lifetime to `'static`.
+    pub fn into_owned(self) -> XLogRecord<'static> {
+        XLogRecord {
+            header: self.header,
+            main_data_len: self.main_data_len,
+            origin: self.origin,
+            blocks: self.blocks.into_iter().map(|b| b.into_owned()).collect(),
+            main_data: std::borrow::Cow::Owned(self.main_data.into_owned()),
+        }
+    }
 }
 
 /// One block reference inside an XLogRecord
-#[derive(Debug, Clone, Default)]
-pub struct XLogRecordBlock {
+#[derive(Debug, Clone)]
+pub struct XLogRecordBlock<'a> {
     pub header: XLogRecordBlockHeader,
-    pub image: Vec<u8>,
-    pub data: Vec<u8>,
+    pub image: std::borrow::Cow<'a, [u8]>,
+    pub data: std::borrow::Cow<'a, [u8]>,
+}
+
+impl<'a> Default for XLogRecordBlock<'a> {
+    fn default() -> Self {
+        Self {
+            header: XLogRecordBlockHeader::default(),
+            image: std::borrow::Cow::Borrowed(&[]),
+            data: std::borrow::Cow::Borrowed(&[]),
+        }
+    }
+}
+
+impl<'a> XLogRecordBlock<'a> {
+    pub fn into_owned(self) -> XLogRecordBlock<'static> {
+        XLogRecordBlock {
+            header: self.header,
+            image: std::borrow::Cow::Owned(self.image.into_owned()),
+            data: std::borrow::Cow::Owned(self.data.into_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,10 +391,10 @@ impl XLogPageHeader {
 /// previous page (if any) + complete records on this page + start of a
 /// record that overflows into the next page (if any)
 #[derive(Debug, Clone, Default)]
-pub struct XLogPage {
+pub struct XLogPage<'a> {
     pub header: XLogPageHeader,
     pub prev_record_trailing_data: Vec<u8>,
-    pub records: Vec<XLogRecord>,
+    pub records: Vec<XLogRecord<'a>>,
     pub next_record_heading_data: Vec<u8>,
 }
 

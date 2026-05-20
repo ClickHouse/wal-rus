@@ -90,7 +90,7 @@ impl WalParser {
     pub fn parse_records_from_page(
         &mut self,
         page_data: &[u8],
-    ) -> Result<(Vec<u8>, Vec<XLogRecord>), ParsePageError> {
+    ) -> Result<(Vec<u8>, Vec<XLogRecord<'static>>), ParsePageError> {
         let page = match self.parse_page(page_data) {
             Ok(p) => p,
             Err(ParsePageError::Parse(ParseError::PartialPage))
@@ -120,7 +120,11 @@ impl WalParser {
         if header.total_record_length as usize != current_record_data.len() {
             return Err(ParseError::ContinuationNotFound.into());
         }
-        let current_record = parse_record_from_bytes(&current_record_data, self.page_magic())?;
+        // state.rs returns owned records — the input slices it parses
+        // from are scratch buffers that don't outlive this function,
+        // so we materialise.
+        let current_record =
+            parse_record_from_bytes(&current_record_data, self.page_magic())?.into_owned();
 
         let mut records = Vec::with_capacity(page.records.len() + 1);
         records.push(current_record);
@@ -129,7 +133,7 @@ impl WalParser {
         Ok((Vec::new(), records))
     }
 
-    fn parse_page(&mut self, page_data: &[u8]) -> Result<XLogPage, ParsePageError> {
+    fn parse_page(&mut self, page_data: &[u8]) -> Result<XLogPage<'static>, ParsePageError> {
         if page_data.len() < WAL_PAGE_SIZE as usize / 2 {
             return Err(ParseError::PartialPage.into());
         }
@@ -220,7 +224,7 @@ fn read_xlog_page_inner(
     ar: &mut AlignedReader<'_>,
     header: XLogPageHeader,
     remaining_data: Vec<u8>,
-) -> Result<XLogPage, ParsePageError> {
+) -> Result<XLogPage<'static>, ParsePageError> {
     let page_magic = header.magic;
     let mut records = Vec::new();
     loop {
@@ -236,7 +240,7 @@ fn read_xlog_page_inner(
                     });
                 }
                 if whole {
-                    let record = parse_record_from_bytes(&data, page_magic)?;
+                    let record = parse_record_from_bytes(&data, page_magic)?.into_owned();
                     let is_switch = record.is_wal_switch();
                     records.push(record);
                     if is_switch {

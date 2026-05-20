@@ -299,9 +299,9 @@ fn read_block_header(
 
 /// Walk the header area of a record. Caller has already consumed the
 /// 24-byte header; `buf` points at the start of the body
-fn read_block_header_part(
-    record: &mut XLogRecord,
-    buf: &mut &[u8],
+fn read_block_header_part<'a>(
+    record: &mut XLogRecord<'a>,
+    buf: &mut &'a [u8],
     page_magic: u16,
 ) -> Result<(), ParseError> {
     let total = record.header.total_record_length as usize;
@@ -338,8 +338,8 @@ fn read_block_header_part(
                     read_block_header(&mut last_rel, id, &mut max_block_id, &mut c, page_magic)?;
                 record.blocks.push(XLogRecordBlock {
                     header: h,
-                    image: Vec::new(),
-                    data: Vec::new(),
+                    image: std::borrow::Cow::Borrowed(&[]),
+                    data: std::borrow::Cow::Borrowed(&[]),
                 });
             }
         }
@@ -348,47 +348,55 @@ fn read_block_header_part(
     Ok(())
 }
 
-fn read_block_data_and_images(record: &mut XLogRecord, buf: &mut &[u8]) -> Result<(), ParseError> {
+fn read_block_data_and_images<'a>(
+    record: &mut XLogRecord<'a>,
+    buf: &mut &'a [u8],
+) -> Result<(), ParseError> {
     for b in record.blocks.iter_mut() {
         if b.header.has_image() {
             let n = b.header.image_header.image_length as usize;
             let head = take(buf, n, "blockImage")?;
-            b.image = head.to_vec();
+            b.image = std::borrow::Cow::Borrowed(head);
         }
         if b.header.has_data() {
             let n = b.header.data_length as usize;
             let head = take(buf, n, "blockData")?;
-            b.data = head.to_vec();
+            b.data = std::borrow::Cow::Borrowed(head);
         }
     }
     Ok(())
 }
 
-fn read_xlog_record_main_data(len: u32, buf: &mut &[u8]) -> Result<Vec<u8>, ParseError> {
-    let head = take(buf, len as usize, "mainData")?;
-    Ok(head.to_vec())
+fn read_xlog_record_main_data<'a>(len: u32, buf: &mut &'a [u8]) -> Result<&'a [u8], ParseError> {
+    take(buf, len as usize, "mainData")
 }
 
-pub(crate) fn read_xlog_record_body(
+pub(crate) fn read_xlog_record_body<'a>(
     header: XLogRecordHeader,
-    buf: &mut &[u8],
+    buf: &mut &'a [u8],
     page_magic: u16,
-) -> Result<XLogRecord, ParseError> {
+) -> Result<XLogRecord<'a>, ParseError> {
     let mut record = XLogRecord {
         header,
         ..Default::default()
     };
     read_block_header_part(&mut record, buf, page_magic)?;
     read_block_data_and_images(&mut record, buf)?;
-    record.main_data = read_xlog_record_main_data(record.main_data_len, buf)?;
+    let main_data = read_xlog_record_main_data(record.main_data_len, buf)?;
+    record.main_data = std::borrow::Cow::Borrowed(main_data);
     Ok(record)
 }
 
 /// Parse a complete record body from raw bytes (caller already concatenated
 /// the header + body across any page boundaries). `page_magic` is the
 /// `XLogPageHeader.magic` of the page that *started* this record — controls
-/// FPI flag interpretation (PG 15 reshuffled bimg_info bits)
-pub fn parse_record_from_bytes(data: &[u8], page_magic: u16) -> Result<XLogRecord, ParseError> {
+/// FPI flag interpretation (PG 15 reshuffled bimg_info bits).
+///
+/// The returned record borrows zero-copy from `data` for the block
+/// images / block data / main_data payloads — call
+/// [`XLogRecord::into_owned`] to bump to `'static` if the record must
+/// outlive `data`.
+pub fn parse_record_from_bytes(data: &[u8], page_magic: u16) -> Result<XLogRecord<'_>, ParseError> {
     let mut buf = data;
     let h = read_xlog_record_header(&mut buf)?;
     read_xlog_record_body(h, &mut buf, page_magic)
@@ -508,7 +516,7 @@ pub enum ExtractError {
 
 /// Flatten the block-locations referenced by a slice of records.
 /// Equivalent to wal-g's `ExtractBlockLocations`
-pub fn extract_block_locations(records: &[XLogRecord]) -> Vec<BlockLocation> {
+pub fn extract_block_locations(records: &[XLogRecord<'_>]) -> Vec<BlockLocation> {
     let mut out = Vec::new();
     for r in records {
         if r.is_zero() {
@@ -658,8 +666,8 @@ mod tests {
         assert_eq!(b.header.location.rel.db_node, 200);
         assert_eq!(b.header.location.rel.rel_node, 300);
         assert_eq!(b.header.location.block_no, 7);
-        assert_eq!(b.data, block_data);
-        assert_eq!(r.main_data, main_data);
+        assert_eq!(&*b.data, &block_data[..]);
+        assert_eq!(&*r.main_data, &main_data[..]);
         assert_eq!(r.main_data_len, main_data.len() as u32);
     }
 
