@@ -14,9 +14,9 @@ use super::all_zero;
 use super::types::{
     BKP_IMAGE_HAS_HOLE, BLOCK_SIZE, BlockLocation, RM_NEXT_FREE_ID, RelFileNode, RmId,
     WAL_PAGE_SIZE, X_LOG_RECORD_ALIGNMENT, X_LOG_RECORD_HEADER_SIZE, X_LOG_SWITCH,
-    XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT, XLR_BLOCK_ID_ORIGIN, XLR_INFO_MASK,
-    XLR_MAX_BLOCK_ID, XLogPageHeader, XLogRecord, XLogRecordBlock, XLogRecordBlockHeader,
-    XLogRecordBlockImageHeader, XLogRecordHeader,
+    XLR_BLOCK_ID_DATA_LONG, XLR_BLOCK_ID_DATA_SHORT, XLR_BLOCK_ID_ORIGIN,
+    XLR_BLOCK_ID_TOPLEVEL_XID, XLR_INFO_MASK, XLR_MAX_BLOCK_ID, XLogPageHeader, XLogRecord,
+    XLogRecordBlock, XLogRecordBlockHeader, XLogRecordBlockImageHeader, XLogRecordHeader,
 };
 
 #[derive(Debug, Error)]
@@ -334,6 +334,10 @@ fn read_block_header_part<'a>(
                 let o = c.read_u16("origin")?;
                 record.origin = o;
             }
+            XLR_BLOCK_ID_TOPLEVEL_XID => {
+                let xid = c.read_u32("toplevelXid")?;
+                record.toplevel_xid = xid;
+            }
             id => {
                 let h =
                     read_block_header(&mut last_rel, id, &mut max_block_id, &mut c, page_magic)?;
@@ -442,6 +446,9 @@ pub fn for_each_block_location_in_record<F: FnMut(BlockLocation)>(
             }
             XLR_BLOCK_ID_ORIGIN => {
                 let _ = c.read_u16("origin")?;
+            }
+            XLR_BLOCK_ID_TOPLEVEL_XID => {
+                let _ = c.read_u32("toplevelXid")?;
             }
             id => {
                 let h =

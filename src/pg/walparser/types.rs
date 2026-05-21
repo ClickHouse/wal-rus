@@ -31,6 +31,10 @@ pub const XLR_MAX_BLOCK_ID: u8 = 32;
 pub const XLR_BLOCK_ID_DATA_SHORT: u8 = 255;
 pub const XLR_BLOCK_ID_DATA_LONG: u8 = 254;
 pub const XLR_BLOCK_ID_ORIGIN: u8 = 253;
+/// `XLR_BLOCK_ID_TOPLEVEL_XID` — PG records this when a subxact's first
+/// WAL-touching write tags the body with its top-level TransactionId
+/// (`xloginsert.c::XLogRegisterTopXid`). Payload is a single u32.
+pub const XLR_BLOCK_ID_TOPLEVEL_XID: u8 = 252;
 
 // XLogRecordBlockHeader.ForkFlags bit layout
 pub const BKP_BLOCK_FORK_MASK: u8 = 0x0F;
@@ -183,6 +187,10 @@ pub struct XLogRecord<'a> {
     pub header: XLogRecordHeader,
     pub main_data_len: u32,
     pub origin: u16,
+    /// Subxact's top-level TransactionId when the writer included a
+    /// `XLR_BLOCK_ID_TOPLEVEL_XID` frame; `0` (`InvalidTransactionId`)
+    /// otherwise. Surfaces SAVEPOINT-style lineage to logical decoders.
+    pub toplevel_xid: u32,
     pub blocks: Vec<XLogRecordBlock<'a>>,
     pub main_data: std::borrow::Cow<'a, [u8]>,
 }
@@ -193,6 +201,7 @@ impl<'a> Default for XLogRecord<'a> {
             header: XLogRecordHeader::default(),
             main_data_len: 0,
             origin: 0,
+            toplevel_xid: 0,
             blocks: Vec::new(),
             main_data: std::borrow::Cow::Borrowed(&[]),
         }
@@ -204,6 +213,7 @@ impl<'a> XLogRecord<'a> {
         self.header.is_zero()
             && self.main_data_len == 0
             && self.origin == 0
+            && self.toplevel_xid == 0
             && self.blocks.is_empty()
             && self.main_data.is_empty()
     }
@@ -222,6 +232,7 @@ impl<'a> XLogRecord<'a> {
             header: self.header,
             main_data_len: self.main_data_len,
             origin: self.origin,
+            toplevel_xid: self.toplevel_xid,
             blocks: self.blocks.into_iter().map(|b| b.into_owned()).collect(),
             main_data: std::borrow::Cow::Owned(self.main_data.into_owned()),
         }
