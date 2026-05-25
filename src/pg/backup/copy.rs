@@ -146,7 +146,8 @@ async fn collect_wal_keys(
     with_history: bool,
     out: &mut Vec<String>,
 ) -> Result<()> {
-    use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName, is_wal_filename};
+    use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+    use crate::pg::wal::segment_file::classify_segment_name;
     let wal_prefix = format!("{}/", crate::pg::WAL_FOLDER);
     let mut s = src
         .list(&wal_prefix)
@@ -158,18 +159,11 @@ async fn collect_wal_keys(
     while let Some(item) = s.next().await {
         let obj = item.context("list iteration")?;
         let bare = obj.key.rsplit('/').next().unwrap_or(&obj.key);
-        let name = match bare.rsplit_once('.') {
-            Some((stem, _)) if stem.len() == 24 => stem,
-            _ => bare,
-        };
-        if !is_wal_filename(name) {
+        let Ok((seg, _)) = classify_segment_name(bare) else {
             // history files always copied (small, useful for downstream)
-            if name.ends_with(".history") || bare.ends_with(".history") {
+            if bare.ends_with(".history") {
                 out.push(obj.key);
             }
-            continue;
-        }
-        let Ok(seg) = SegmentName::parse(name) else {
             continue;
         };
         if seg.timeline != backup.timeline {

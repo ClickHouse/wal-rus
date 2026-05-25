@@ -15,9 +15,8 @@ use tokio::io::AsyncReadExt;
 use crate::pg::WAL_FOLDER;
 use crate::pg::backup::list as backup_list;
 use crate::pg::backup::parse_timeline_from_backup_name;
-use crate::pg::wal::segment::{
-    DEFAULT_WAL_SEG_SIZE, SEGMENT_NAME_LEN, SegmentName, is_wal_filename,
-};
+use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
+use crate::pg::wal::segment_file::classify_segment_name;
 use crate::storage::DynStorage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,16 +106,8 @@ async fn list_segments(
     while let Some(item) = stream.next().await {
         let obj = item.context("list iteration")?;
         let bare = obj.key.rsplit('/').next().unwrap_or(&obj.key);
-        // Strip a single compression suffix to recover the segment name
-        let name = match bare.rsplit_once('.') {
-            Some((stem, _ext)) if stem.len() == SEGMENT_NAME_LEN => stem,
-            _ => bare,
-        };
-        if !is_wal_filename(name) {
-            continue;
-        }
-        if let Ok(s) = SegmentName::parse(name) {
-            by_tli.entry(s.timeline).or_default().insert(s);
+        if let Ok((seg, _)) = classify_segment_name(bare) {
+            by_tli.entry(seg.timeline).or_default().insert(seg);
         }
     }
     Ok(by_tli)

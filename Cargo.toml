@@ -25,7 +25,7 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-async-compression = { version = "0.4", default-features = false, features = ["tokio", "zstd", "brotli", "lz4", "lzma"] }
+async-compression = { version = "0.4", default-features = false, features = ["tokio", "zstd", "brotli", "lz4", "lzma", "gzip"] }
 hex = "0.4"
 url = "2"
 percent-encoding = "2"
@@ -44,7 +44,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 rustls-pki-types = "1"
 rustls-pemfile = "2"
 webpki-roots = "1"
-dryoc = { version = "0.7", default-features = false, features = ["u64_backend"] }
+dryoc = { version = "0.8", default-features = false, features = ["u64_backend"] }
 
 [dev-dependencies]
 tempfile = "3"
