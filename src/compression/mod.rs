@@ -7,8 +7,8 @@ use std::pin::Pin;
 
 use async_compression::Level;
 use async_compression::tokio::bufread::{
-    BrotliDecoder, BrotliEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder, LzmaEncoder, ZstdDecoder,
-    ZstdEncoder,
+    BrotliDecoder, BrotliEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
+    LzmaEncoder, ZstdDecoder, ZstdEncoder,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, BufReader};
@@ -24,6 +24,7 @@ pub enum Method {
     Brotli,
     Lz4,
     Lzma,
+    Gz,
 }
 
 impl Method {
@@ -34,6 +35,7 @@ impl Method {
             "brotli" => Some(Method::Brotli),
             "lz4" => Some(Method::Lz4),
             "lzma" => Some(Method::Lzma),
+            "gz" | "gzip" => Some(Method::Gz),
             _ => None,
         }
     }
@@ -45,6 +47,7 @@ impl Method {
             Method::Brotli => "br",
             Method::Lz4 => "lz4",
             Method::Lzma => "lzma",
+            Method::Gz => "gz",
         }
     }
 
@@ -55,6 +58,7 @@ impl Method {
             "br" | "brotli" => Some(Method::Brotli),
             "lz4" => Some(Method::Lz4),
             "lzma" => Some(Method::Lzma),
+            "gz" | "gzip" => Some(Method::Gz),
             _ => None,
         }
     }
@@ -91,6 +95,13 @@ pub fn encode(method: Method, input: AsyncReader, level: i32) -> AsyncReader {
                 Level::Precise(lzma_preset(level)),
             ))
         }
+        Method::Gz => {
+            let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
+            Box::pin(GzipEncoder::with_quality(
+                buffered,
+                Level::Precise(gzip_level(level)),
+            ))
+        }
     }
 }
 
@@ -113,6 +124,10 @@ pub fn decode(method: Method, input: AsyncReader) -> AsyncReader {
             let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
             Box::pin(LzmaDecoder::new(buffered))
         }
+        Method::Gz => {
+            let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
+            Box::pin(GzipDecoder::new(buffered))
+        }
     }
 }
 
@@ -123,6 +138,11 @@ fn brotli_quality(level: i32) -> i32 {
 
 // lzma preset 0..=9
 fn lzma_preset(level: i32) -> i32 {
+    level.clamp(0, 9)
+}
+
+// gzip level 0..=9 (flate2 / async-compression accept 0..=9)
+fn gzip_level(level: i32) -> i32 {
     level.clamp(0, 9)
 }
 
@@ -170,6 +190,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gz_roundtrip() {
+        roundtrip(Method::Gz).await;
+    }
+
+    #[tokio::test]
     async fn none_passthrough() {
         let mut r = encode(Method::None, reader(b"hello"), 3);
         let mut out = Vec::new();
@@ -184,15 +209,20 @@ mod tests {
         assert_eq!(Method::from_name("lz4"), Some(Method::Lz4));
         assert_eq!(Method::from_name("lzma"), Some(Method::Lzma));
         assert_eq!(Method::from_name("none"), Some(Method::None));
+        assert_eq!(Method::from_name("gz"), Some(Method::Gz));
+        assert_eq!(Method::from_name("gzip"), Some(Method::Gz));
 
         assert_eq!(Method::from_extension(".zst"), Some(Method::Zstd));
         assert_eq!(Method::from_extension(".br"), Some(Method::Brotli));
         assert_eq!(Method::from_extension(".lz4"), Some(Method::Lz4));
         assert_eq!(Method::from_extension(".lzma"), Some(Method::Lzma));
+        assert_eq!(Method::from_extension(".gz"), Some(Method::Gz));
+        assert_eq!(Method::from_extension(".gzip"), Some(Method::Gz));
 
         assert_eq!(Method::Zstd.extension(), "zst");
         assert_eq!(Method::Brotli.extension(), "br");
         assert_eq!(Method::Lz4.extension(), "lz4");
         assert_eq!(Method::Lzma.extension(), "lzma");
+        assert_eq!(Method::Gz.extension(), "gz");
     }
 }

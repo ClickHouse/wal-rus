@@ -4,5 +4,6 @@ pub mod push;
 pub mod receive;
 pub mod restore;
 pub mod segment;
+pub mod segment_file;
 pub mod show;
 pub mod verify;
