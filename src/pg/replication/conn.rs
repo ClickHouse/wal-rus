@@ -239,6 +239,7 @@ impl ReplicationConn {
                 }
                 Message::AuthenticationSasl(body) => {
                     self.do_sasl(cfg, body).await?;
+                    return Ok(());
                 }
                 Message::AuthenticationMd5Password(_) => {
                     bail!("MD5 password auth not supported (use SCRAM-SHA-256 or trust)");
