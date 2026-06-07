@@ -1,4 +1,4 @@
-//! Round-trip test: wire wal-rs's walsender server (PHASE13 §2) to
+//! Round-trip test: wire wal-rs's walsender server to
 //! its own `ReplicationConn` client side via a real TCP socket.
 //!
 //! Validates the wire shapes a PG18 walreceiver needs:

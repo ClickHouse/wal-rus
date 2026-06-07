@@ -1,4 +1,4 @@
-//! Real-PG client validation for PHASE13 §2's walsender server.
+//! Real-PG client validation for the walsender server.
 //!
 //! Spawns the wal-rs walsender server on a TCP port, then drives it
 //! with the local `psql` binary (libpq) using a replication-mode
