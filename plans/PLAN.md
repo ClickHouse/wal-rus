@@ -394,7 +394,7 @@ PG socket); unit tests still run locally. CI on local dev pre-deploy:
 
 ### Cross-tool guarantee (bidirectional bucket interop)
 
-Install upstream wal-g `.deb` (or build from `~/s/wal-g`) onto the VM
+Install upstream wal-g `.deb` (or build from source) onto the VM
 into a separate `WALG_FILE_PREFIX=/tmp/cross`. After each phase that
 touches on-bucket layout (B, C, F):
 

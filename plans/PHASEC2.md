@@ -6,7 +6,7 @@ delta scaffolding from Phase C. Mirrors the work on wal-g's
 `pg-incremental` branch (commit `91d409de`, "support native pg
 incremental format introduced in PG17"). Format fidelity
 double-validated: against the wal-g port AND against PostgreSQL upstream
-in `~/s/postgresql` (specifically `src/common/blkreftable.c`,
+(specifically `src/common/blkreftable.c`,
 `src/include/backup/basebackup_incremental.h`,
 `src/backend/backup/basebackup.c` and `src/bin/pg_combinebackup/reconstruct.c`).
 
@@ -34,8 +34,7 @@ build, then falls back to a full backup.
 
 ## Cross-reference to postgres source
 
-Every wire-format constant & layout verified against the postgres
-checkout at `~/s/postgresql`:
+Every wire-format constant & layout verified against postgres source:
 
 ### `BLOCKREFTABLE_MAGIC = 0x652b137b`
 
@@ -300,8 +299,7 @@ Verified by:
    round-trips. The native format's padding and zero-blocks edge cases
    are tested against the postgres-source rule.
 2. **Format-level cross-reference** — every constant cross-referenced
-   to the upstream postgres `~/s/postgresql` checkout (see section
-   above).
+   to upstream postgres source (see section above).
 3. **No end-to-end cross-tool test landed yet** — because the streamer
    integration that emits per-file payloads hasn't shipped, neither
    tool can produce a bucket with native-format increments today.
