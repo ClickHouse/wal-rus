@@ -22,6 +22,12 @@ no-overcommit hosts (streaming I/O, no full-segment buffering).
 Configuration follows wal-g env vars (`WALG_*`, `PG*`). See `wal-rs --help` per
 subcommand.
 
+## Docs
+
+- [docs/DESIGN.md](docs/DESIGN.md) — architecture & design decisions
+- [docs/WALG_COMPAT.md](docs/WALG_COMPAT.md) — wal-g interop guarantees & divergences
+- [docs/TESTING.md](docs/TESTING.md) — test strategy
+
 ## License
 
 Apache 2.0, derivative work of wal-g. See [LICENSE](LICENSE).
