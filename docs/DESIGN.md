@@ -12,16 +12,26 @@ layout, or operator runbooks. North star: a backup written by either
 tool restorable by the other.
 
 Optimized for no-overcommit hosts: every pipeline stage is streaming,
-no full-segment or full-file buffering. Single 16 MB WAL segment push
-peaks under 4 MB RSS with no `MALLOC_ARENA_MAX` tuning.
+no full-segment or full-file buffering.
 
 ## Runtime
 
-`tokio` current-thread flavor for the CLI entry. `wal-push` as
-`archive_command` runs once per 16 MB segment; multi-thread runtime
-would spawn worker threads + per-thread malloc arenas for nothing.
-Daemon mode reuses the flavor since I/O is the bottleneck. glibc only
-sees one thread, so one arena, hence no `MALLOC_ARENA_MAX` requirement.
+Runtime flavor is picked per command before construction
+(`Cli::worker_threads`), overridable via `--threads` / `WALG_THREADS`;
+1 builds current-thread, >1 multi-thread with that many workers.
+
+Default 1 for most commands: `wal-push` as `archive_command` runs once
+per 16 MB segment; multi-thread runtime would spawn worker threads +
+per-thread malloc arenas for nothing. Daemon mode stays at 1 since I/O
+is the bottleneck.
+
+Commands whose fan-out does real CPU work per task (compress, encrypt,
+checksum, TLS) default to multi-thread capped by the matching
+concurrency knob, otherwise `WALG_UPLOAD_CONCURRENCY` tasks timeshare
+one core and uploads overlap only on network: `backup-push`
+min(cores, upload concurrency); `backup-fetch` / `wal-prefetch` /
+`wal-restore` min(cores, download concurrency). Worker count stays
+bounded so arenas + stacks don't balloon and postgres keeps its cores.
 
 ## Storage trait
 

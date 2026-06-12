@@ -63,9 +63,9 @@ impl Settings {
                 .ok_or_else(|| anyhow!("unsupported WALG_COMPRESSION_METHOD={s}"))?,
         };
         let compression_level = parse_env_int("WALG_COMPRESSION_LEVEL", 3)? as i32;
-        let upload_concurrency = parse_env_int("WALG_UPLOAD_CONCURRENCY", 4)?.max(1) as usize;
+        let upload_concurrency = upload_concurrency_from_env()?;
         let upload_queue = parse_env_int("WALG_UPLOAD_QUEUE", 2)?.max(1) as usize;
-        let download_concurrency = parse_env_int("WALG_DOWNLOAD_CONCURRENCY", 4)?.max(1) as usize;
+        let download_concurrency = download_concurrency_from_env()?;
         let prevent_wal_overwrite = parse_env_bool("WALG_PREVENT_WAL_OVERWRITE", false)?;
         let retry = RetryPolicy::from_env();
         let network_rate_limit = parse_env_int("WALG_NETWORK_RATE_LIMIT", 0)?.max(0) as u64;
@@ -340,6 +340,18 @@ fn parse_uri_prefix(uri: &str, scheme: &str) -> Result<(String, String)> {
         bail!("bucket is empty in {uri}");
     }
     Ok((bucket, prefix))
+}
+
+/// `WALG_UPLOAD_CONCURRENCY`; read before runtime construction to cap
+/// worker threads for backup-push
+pub fn upload_concurrency_from_env() -> Result<usize> {
+    Ok(parse_env_int("WALG_UPLOAD_CONCURRENCY", 4)?.max(1) as usize)
+}
+
+/// `WALG_DOWNLOAD_CONCURRENCY`; read before runtime construction to cap
+/// worker threads for fetch-side commands
+pub fn download_concurrency_from_env() -> Result<usize> {
+    Ok(parse_env_int("WALG_DOWNLOAD_CONCURRENCY", 4)?.max(1) as usize)
 }
 
 fn parse_env_int(key: &str, default: i64) -> Result<i64> {
