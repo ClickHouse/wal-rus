@@ -1,5 +1,6 @@
 //! CLI surface mirroring wal-g pg subcommands; only wired ones do real work
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -12,6 +13,12 @@ use crate::pg::wal;
 #[derive(Parser, Debug)]
 #[command(name = "wal-rs", version, about = "Rust port of wal-g for PostgreSQL")]
 pub struct Cli {
+    /// Tokio worker threads; 1 = single-threaded runtime. Defaults per
+    /// command: backup-push min(cores, WALG_UPLOAD_CONCURRENCY),
+    /// backup-fetch/wal-prefetch/wal-restore min(cores,
+    /// WALG_DOWNLOAD_CONCURRENCY), 1 elsewhere
+    #[arg(long, global = true, env = "WALG_THREADS")]
+    pub threads: Option<NonZeroUsize>,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -218,6 +225,24 @@ pub enum WalVerifyOp {
 }
 
 impl Cli {
+    /// Resolve runtime worker count; must run before runtime construction.
+    /// Multi-thread only where concurrent CPU work (compress/encrypt/TLS)
+    /// exists today; everything else keeps the single-thread footprint
+    /// (one malloc arena, no worker stacks)
+    pub fn worker_threads(&self) -> Result<usize> {
+        if let Some(n) = self.threads {
+            return Ok(n.get());
+        }
+        let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        Ok(match self.cmd {
+            Cmd::BackupPush { .. } => cores.min(crate::config::upload_concurrency_from_env()?),
+            Cmd::BackupFetch { .. } | Cmd::WalPrefetch { .. } | Cmd::WalRestore { .. } => {
+                cores.min(crate::config::download_concurrency_from_env()?)
+            }
+            _ => 1,
+        })
+    }
+
     pub async fn run(self) -> Result<()> {
         match self.cmd {
             Cmd::WalPush { wal_filepath } => {
