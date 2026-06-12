@@ -11,18 +11,23 @@
 //!   'k' = keepalive:  u64 server_wal_end | u64 send_time | u8 reply_requested
 //! - Client replies (`r`): u64 write | u64 flush | u64 apply | u64 client_time | u8 reply_requested
 //!
-//! Segments accumulate into a 16 MiB-aligned buffer; rotation triggers a
-//! synchronous `wal-push` on the just-filled segment. Promoted segments
-//! ride the regular compression + storage pipeline so the archive format
-//! stays consistent with `archive_command`-driven pushes.
+//! Segments accumulate into a 16 MiB-aligned buffer; rotation spawns a
+//! `wal-push` upload task bounded by WALG_UPLOAD_CONCURRENCY, so the
+//! receive loop keeps consuming frames (and answering keepalives) while
+//! slow uploads drain. Uploaded segments ride the regular compression +
+//! storage pipeline so the archive format stays consistent with
+//! `archive_command`-driven pushes.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use postgres_protocol::message::backend::Message;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::config::Settings;
 use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
@@ -42,6 +47,13 @@ struct SegmentAccumulator {
     timeline: u32,
     archive_dir: PathBuf,
     current: Option<CurrentSegment>,
+    settings: Settings,
+    storage: DynStorage,
+    /// In-flight segment uploads, bounded by `upload_sem`. Receive loop reaps
+    /// completions each iteration; rotation blocks only once
+    /// `upload_concurrency` uploads are already in flight
+    uploads: JoinSet<Result<()>>,
+    upload_sem: Arc<Semaphore>,
 }
 
 struct CurrentSegment {
@@ -52,15 +64,26 @@ struct CurrentSegment {
 }
 
 impl SegmentAccumulator {
-    async fn new(timeline: u32, archive_dir: PathBuf, seg_size: u64) -> Result<Self> {
+    async fn new(
+        timeline: u32,
+        archive_dir: PathBuf,
+        seg_size: u64,
+        settings: Settings,
+        storage: DynStorage,
+    ) -> Result<Self> {
         fs::create_dir_all(&archive_dir)
             .await
             .with_context(|| format!("create_dir_all {}", archive_dir.display()))?;
+        let upload_sem = Arc::new(Semaphore::new(settings.upload_concurrency.max(1)));
         Ok(Self {
             seg_size,
             timeline,
             archive_dir,
             current: None,
+            settings,
+            storage,
+            uploads: JoinSet::new(),
+            upload_sem,
         })
     }
 
@@ -75,14 +98,8 @@ impl SegmentAccumulator {
     }
 
     /// Write `data` starting at `start_lsn`. Splits across segment
-    /// boundaries, rotating + pushing each completed segment
-    async fn write(
-        &mut self,
-        start_lsn: u64,
-        data: &[u8],
-        settings: &Settings,
-        storage: &DynStorage,
-    ) -> Result<()> {
+    /// boundaries, rotating + spawning an upload for each completed segment
+    async fn write(&mut self, start_lsn: u64, data: &[u8]) -> Result<()> {
         let mut lsn = start_lsn;
         let mut data = data;
         while !data.is_empty() {
@@ -113,7 +130,7 @@ impl SegmentAccumulator {
             lsn += chunk_len as u64;
             data = &data[chunk_len..];
             if cur.bytes_written == self.seg_size {
-                self.rotate_and_push(settings, storage).await?;
+                self.rotate_and_spawn().await?;
             }
         }
         Ok(())
@@ -126,7 +143,8 @@ impl SegmentAccumulator {
                 return Ok(());
             }
             // Boundary crossing on a partial segment is unusual but possible
-            // (eg WAL switch midway); push what we have, then open the new one
+            // (eg WAL switch midway); push what we have (zero-padded to
+            // seg_size by the pre-extend), then open the new one
             tracing::warn!(
                 target = "wal_receive",
                 "rotating partial segment {} ({} bytes written, target {})",
@@ -134,6 +152,7 @@ impl SegmentAccumulator {
                 cur.bytes_written,
                 self.seg_size
             );
+            self.rotate_and_spawn().await?;
         }
         let seg = self.segment_for_lsn(lsn);
         let path = self.archive_dir.join(seg.format());
@@ -146,22 +165,21 @@ impl SegmentAccumulator {
             .with_context(|| format!("open {}", path.display()))?;
         // pre-extend to seg_size so partial-tail writes leave a zero pad
         file.set_len(self.seg_size).await?;
-        if let Some(prev) = self.current.replace(CurrentSegment {
+        // rotate_and_spawn above took any previous segment
+        self.current = Some(CurrentSegment {
             name: seg,
             file,
             path,
             bytes_written: 0,
-        }) {
-            tracing::debug!(
-                target = "wal_receive",
-                "swapped out segment {}",
-                prev.name.format()
-            );
-        }
+        });
         Ok(())
     }
 
-    async fn rotate_and_push(&mut self, settings: &Settings, storage: &DynStorage) -> Result<()> {
+    /// Close out current segment & spawn its upload. Permit acquisition is
+    /// the backpressure point: blocks only once `upload_concurrency` uploads
+    /// are already in flight, so bursty WAL against a slow store stalls the
+    /// stream N segments deep instead of on every rotation
+    async fn rotate_and_spawn(&mut self) -> Result<()> {
         let Some(cur) = self.current.take() else {
             return Ok(());
         };
@@ -179,13 +197,33 @@ impl SegmentAccumulator {
             "segment {} complete, archiving",
             name.format()
         );
-        // Re-uses wal::push::handle so compression + rate limiting + retry
-        // semantics stay identical to archive_command-driven pushes
-        push::handle(settings, storage.clone(), &path)
+        let permit = self
+            .upload_sem
+            .clone()
+            .acquire_owned()
             .await
-            .with_context(|| format!("archive {}", path.display()))?;
-        // remove local file after a successful upload
-        let _ = fs::remove_file(&path).await;
+            .context("acquire upload permit")?;
+        let settings = self.settings.clone();
+        let storage = self.storage.clone();
+        self.uploads.spawn(async move {
+            let _permit = permit;
+            // Re-uses wal::push::handle so compression + rate limiting + retry
+            // semantics stay identical to archive_command-driven pushes
+            push::handle(&settings, storage, &path)
+                .await
+                .with_context(|| format!("archive {}", path.display()))?;
+            // remove local file after a successful upload
+            let _ = fs::remove_file(&path).await;
+            Ok(())
+        });
+        Ok(())
+    }
+
+    /// Await all in-flight uploads; first failure wins
+    async fn drain_uploads(&mut self) -> Result<()> {
+        while let Some(joined) = self.uploads.join_next().await {
+            joined.context("upload task join")??;
+        }
         Ok(())
     }
 
@@ -269,7 +307,14 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     // protocol's parser does not handle. The conn helper consumes the frame
     conn.expect_copy_both_open().await?;
 
-    let mut acc = SegmentAccumulator::new(timeline, archive_dir.to_path_buf(), seg_size).await?;
+    let mut acc = SegmentAccumulator::new(
+        timeline,
+        archive_dir.to_path_buf(),
+        seg_size,
+        settings.clone(),
+        storage,
+    )
+    .await?;
     let mut last_status = std::time::Instant::now();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -289,6 +334,12 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                 tracing::info!(target = "wal_receive", "shutdown signal received, flushing");
                 break;
             }
+            // Reap finished uploads so a failure surfaces now, not at the
+            // next rotation. Pattern mismatch on empty set disables the arm
+            Some(joined) = acc.uploads.join_next() => {
+                joined.context("upload task join")??;
+                continue;
+            }
             r = tokio::time::timeout(STATUS_UPDATE_INTERVAL, conn.recv_message()) => match r {
                 Ok(r) => r?,
                 Err(_) => continue, // tick the keepalive
@@ -300,7 +351,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                 let frame = decode_frame(&payload)?;
                 match frame {
                     Frame::Wal(w) => {
-                        acc.write(w.start_lsn, w.data, settings, &storage).await?;
+                        acc.write(w.start_lsn, w.data).await?;
                     }
                     Frame::Keepalive(k) => {
                         if k.reply_requested {
@@ -319,6 +370,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
             m => tracing::debug!(target = "wal_receive", "ignoring {}", message_kind(&m)),
         }
     }
+    acc.drain_uploads().await?;
     acc.finalize_partial().await?;
     Ok(())
 }
@@ -344,6 +396,10 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
+/// START_REPLICATION carries no SLOT clause, so reported positions don't
+/// gate server-side WAL retention; reporting local write position while
+/// uploads are still in flight is sound. If slot support lands, flush must
+/// switch to uploaded-through LSN
 async fn send_status_update(conn: &mut ReplicationConn, pos: u64) -> Result<()> {
     let payload = build_status_update(pos, pos, pos);
     conn.send_copy_data(&payload).await
@@ -390,6 +446,31 @@ async fn identify_system(conn: &mut ReplicationConn) -> Result<(String, u32, u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Accumulator backed by fs storage at `<dir>/store`, timeline 1
+    async fn test_acc(dir: &Path, seg_size: u64) -> SegmentAccumulator {
+        let store = dir.join("store");
+        let settings = Settings {
+            storage: crate::config::StorageSettings::Fs {
+                path: store.to_string_lossy().into(),
+            },
+            compression: crate::compression::Method::None,
+            compression_level: 3,
+            upload_concurrency: 1,
+            upload_queue: 1,
+            download_concurrency: 1,
+            prevent_wal_overwrite: false,
+            retry: crate::retry::RetryPolicy::default(),
+            network_rate_limit: 0,
+            disk_rate_limit: 0,
+            delta: Default::default(),
+            crypter: None,
+        };
+        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
+        SegmentAccumulator::new(1, dir.to_path_buf(), seg_size, settings, storage)
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn decode_wal_frame() {
@@ -448,9 +529,7 @@ mod tests {
     async fn finalize_partial_renames_inflight_segment() {
         let dir = tempfile::tempdir().unwrap();
         let seg_size = 16u64;
-        let mut acc = SegmentAccumulator::new(1, dir.path().to_path_buf(), seg_size)
-            .await
-            .unwrap();
+        let mut acc = test_acc(dir.path(), seg_size).await;
         acc.ensure_current(0).await.unwrap();
         {
             use tokio::io::AsyncWriteExt;
@@ -471,9 +550,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_partial_drops_empty_placeholder() {
         let dir = tempfile::tempdir().unwrap();
-        let mut acc = SegmentAccumulator::new(1, dir.path().to_path_buf(), 16)
-            .await
-            .unwrap();
+        let mut acc = test_acc(dir.path(), 16).await;
         acc.ensure_current(0).await.unwrap();
         let name = acc.current.as_ref().unwrap().name.format();
         acc.finalize_partial().await.unwrap();
@@ -486,10 +563,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // tiny 16-byte segs for the test
         let seg_size = 16u64;
-        let mut acc = SegmentAccumulator::new(1, dir.path().to_path_buf(), seg_size)
-            .await
-            .unwrap();
-        // Direct buffer-only test: don't archive (skip rotate_and_push wiring)
+        let mut acc = test_acc(dir.path(), seg_size).await;
+        // Direct buffer-only test: don't archive (skip rotate_and_spawn wiring)
         acc.ensure_current(0).await.unwrap();
         let bytes_written_before = acc.current.as_ref().unwrap().bytes_written;
         // Manually drive write_all to avoid kicking the storage push path
@@ -498,5 +573,47 @@ mod tests {
         cur.file.write_all(&[0xABu8; 16]).await.unwrap();
         cur.bytes_written = bytes_written_before + 16;
         assert_eq!(cur.bytes_written, seg_size);
+    }
+
+    #[tokio::test]
+    async fn rotation_uploads_and_removes_local_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        let mut acc = test_acc(dir.path(), seg_size).await;
+        acc.write(0, &[0xAB; 16]).await.unwrap();
+        acc.drain_uploads().await.unwrap();
+        let name = acc.segment_for_lsn(0).format();
+        assert!(
+            !dir.path().join(&name).exists(),
+            "local segment should be removed after upload"
+        );
+        let archived = dir
+            .path()
+            .join("store")
+            .join(crate::pg::WAL_FOLDER)
+            .join(&name);
+        assert_eq!(std::fs::read(&archived).unwrap(), vec![0xAB; 16]);
+    }
+
+    #[tokio::test]
+    async fn partial_boundary_crossing_archives_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        let mut acc = test_acc(dir.path(), seg_size).await;
+        acc.write(0, &[0xCD; 4]).await.unwrap();
+        // LSN jump past segment end: partial must be pushed, not dropped
+        acc.write(seg_size, &[0xEF; 4]).await.unwrap();
+        acc.drain_uploads().await.unwrap();
+        let first = acc.segment_for_lsn(0).format();
+        assert!(!dir.path().join(&first).exists());
+        let archived = dir
+            .path()
+            .join("store")
+            .join(crate::pg::WAL_FOLDER)
+            .join(&first);
+        let bytes = std::fs::read(&archived).unwrap();
+        assert_eq!(bytes.len() as u64, seg_size, "zero pad retained");
+        assert_eq!(&bytes[..4], &[0xCD; 4]);
+        assert!(bytes[4..].iter().all(|&b| b == 0));
     }
 }
