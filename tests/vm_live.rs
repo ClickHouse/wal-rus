@@ -439,37 +439,36 @@ async fn wal_receive_archives_segment_against_live_pg() {
     // Let START_REPLICATION establish before forcing segment rotations
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Drive segment rotations via psql. pg_switch_wal is the only thing
-    // guaranteed to FULLY fill the current segment (backup-push's
-    // pg_backup_stop only writes a switch record on some PG configs, which
-    // doesn't put zero-pad bytes on the wire before the new segment starts).
-    // Fire 3 in quick succession so wal-receive accumulates >1 full segment
-    // even if the first switch lands mid-frame.
+    // Drive segment rotations via psql. pg_switch_wal alone is a no-op on an
+    // empty segment (ReserveXLogSwitch returns false at a segment boundary),
+    // so a freshly-initialized idle cluster never fills one and wal-receive
+    // has nothing to rotate. Emit large logical messages first (written to
+    // WAL at any wal_level) to force full-segment boundary crossings, then
+    // switch to finalize the tail. 3 x 8 MiB exceeds one 16 MiB segment, so at
+    // least one segment completes and uploads even discounting switch padding.
     let pghost = std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".into());
     let pgport = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
     let pguser = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".into());
     let pgdb = std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".into());
-    for _ in 0..3 {
+    let psql = |sql: &str| {
         let out = std::process::Command::new("psql")
             .args([
-                "-h",
-                &pghost,
-                "-p",
-                &pgport,
-                "-U",
-                &pguser,
-                "-d",
-                &pgdb,
-                "-Atqc",
-                "SELECT pg_switch_wal()",
+                "-h", &pghost, "-p", &pgport, "-U", &pguser, "-d", &pgdb, "-Atqc", sql,
             ])
             .output()
             .expect("invoke psql; install postgresql-client if missing");
         assert!(
             out.status.success(),
-            "psql pg_switch_wal failed: {}",
+            "psql `{sql}` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    };
+    for _ in 0..3 {
+        // transactional=true: commit flushes the record so the walsender
+        // streams it promptly. 3-arg form is compatible with PG 13+ (the
+        // `flush` arg only exists on PG 16+)
+        psql("SELECT pg_logical_emit_message(true, 'walross', repeat('x', 8 * 1024 * 1024))");
+        psql("SELECT pg_switch_wal()");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
