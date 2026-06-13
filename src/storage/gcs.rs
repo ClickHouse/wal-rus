@@ -17,6 +17,7 @@ use chrono::Utc;
 use futures::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Body, Client};
+use rustls_pki_types::PrivateKeyDer;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
@@ -490,32 +491,22 @@ impl Storage for GcsStorage {
 }
 
 fn parse_pkcs8_or_pkcs1(pem: &str) -> Result<RsaKeyPair> {
-    // service account keys come as PKCS#8 PEM by default
-    let der = pem_to_der(pem).map_err(StorageError::Auth)?;
-    if let Ok(kp) = RsaKeyPair::from_pkcs8(&der) {
-        return Ok(kp);
-    }
-    RsaKeyPair::from_der(&der).map_err(|e| StorageError::Auth(format!("rsa key parse: {e}")))
-}
-
-fn pem_to_der(pem: &str) -> std::result::Result<Vec<u8>, String> {
-    let mut started = false;
-    let mut b64 = String::new();
-    for line in pem.lines() {
-        if line.starts_with("-----BEGIN") {
-            started = true;
-            continue;
-        }
-        if line.starts_with("-----END") {
-            break;
-        }
-        if started {
-            b64.push_str(line.trim());
+    // service account keys come as PKCS#8 PEM by default; rustls-pemfile labels
+    // the section so we route to the matching aws-lc-rs constructor
+    let mut reader = std::io::Cursor::new(pem.as_bytes());
+    let key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| StorageError::Auth(format!("read private key: {e}")))?
+        .ok_or_else(|| StorageError::Auth("no private key in credentials".into()))?;
+    match key {
+        PrivateKeyDer::Pkcs8(der) => RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()),
+        PrivateKeyDer::Pkcs1(der) => RsaKeyPair::from_der(der.secret_pkcs1_der()),
+        other => {
+            return Err(StorageError::Auth(format!(
+                "unsupported private key format: {other:?}"
+            )));
         }
     }
-    base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .map_err(|e| format!("pem b64: {e}"))
+    .map_err(|e| StorageError::Auth(format!("rsa key parse: {e}")))
 }
 
 #[cfg(test)]
@@ -523,10 +514,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pem_to_der_strips_armor() {
+    fn private_key_reads_pkcs8_armor() {
+        // rustls-pemfile decodes the base64 body and tags the section kind; the
+        // 3-byte payload isn't a real key, only the armor handling is exercised
         let pem = "-----BEGIN PRIVATE KEY-----\nAAEC\n-----END PRIVATE KEY-----\n";
-        let der = pem_to_der(pem).unwrap();
-        assert_eq!(der, vec![0, 1, 2]);
+        let mut rd = std::io::Cursor::new(pem.as_bytes());
+        match rustls_pemfile::private_key(&mut rd).unwrap().unwrap() {
+            PrivateKeyDer::Pkcs8(der) => assert_eq!(der.secret_pkcs8_der(), &[0, 1, 2]),
+            other => panic!("expected pkcs8, got {other:?}"),
+        }
     }
 
     #[test]
