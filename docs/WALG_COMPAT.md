@@ -2,7 +2,7 @@
 
 Bidirectional bucket interop is the project's acceptance bar: a bucket
 written by wal-g v3.x is listable / fetchable / replayable / verifiable
-/ deletable by wal-rs, and the reverse. CI gates the claim
+/ deletable by walross, and the reverse. CI gates the claim
 (`scripts/ci/cross_tool_{forward,reverse}.sh` against a pinned wal-g
 version in `.github/workflows/pg-compat.yml`; bumping the pin is a
 deliberate one-line change so an interop-breaking wal-g release fails
@@ -43,7 +43,7 @@ the bump PR, not master).
 
 ## Deliberate divergences
 
-| Area | wal-rs behavior |
+| Area | walross behavior |
 |---|---|
 | OpenPGP (`WALG_PGP_*`) | hard error at startup, never silently plaintext; re-encrypt to libsodium when migrating (see DESIGN.md for rationale) |
 | Backends | `file://`, `s3://`, `gs://` only; no azure / oss / swift / sh |

@@ -1,5 +1,5 @@
 [package]
-name = "wal-rs"
+name = "walross"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
@@ -10,11 +10,11 @@ readme = "README.md"
 keywords = ["postgres", "postgresql"]
 
 [[bin]]
-name = "wal-rs"
+name = "walross"
 path = "src/main.rs"
 
 [lib]
-name = "wal_rs"
+name = "walross"
 path = "src/lib.rs"
 
 [dependencies]

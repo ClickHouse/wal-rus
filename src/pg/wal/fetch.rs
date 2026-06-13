@@ -1,7 +1,7 @@
 //! wal-fetch: download WAL segment from storage, decompress, write to dst path
 //!
 //! Try configured compression first, fall back to other extensions to support
-//! buckets written by mixed-config wal-g/wal-rs invocations
+//! buckets written by mixed-config wal-g/walross invocations
 
 use std::path::{Path, PathBuf};
 

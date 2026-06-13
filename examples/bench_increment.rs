@@ -11,8 +11,8 @@
 use std::io::{Cursor, Write};
 use std::time::Instant;
 
-use wal_rs::pg::backup::delta::PG_PAGE_SIZE;
-use wal_rs::pg::backup::increment::{
+use walross::pg::backup::delta::PG_PAGE_SIZE;
+use walross::pg::backup::increment::{
     Format, apply_increment_in_place, write_increment_header, write_native_increment_header,
 };
 
@@ -151,7 +151,7 @@ fn run_case(file_blocks: u32, dirty: u32) {
 }
 
 fn main() {
-    println!("wal-rs increment format micro-benchmark");
+    println!("walross increment format micro-benchmark");
     println!("BLCKSZ = {} bytes; ITERS = {}", PG_PAGE_SIZE, ITERS);
 
     // 4 MiB / sparse delta (typical OLTP)

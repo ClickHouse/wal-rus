@@ -1,6 +1,6 @@
 //! Base backup objects: storage layout, name parsing, sentinel & metadata DTOs
 //!
-//! Wire format mirrors wal-g so wal-rs and wal-g can share buckets
+//! Wire format mirrors wal-g so walross and wal-g can share buckets
 
 use std::collections::HashMap;
 

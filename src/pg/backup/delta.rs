@@ -445,7 +445,7 @@ async fn find_by_user_data(
 
 /// Walk the WAL segments [start_lsn, end_lsn) on `timeline`, parse each,
 /// & aggregate the referenced block locations into a delta map.
-/// Segments are fetched from the `wal_005/` prefix (wal-rs layout)
+/// Segments are fetched from the `wal_005/` prefix (walross layout)
 pub async fn build_delta_map_from_wal(
     settings: &crate::config::Settings,
     storage: &DynStorage,

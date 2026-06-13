@@ -7,17 +7,17 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use wal_rs::compression::Method;
-use wal_rs::config::{Settings, StorageSettings};
-use wal_rs::pg::backup::copy as copy_mod;
-use wal_rs::pg::backup::delete::{
+use walross::compression::Method;
+use walross::config::{Settings, StorageSettings};
+use walross::pg::backup::copy as copy_mod;
+use walross::pg::backup::delete::{
     self, DeleteModifier, DeleteOp, GarbageScope, try_extract_timeline_seg_no,
 };
-use wal_rs::pg::backup::{
+use walross::pg::backup::{
     BackupSentinelDto, BackupSentinelDtoV2, METADATA_DATETIME_FORMAT, sentinel_key, tar_part_key,
 };
-use wal_rs::storage::Storage;
-use wal_rs::storage::fs::FsStorage;
+use walross::storage::Storage;
+use walross::storage::fs::FsStorage;
 
 fn test_settings() -> Settings {
     Settings {
@@ -30,7 +30,7 @@ fn test_settings() -> Settings {
         upload_queue: 1,
         download_concurrency: 2,
         prevent_wal_overwrite: false,
-        retry: wal_rs::retry::RetryPolicy::default(),
+        retry: walross::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
@@ -74,12 +74,12 @@ fn make_sentinel(start_lsn: u64, is_permanent: bool) -> BackupSentinelDtoV2 {
 
 async fn put_bytes(store: &Arc<FsStorage>, key: &str, body: Vec<u8>) {
     let len = body.len() as u64;
-    let r: wal_rs::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
+    let r: walross::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
     store.put(key, r, Some(len)).await.unwrap();
 }
 
 fn backup_name(timeline: u32, start_lsn: u64) -> String {
-    wal_rs::pg::backup::format_backup_name(timeline, start_lsn, seg_size())
+    walross::pg::backup::format_backup_name(timeline, start_lsn, seg_size())
 }
 
 /// Seed N backups with start LSNs `[1, 2, ..., N] * seg_size` and a few WAL
@@ -105,7 +105,7 @@ async fn seed_bucket(n: u32) -> (tempfile::TempDir, Arc<FsStorage>, Vec<String>)
         let wal_name = format!("00000001000000000000000{seg_no:X}.zst");
         put_bytes(
             &store,
-            &format!("{}/{}", wal_rs::pg::WAL_FOLDER, wal_name),
+            &format!("{}/{}", walross::pg::WAL_FOLDER, wal_name),
             b"wal".to_vec(),
         )
         .await;
@@ -117,7 +117,7 @@ async fn seed_bucket(n: u32) -> (tempfile::TempDir, Arc<FsStorage>, Vec<String>)
 #[tokio::test]
 async fn delete_retain_keeps_n_newest() {
     let (_dir, store, names) = seed_bucket(4).await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
     let plan = delete::handle(
         dyn_store.clone(),
         DeleteOp::Retain {
@@ -150,7 +150,7 @@ async fn delete_retain_keeps_n_newest() {
 #[tokio::test]
 async fn delete_before_name_drops_older_only() {
     let (_dir, store, names) = seed_bucket(4).await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
     let plan = delete::handle(
         dyn_store.clone(),
         DeleteOp::Before {
@@ -180,7 +180,7 @@ async fn delete_everything_refuses_with_permanent_unless_force() {
         serde_json::to_vec(&sentinel).unwrap(),
     )
     .await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
 
     // without FORCE: refuses
     let err = delete::handle(
@@ -234,12 +234,12 @@ async fn delete_permanent_wal_is_preserved() {
         let wal_name = format!("00000001000000000000000{seg:X}.zst");
         put_bytes(
             &store,
-            &format!("{}/{}", wal_rs::pg::WAL_FOLDER, wal_name),
+            &format!("{}/{}", walross::pg::WAL_FOLDER, wal_name),
             b"wal".to_vec(),
         )
         .await;
     }
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
 
     delete::handle(
         dyn_store.clone(),
@@ -284,7 +284,7 @@ async fn delete_permanent_wal_is_preserved() {
 #[tokio::test]
 async fn delete_dry_run_does_not_delete() {
     let (_dir, store, names) = seed_bucket(3).await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
     let plan = delete::handle(
         dyn_store.clone(),
         DeleteOp::Retain {
@@ -306,7 +306,7 @@ async fn delete_dry_run_does_not_delete() {
 #[tokio::test]
 async fn delete_garbage_scopes_to_wal_archives_only() {
     let (_dir, store, names) = seed_bucket(3).await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
     // The oldest non-permanent backup is the first one; "garbage ARCHIVES"
     // deletes only WAL older than it (nothing here, since seg 1 == oldest)
     delete::handle(
@@ -362,7 +362,7 @@ async fn delete_target_drops_delta_dependants() {
         serde_json::to_vec(&d2_s).unwrap(),
     )
     .await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
 
     // Default modifier deletes target + dependants. Targeting d1 should remove d1 and d2 but keep full
     delete::handle(
@@ -402,7 +402,7 @@ async fn delete_target_find_full_drops_chain_root() {
         serde_json::to_vec(&d1_s).unwrap(),
     )
     .await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
 
     // FIND_FULL on the delta should drop the whole chain (full + delta)
     delete::handle(
@@ -446,8 +446,8 @@ async fn copy_single_backup_to_other_fs_prefix() {
     .await;
 
     let s = test_settings();
-    let src_dyn: wal_rs::storage::DynStorage = src as Arc<dyn Storage>;
-    let dst_dyn: wal_rs::storage::DynStorage = dst as Arc<dyn Storage>;
+    let src_dyn: walross::storage::DynStorage = src as Arc<dyn Storage>;
+    let dst_dyn: walross::storage::DynStorage = dst as Arc<dyn Storage>;
     copy_mod::handle(
         &s,
         src_dyn,
@@ -503,7 +503,7 @@ async fn delete_retain_after_keeps_newer_than_boundary() {
         .await;
         names.push(name);
     }
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
     let after = boundary.unwrap().to_rfc3339();
     let plan = delete::handle(
         dyn_store.clone(),
@@ -536,14 +536,15 @@ async fn backup_mark_target_user_data_flips_sentinel() {
     let mut s2 = make_sentinel(2 * seg_size(), false);
     s2.sentinel.user_data = Some(serde_json::json!({"id": "tagged"}));
     put_bytes(&store, &sentinel_key(&n2), serde_json::to_vec(&s2).unwrap()).await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
 
-    let resolved = wal_rs::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"tagged"}"#)
-        .await
-        .unwrap();
+    let resolved =
+        walross::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"tagged"}"#)
+            .await
+            .unwrap();
     assert_eq!(resolved, n2);
 
-    wal_rs::pg::backup::show::mark(dyn_store.clone(), &resolved, true)
+    walross::pg::backup::show::mark(dyn_store.clone(), &resolved, true)
         .await
         .unwrap();
     // Reload sentinel & verify IsPermanent flipped on n2 but not n1
@@ -565,8 +566,8 @@ async fn backup_mark_target_user_data_flips_sentinel() {
 #[tokio::test]
 async fn backup_mark_target_user_data_rejects_no_match() {
     let (_dir, store, _names) = seed_bucket(2).await;
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
-    let err = wal_rs::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"x"}"#)
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
+    let err = walross::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"x"}"#)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("no backup"));
@@ -589,8 +590,8 @@ async fn backup_mark_target_user_data_rejects_ambiguous() {
         )
         .await;
     }
-    let dyn_store: wal_rs::storage::DynStorage = store as Arc<dyn Storage>;
-    let err = wal_rs::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"dup"}"#)
+    let dyn_store: walross::storage::DynStorage = store as Arc<dyn Storage>;
+    let err = walross::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"dup"}"#)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("backups match"));

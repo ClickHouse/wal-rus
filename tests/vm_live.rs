@@ -21,12 +21,12 @@
 
 use std::sync::Arc;
 
-use wal_rs::compression::Method;
-use wal_rs::config::{Settings, StorageSettings};
-use wal_rs::pg::backup;
-use wal_rs::pg::wal;
-use wal_rs::storage::Storage;
-use wal_rs::storage::fs::FsStorage;
+use walross::compression::Method;
+use walross::config::{Settings, StorageSettings};
+use walross::pg::backup;
+use walross::pg::wal;
+use walross::storage::Storage;
+use walross::storage::fs::FsStorage;
 
 fn settings_for(path: &str) -> Settings {
     Settings {
@@ -37,7 +37,7 @@ fn settings_for(path: &str) -> Settings {
         upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
-        retry: wal_rs::retry::RetryPolicy::default(),
+        retry: walross::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
@@ -115,9 +115,9 @@ async fn backup_push_fetch_against_live_pg() {
     // If the cluster has user tablespaces, redirect them into the temp dir so
     // we don't try to write to /var/lib/postgresql which is postgres-owned
     let resolved = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
-    let sentinel_key = wal_rs::pg::backup::sentinel_key(&resolved);
+    let sentinel_key = walross::pg::backup::sentinel_key(&resolved);
     let sentinel_bytes = std::fs::read(storage_dir.join(&sentinel_key)).unwrap();
-    let v2_pre: wal_rs::pg::backup::BackupSentinelDtoV2 =
+    let v2_pre: walross::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes).unwrap();
     let mut fetch_args = backup::fetch::FetchArgs::default();
     if let Some(spec) = v2_pre.sentinel.tablespace_spec.as_ref() {
@@ -155,7 +155,7 @@ async fn backup_push_fetch_against_live_pg() {
         }
     }
     let fm_path = fm_path.expect("files_metadata.json missing from backup");
-    let fm: wal_rs::pg::backup::FilesMetadataDto =
+    let fm: walross::pg::backup::FilesMetadataDto =
         serde_json::from_slice(&std::fs::read(&fm_path).unwrap()).expect("parse files_metadata");
     assert!(
         fm.files.contains_key("PG_VERSION") || fm.files.values().count() > 0,
@@ -174,7 +174,7 @@ async fn backup_push_fetch_against_live_pg() {
             break;
         }
     }
-    let v2: wal_rs::pg::backup::BackupSentinelDtoV2 =
+    let v2: walross::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes.unwrap()).unwrap();
     assert!(
         v2.sentinel.compressed_size > 0,
@@ -228,7 +228,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
         }
     }
     let sentinel_path = sentinel_path.expect("sentinel missing");
-    let v2: wal_rs::pg::backup::BackupSentinelDtoV2 =
+    let v2: walross::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
     let spec = match v2.sentinel.tablespace_spec.clone() {
         Some(s) if !s.is_empty() => s,
@@ -269,7 +269,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
 // ── Phase F carry: encrypted live-PG backup roundtrip ─────────────────────
 
 fn encrypted_settings_for(path: &str) -> Settings {
-    use wal_rs::crypto::libsodium::LibsodiumCrypter;
+    use walross::crypto::libsodium::LibsodiumCrypter;
     let mut k = [0u8; 32];
     for (i, b) in k.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(7).wrapping_add(11);
@@ -293,7 +293,7 @@ fn default_push_args() -> backup::push::PushArgs {
 }
 
 fn apply_tablespace_remap(
-    spec: &wal_rs::pg::backup::TablespaceSpec,
+    spec: &walross::pg::backup::TablespaceSpec,
     restore: &std::path::Path,
     args: &mut backup::fetch::FetchArgs,
 ) {
@@ -308,7 +308,7 @@ fn apply_tablespace_remap(
 
 #[tokio::test]
 async fn encrypted_backup_push_fetch_against_live_pg() {
-    use wal_rs::crypto::libsodium::LibsodiumCrypter;
+    use walross::crypto::libsodium::LibsodiumCrypter;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -343,8 +343,8 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
     // Right-key fetch decrypts cleanly + PG_VERSION readable
     let resolved = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
     let sentinel_bytes =
-        std::fs::read(storage_dir.join(wal_rs::pg::backup::sentinel_key(&resolved))).unwrap();
-    let v2: wal_rs::pg::backup::BackupSentinelDtoV2 =
+        std::fs::read(storage_dir.join(walross::pg::backup::sentinel_key(&resolved))).unwrap();
+    let v2: walross::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes).unwrap();
     let mut fetch_args = backup::fetch::FetchArgs::default();
     if let Some(spec) = v2.sentinel.tablespace_spec.as_ref() {
@@ -376,7 +376,7 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
 
 #[tokio::test]
 async fn retain_full_one_against_live_pg() {
-    use wal_rs::pg::backup::delete::{DeleteModifier, DeleteOp};
+    use walross::pg::backup::delete::{DeleteModifier, DeleteOp};
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -402,7 +402,7 @@ async fn retain_full_one_against_live_pg() {
         modifier: DeleteModifier::Full,
         after: None,
     };
-    wal_rs::pg::backup::delete::handle(store.clone(), op, true)
+    walross::pg::backup::delete::handle(store.clone(), op, true)
         .await
         .expect("delete retain FULL 1");
 
@@ -439,37 +439,36 @@ async fn wal_receive_archives_segment_against_live_pg() {
     // Let START_REPLICATION establish before forcing segment rotations
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Drive segment rotations via psql. pg_switch_wal is the only thing
-    // guaranteed to FULLY fill the current segment (backup-push's
-    // pg_backup_stop only writes a switch record on some PG configs, which
-    // doesn't put zero-pad bytes on the wire before the new segment starts).
-    // Fire 3 in quick succession so wal-receive accumulates >1 full segment
-    // even if the first switch lands mid-frame.
+    // Drive segment rotations via psql. pg_switch_wal alone is a no-op on an
+    // empty segment (ReserveXLogSwitch returns false at a segment boundary),
+    // so a freshly-initialized idle cluster never fills one and wal-receive
+    // has nothing to rotate. Emit large logical messages first (written to
+    // WAL at any wal_level) to force full-segment boundary crossings, then
+    // switch to finalize the tail. 3 x 8 MiB exceeds one 16 MiB segment, so at
+    // least one segment completes and uploads even discounting switch padding.
     let pghost = std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".into());
     let pgport = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
     let pguser = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".into());
     let pgdb = std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".into());
-    for _ in 0..3 {
+    let psql = |sql: &str| {
         let out = std::process::Command::new("psql")
             .args([
-                "-h",
-                &pghost,
-                "-p",
-                &pgport,
-                "-U",
-                &pguser,
-                "-d",
-                &pgdb,
-                "-Atqc",
-                "SELECT pg_switch_wal()",
+                "-h", &pghost, "-p", &pgport, "-U", &pguser, "-d", &pgdb, "-Atqc", sql,
             ])
             .output()
             .expect("invoke psql; install postgresql-client if missing");
         assert!(
             out.status.success(),
-            "psql pg_switch_wal failed: {}",
+            "psql `{sql}` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    };
+    for _ in 0..3 {
+        // transactional=true: commit flushes the record so the walsender
+        // streams it promptly. 3-arg form is compatible with PG 13+ (the
+        // `flush` arg only exists on PG 16+)
+        psql("SELECT pg_logical_emit_message(true, 'walross', repeat('x', 8 * 1024 * 1024))");
+        psql("SELECT pg_switch_wal()");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 

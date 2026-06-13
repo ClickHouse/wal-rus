@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn build_sql_v15_paren_form() {
         let opts = BaseBackupOpts {
-            label: "wal-rs".into(),
+            label: "walross".into(),
             fast_checkpoint: true,
             no_verify_checksums: false,
             max_rate_kib: None,
@@ -640,7 +640,7 @@ mod tests {
         };
         let s = build_base_backup_sql(&opts, 150000);
         assert!(s.starts_with("BASE_BACKUP ("));
-        assert!(s.contains("LABEL 'wal-rs'"));
+        assert!(s.contains("LABEL 'walross'"));
         assert!(s.contains("CHECKPOINT 'fast'"));
         assert!(s.contains("WAL false"));
         assert!(s.contains("MANIFEST 'no'"));
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn build_sql_v15_wal_true() {
         let opts = BaseBackupOpts {
-            label: "wal-rs".into(),
+            label: "walross".into(),
             fast_checkpoint: true,
             no_verify_checksums: false,
             max_rate_kib: None,
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn build_sql_compat_form() {
         let opts = BaseBackupOpts {
-            label: "wal-rs".into(),
+            label: "walross".into(),
             fast_checkpoint: true,
             no_verify_checksums: true,
             max_rate_kib: Some(8192),
@@ -676,7 +676,7 @@ mod tests {
         let s = build_base_backup_sql(&opts, 140005);
         assert!(s.starts_with("BASE_BACKUP "));
         assert!(!s.contains("("));
-        assert!(s.contains("LABEL 'wal-rs'"));
+        assert!(s.contains("LABEL 'walross'"));
         assert!(s.contains("FAST"));
         assert!(s.contains("TABLESPACE_MAP"));
         assert!(s.contains("NOVERIFY_CHECKSUMS"));
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn build_sql_compat_wal_true() {
         let opts = BaseBackupOpts {
-            label: "wal-rs".into(),
+            label: "walross".into(),
             fast_checkpoint: false,
             no_verify_checksums: false,
             max_rate_kib: None,
