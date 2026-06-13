@@ -13,7 +13,7 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    let cli = wal_rs::cli::Cli::parse();
+    let cli = walross::cli::Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: wal_rs::cli::Cli) -> anyhow::Result<()> {
+fn run(cli: walross::cli::Cli) -> anyhow::Result<()> {
     let threads = cli.worker_threads()?;
     // current_thread when 1: no worker threads, single glibc malloc arena
     // (see docs/DESIGN.md Runtime)

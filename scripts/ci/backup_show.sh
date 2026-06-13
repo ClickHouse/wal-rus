@@ -8,14 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
 pg_initdb
-pg_archive_on "$WALRS_BIN"
+pg_archive_on "$WALROSS_BIN"
 pg_start
 
 pgbench -p "$PGPORT" -h "$PGHOST" -i -s 1 postgres
-walrs backup-push
+walross backup-push
 
-walrs backup-show LATEST
-walrs backup-show LATEST --json \
+walross backup-show LATEST
+walross backup-show LATEST --json \
     | python3 -c '
 import sys, json
 o = json.load(sys.stdin)

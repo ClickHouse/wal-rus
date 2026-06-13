@@ -11,7 +11,7 @@ use crate::pg::backup;
 use crate::pg::wal;
 
 #[derive(Parser, Debug)]
-#[command(name = "wal-rs", version, about = "Rust port of wal-g for PostgreSQL")]
+#[command(name = "walross", version, about = "Rust port of wal-g for PostgreSQL")]
 pub struct Cli {
     /// Tokio worker threads; 1 = single-threaded runtime. Defaults per
     /// command: backup-push min(cores, WALG_UPLOAD_CONCURRENCY),
@@ -139,7 +139,7 @@ pub enum Cmd {
         #[command(subcommand)]
         op: DeleteCli,
         /// Actually delete (default is dry-run)
-        #[arg(long)]
+        #[arg(long, global = true)]
         confirm: bool,
     },
     /// Copy backups (and optionally their WAL window) to a destination prefix.

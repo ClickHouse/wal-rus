@@ -1,6 +1,6 @@
 //! Real-PG client validation for the walsender server.
 //!
-//! Spawns the wal-rs walsender server on a TCP port, then drives it
+//! Spawns the walross walsender server on a TCP port, then drives it
 //! with the local `psql` binary (libpq) using a replication-mode
 //! connection. Asserts the libpq client successfully:
 //! * negotiates the StartupMessage exchange (`replication=database`)
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use wal_rs::pg::replication::server::{Identity, handshake_and_await_start};
+use walross::pg::replication::server::{Identity, handshake_and_await_start};
 
 async fn psql_available() -> bool {
     tokio::process::Command::new("psql")
@@ -75,7 +75,7 @@ async fn libpq_psql_handshakes_and_runs_identify_system() {
     // StartupMessage and lets simple queries work the same as on a
     // normal connection.
     let conninfo = format!(
-        "host=127.0.0.1 port={port} user=walrs dbname=walrs replication=database sslmode=disable"
+        "host=127.0.0.1 port={port} user=walross dbname=walross replication=database sslmode=disable"
     );
     let psql = tokio::process::Command::new("psql")
         .arg(&conninfo)

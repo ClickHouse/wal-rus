@@ -1,4 +1,4 @@
-//! Connect to a wal-rs/wal-g daemon and send a single op
+//! Connect to a walross/wal-g daemon and send a single op
 
 use std::path::Path;
 
