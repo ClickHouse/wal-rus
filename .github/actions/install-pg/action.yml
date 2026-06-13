@@ -1,0 +1,30 @@
+name: install-pg
+description: Install a PGDG PostgreSQL server + client and stop the auto-started cluster
+
+inputs:
+  pg-version:
+    description: PostgreSQL major version (e.g. 16)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -eux
+        # Ubuntu runners ship a default PG; mask its cluster and bring in PGDG
+        # packages for the requested version.
+        sudo systemctl disable --now postgresql || true
+        sudo apt-get purge -y 'postgresql*' || true
+        sudo install -d /etc/apt/keyrings
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+          | sudo gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg
+        codename=$(lsb_release -cs)
+        echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $codename-pgdg main" \
+          | sudo tee /etc/apt/sources.list.d/pgdg.list
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          postgresql-${{ inputs.pg-version }} postgresql-client-${{ inputs.pg-version }} postgresql-contrib-${{ inputs.pg-version }}
+        # Stop & drop the auto-started cluster; tests bring up their own
+        sudo pg_ctlcluster ${{ inputs.pg-version }} main stop || true
+        sudo pg_dropcluster --stop ${{ inputs.pg-version }} main || true

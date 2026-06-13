@@ -21,13 +21,52 @@ export PGUSER="$(id -un)"
 export PGDATABASE=postgres
 export PGPORT=55435
 
-export WALG_FILE_PREFIX="$WORKROOT/storage"
-# wal-g still recognises the legacy WALE_FILE_PREFIX file:// URL; set both so
-# either tool reads the same bucket regardless of which storage layer it picks.
-export WALE_FILE_PREFIX="file://localhost$WALG_FILE_PREFIX"
-export WALG_COMPRESSION_METHOD=zstd
+# Respect a pre-set compression method (codec matrix) else default zstd
+export WALG_COMPRESSION_METHOD="${WALG_COMPRESSION_METHOD:-zstd}"
 
-mkdir -p "$PGHOST" "$WALG_FILE_PREFIX"
+mkdir -p "$PGHOST"
+
+# Configure the storage backend from WALRS_STORAGE_BACKEND (default fs). Exports
+# the WALG_* vars the wal-rs binary reads, plus WALG_ARCHIVE_ENV: the `KEY=VAL`
+# prefix pg_archive_on inlines so the archive_command subprocess targets the
+# same backend. s3 points at MinIO (path-style), gcs at fake-gcs-server.
+storage_init() {
+    local backend="${WALRS_STORAGE_BACKEND:-fs}"
+    case "$backend" in
+    fs)
+        export WALG_FILE_PREFIX="$WORKROOT/storage"
+        # wal-g still recognises the legacy file:// URL; set both so either
+        # tool reads the same bucket regardless of which layer it picks.
+        export WALE_FILE_PREFIX="file://localhost$WALG_FILE_PREFIX"
+        mkdir -p "$WALG_FILE_PREFIX"
+        WALG_ARCHIVE_ENV="WALG_FILE_PREFIX=$WALG_FILE_PREFIX"
+        ;;
+    s3)
+        : "${MINIO_ENDPOINT:?set MINIO_ENDPOINT, e.g. http://127.0.0.1:9000}"
+        local bucket="${WALRS_S3_BUCKET:-walrs}"
+        export WALG_S3_PREFIX="s3://$bucket/$(basename "$WORKROOT")"
+        export AWS_ENDPOINT_URL="$MINIO_ENDPOINT"
+        export WALG_S3_FORCE_PATH_STYLE=true
+        export AWS_REGION="${AWS_REGION:-us-east-1}"
+        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
+        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
+        WALG_ARCHIVE_ENV="WALG_S3_PREFIX=$WALG_S3_PREFIX AWS_ENDPOINT_URL=$AWS_ENDPOINT_URL WALG_S3_FORCE_PATH_STYLE=true AWS_REGION=$AWS_REGION AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
+        ;;
+    gcs)
+        : "${FAKE_GCS_ENDPOINT:?set FAKE_GCS_ENDPOINT, e.g. http://127.0.0.1:4443}"
+        local bucket="${WALRS_GS_BUCKET:-walrs}"
+        export WALG_GS_PREFIX="gs://$bucket/$(basename "$WORKROOT")"
+        export WALG_GS_ENDPOINT="$FAKE_GCS_ENDPOINT"
+        WALG_ARCHIVE_ENV="WALG_GS_PREFIX=$WALG_GS_PREFIX WALG_GS_ENDPOINT=$WALG_GS_ENDPOINT"
+        ;;
+    *)
+        echo "unknown WALRS_STORAGE_BACKEND=$backend" >&2
+        exit 1
+        ;;
+    esac
+    export WALG_ARCHIVE_ENV
+}
+storage_init
 
 PG_LOG="$WORKROOT/pg.log"
 
@@ -56,10 +95,43 @@ pg_archive_on() {
     # against PGDATA's cwd, which matches wal-g's contract.
     cat >>"$PGDATA/postgresql.conf" <<EOF
 archive_mode = on
-archive_command = 'WALG_FILE_PREFIX=$WALG_FILE_PREFIX WALG_COMPRESSION_METHOD=$WALG_COMPRESSION_METHOD $1 wal-push %p'
+archive_command = '$WALG_ARCHIVE_ENV WALG_COMPRESSION_METHOD=$WALG_COMPRESSION_METHOD $1 wal-push %p'
 archive_timeout = 30
 wal_level = replica
 max_wal_senders = 4
+EOF
+}
+
+# Enable streaming replication without archiving — for BASE_BACKUP /
+# START_REPLICATION exercises (backup-push, wal-receive) that read WAL off the
+# wire rather than from the archive. Kept distinct from pg_archive_on so the
+# vm-test lane doesn't drag in an archive_command it never uses.
+pg_replication_on() {
+    # wal_keep_size retains recent segments so START_REPLICATION from the
+    # current segment boundary can't race a checkpoint that recycles it
+    # ("requested WAL segment ... has already been removed") on an otherwise
+    # idle cluster.
+    cat >>"$PGDATA/postgresql.conf" <<EOF
+wal_level = replica
+max_wal_senders = 8
+wal_keep_size = 128MB
+EOF
+}
+
+# initdb's default pg_hba trusts local replication on PG 13+, but make it
+# explicit & idempotent so the lane survives template-pg_hba changes.
+pg_hba_replication() {
+    if ! grep -qE '^[[:space:]]*local[[:space:]]+replication[[:space:]]+all[[:space:]]+trust' "$PGDATA/pg_hba.conf"; then
+        printf 'local replication all trust\n' >>"$PGDATA/pg_hba.conf"
+    fi
+}
+
+# Listen on TCP loopback in addition to the unix socket. Required for the
+# TLS + SCRAM lanes: wal-rs skips TLS on unix sockets (mirrors libpq), and the
+# handshake tests connect with PGHOST=127.0.0.1.
+pg_listen_tcp() {
+    cat >>"$PGDATA/postgresql.conf" <<EOF
+listen_addresses = '127.0.0.1'
 EOF
 }
 
@@ -101,14 +173,62 @@ walg() {
     "$WALG_BIN" "$@"
 }
 
+# One bucket-interop roundtrip: $1 writes the backup + WAL, $2 restores and
+# replays, dumps compared. Storage/compression/encryption come from the
+# exported env so callers vary just those. Leaves the cluster stopped + dropped.
+# Used by the new cross_tool_{encryption,lzma} scripts; the original
+# forward/reverse scripts predate it and stay inline.
+cross_roundtrip() {
+    local writer="$1" reader="$2"
+    pg_initdb
+    pg_archive_on "$writer"
+    pg_start
+    pgbench -p "$PGPORT" -h "$PGHOST" -i -s 1 postgres >/dev/null
+    psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
+    pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump1.sql"
+
+    if [ "$writer" = "$WALRS_BIN" ]; then walrs backup-push; else walg backup-push "$PGDATA"; fi
+    psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
+    sleep 3
+
+    pg_drop
+    mkdir -p "$PGDATA"
+    chmod 700 "$PGDATA"
+    # arg order differs: walrs backup-fetch <name> <dst>, walg backup-fetch <dst> <name>
+    if [ "$reader" = "$WALRS_BIN" ]; then walrs backup-fetch LATEST "$PGDATA"; else walg backup-fetch "$PGDATA" LATEST; fi
+
+    pg_recovery_conf "$reader wal-fetch %f %p"
+    pg_start
+    local _i
+    for _i in $(seq 1 60); do
+        if psql -p "$PGPORT" -h "$PGHOST" -tAc 'SELECT pg_is_in_recovery()' postgres 2>/dev/null | grep -qx f; then
+            break
+        fi
+        sleep 1
+    done
+
+    pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump2.sql"
+    diff -I '^\\\(restrict\|unrestrict\) ' "$WORKROOT/dump1.sql" "$WORKROOT/dump2.sql"
+    pg_drop
+}
+
 cleanup() {
     pg_stop || true
 }
 trap cleanup EXIT
 
-# Drop the bucket between subtests when wal-rs gains `delete everything`.
-# For now, just blow away the prefix.
+# Drop the bucket between subtests. fs blows away the prefix; object backends
+# would need API deletes, so it's an explicit error there (the storage-lane
+# scripts use a fresh per-run prefix instead of resetting mid-run).
 bucket_reset() {
-    rm -rf "$WALG_FILE_PREFIX"
-    mkdir -p "$WALG_FILE_PREFIX"
+    case "${WALRS_STORAGE_BACKEND:-fs}" in
+    fs)
+        rm -rf "$WALG_FILE_PREFIX"
+        mkdir -p "$WALG_FILE_PREFIX"
+        ;;
+    *)
+        echo "bucket_reset unsupported for WALRS_STORAGE_BACKEND=${WALRS_STORAGE_BACKEND}" >&2
+        return 1
+        ;;
+    esac
 }

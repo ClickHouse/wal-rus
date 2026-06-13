@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 
-use super::{AsyncReader, ObjectMeta, ObjectStream, Result, Storage, StorageError};
+use super::{AsyncReader, CopySource, ObjectMeta, ObjectStream, Result, Storage, StorageError};
 use crate::retry::{RetryPolicy, with_retry};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -94,6 +94,18 @@ impl S3Storage {
         }
     }
 
+    /// Server-side copy identity: same endpoint/region + same credential.
+    /// Conservative: AWS allows cross-region CopyObject, but mismatched
+    /// region ids fall back to stream-through rather than risk custom
+    /// endpoints (minio, ceph) that don't
+    fn backend_id(&self) -> String {
+        format!(
+            "s3:{}:{}",
+            self.cfg.endpoint.as_deref().unwrap_or(&self.cfg.region),
+            self.cfg.access_key,
+        )
+    }
+
     fn host(&self) -> String {
         // host header excludes scheme and port=443/80
         host_from_base(&self.base)
@@ -138,7 +150,14 @@ impl S3Storage {
         headers.sort_by(|a, b| a.0.cmp(&b.0));
 
         let canonical_query = canonical_query(query);
-        let canonical_path = canonical_path(key_path);
+        // Sign the full request path. With a custom endpoint the bucket lives in
+        // `base` (path-style: http://host/bucket), so it must appear in the
+        // canonical path or the server-recomputed signature won't match.
+        let base_path = url::Url::parse(&self.base)
+            .ok()
+            .map(|u| u.path().trim_end_matches('/').to_string())
+            .unwrap_or_default();
+        let canonical_path = canonical_path(&base_path, key_path);
         let signed_headers = headers
             .iter()
             .map(|(k, _)| k.as_str())
@@ -460,6 +479,56 @@ impl Storage for S3Storage {
             })
         }
     }
+
+    fn copy_source(&self, key: &str) -> Option<CopySource> {
+        Some(CopySource {
+            backend: self.backend_id(),
+            bucket: self.cfg.bucket.clone(),
+            key: self.full_key(key),
+        })
+    }
+
+    async fn copy_within(&self, src: &CopySource, dst_key: &str) -> Result<()> {
+        if src.backend != self.backend_id() {
+            return Err(StorageError::Unimplemented("copy_within backend mismatch"));
+        }
+        // CopyObject caps at 5 GiB per request; larger sources fail with 400
+        // and caller falls back to stream-through
+        let header = copy_source_header(&src.bucket, &src.key);
+        let resp = self
+            .signed_request(
+                "PUT",
+                &self.full_key(dst_key),
+                &[],
+                Bytes::new(),
+                &[("x-amz-copy-source", header.as_str())],
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(StorageError::NotFound(src.key.clone()));
+        }
+        let resp = check_status(resp).await?;
+        copy_object_result(&resp.text().await?)
+    }
+}
+
+/// x-amz-copy-source value: /bucket/key, key path-encoded per SigV4
+fn copy_source_header(bucket: &str, key: &str) -> String {
+    format!("/{}/{}", bucket, utf8_percent_encode(key, PATH_ENCODE))
+}
+
+/// CopyObject returns 200 before copy completes; failures past that point
+/// surface as <Error> in the body. Mapped to 500 (transient) so the retry
+/// wrapper replays, per AWS guidance to retry embedded copy errors
+fn copy_object_result(body: &str) -> Result<()> {
+    if body.contains("<CopyObjectResult") {
+        Ok(())
+    } else {
+        Err(StorageError::Http {
+            status: 500,
+            body: format!("copy object: {body}"),
+        })
+    }
 }
 
 fn build_base_url(cfg: &S3Config) -> String {
@@ -486,11 +555,19 @@ fn host_from_base(base: &str) -> String {
     }
 }
 
-fn canonical_path(key_path: &str) -> String {
+fn canonical_path(base_path: &str, key_path: &str) -> String {
     if key_path.is_empty() {
-        "/".into()
+        if base_path.is_empty() {
+            "/".into()
+        } else {
+            base_path.to_string()
+        }
     } else {
-        format!("/{}", utf8_percent_encode(key_path, PATH_ENCODE))
+        format!(
+            "{}/{}",
+            base_path,
+            utf8_percent_encode(key_path, PATH_ENCODE)
+        )
     }
 }
 
@@ -636,5 +713,25 @@ mod tests {
     fn canonical_query_is_sorted() {
         let q = canonical_query(&[("b", "1"), ("a", "2")]);
         assert_eq!(q, "a=2&b=1");
+    }
+
+    #[test]
+    fn copy_source_header_encodes_key() {
+        assert_eq!(
+            copy_source_header("bkt", "p/wal_005/000000010000000000000001.zst"),
+            "/bkt/p/wal_005/000000010000000000000001.zst"
+        );
+        assert_eq!(copy_source_header("bkt", "a b+c"), "/bkt/a%20b%2Bc");
+    }
+
+    #[test]
+    fn copy_object_result_detects_embedded_error() {
+        assert!(copy_object_result("<CopyObjectResult><ETag>x</ETag></CopyObjectResult>").is_ok());
+        // whitespace keep-alive prefix before result is fine
+        assert!(copy_object_result("\n\n<CopyObjectResult/>").is_ok());
+        match copy_object_result("<Error><Code>InternalError</Code></Error>") {
+            Err(StorageError::Http { status: 500, .. }) => {}
+            other => panic!("expected Http 500, got {:?}", other.err()),
+        }
     }
 }

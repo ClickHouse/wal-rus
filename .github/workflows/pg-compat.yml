@@ -36,7 +36,9 @@ jobs:
 
   pg:
     needs: build
-    runs-on: ubuntu-22.04
+    # PG 13-17 on jammy; PG 18 single-tool cells on noble (PGDG packages for
+    # jammy lagged 18). Cross-tool stays 13-17 — pinned wal-g v3.0.8 predates 18.
+    runs-on: ${{ matrix.os || 'ubuntu-22.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +51,15 @@ jobs:
           - daemon
           - cross_tool_forward
           - cross_tool_reverse
+          - cross_tool_encryption
+          - cross_tool_retention
+          - cross_tool_lzma
+        include:
+          - { pg: 18, test: full_backup, os: ubuntu-24.04 }
+          - { pg: 18, test: backup_mark, os: ubuntu-24.04 }
+          - { pg: 18, test: backup_show, os: ubuntu-24.04 }
+          - { pg: 18, test: wal_overwrite, os: ubuntu-24.04 }
+          - { pg: 18, test: daemon, os: ubuntu-24.04 }
     steps:
       - uses: actions/checkout@v4
 
@@ -60,24 +71,9 @@ jobs:
       - run: chmod +x bin/wal-rs && bin/wal-rs --version
 
       - name: Install PostgreSQL ${{ matrix.pg }}
-        run: |
-          set -eux
-          # Ubuntu runners ship PG 14; mask the default cluster and bring in
-          # PGDG packages for the matrix version.
-          sudo systemctl disable --now postgresql || true
-          sudo apt-get purge -y 'postgresql*' || true
-          sudo install -d /etc/apt/keyrings
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg
-          codename=$(lsb_release -cs)
-          echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $codename-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            postgresql-${{ matrix.pg }} postgresql-client-${{ matrix.pg }} postgresql-contrib-${{ matrix.pg }}
-          # Stop auto-started cluster; tests bring up their own
-          sudo pg_ctlcluster ${{ matrix.pg }} main stop || true
-          sudo pg_dropcluster --stop ${{ matrix.pg }} main || true
+        uses: ./.github/actions/install-pg
+        with:
+          pg-version: ${{ matrix.pg }}
 
       - name: Install wal-g ${{ env.WALG_VERSION }}
         if: ${{ startsWith(matrix.test, 'cross_tool') }}
@@ -102,6 +98,196 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-pg${{ matrix.pg }}-${{ matrix.test }}
+          path: |
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Run the live-PG suite (tests/vm_live.rs, gated on the vm-test feature)
+  # against a real PGDG cluster. Previously VM-only; this brings backup-push,
+  # wal-receive, encryption & retention live exercises into GitHub CI.
+  pg-vm-test:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [13, 14, 15, 16, 17]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        uses: ./.github/actions/install-pg
+        with:
+          pg-version: ${{ matrix.pg }}
+
+      - name: vm-test against PG ${{ matrix.pg }}
+        env:
+          PG_VERSION: ${{ matrix.pg }}
+          PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
+          # Unused by the cargo tests (they call library functions directly),
+          # but lib.sh requires it set; point at the build output.
+          WALRS_BIN: ${{ github.workspace }}/target/debug/wal-rs
+        run: scripts/ci/vm_test_cluster.sh cargo test --features vm-test --locked
+
+      - name: Collect PG logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-vmtest-pg${{ matrix.pg }}
+          path: |
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Object-storage lane: drive the same shell tests against MinIO (S3) and
+  # fsouza/fake-gcs-server (GCS) so the hand-rolled S3/GCS clients get exercised
+  # against real APIs (SigV4 path-style, multipart, listing, server-side copy).
+  pg-storage:
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [s3, gcs]
+        test: [full_backup, storage_copy]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch wal-rs binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wal-rs-bin
+          path: bin
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+
+      - name: Install PostgreSQL 16
+        uses: ./.github/actions/install-pg
+        with:
+          pg-version: 16
+
+      - name: Start object-storage emulators + bootstrap buckets
+        run: |
+          set -eux
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          docker run -d --name fakegcs -p 4443:4443 \
+            fsouza/fake-gcs-server -scheme http -port 4443 -public-host 127.0.0.1:4443
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break; sleep 1
+          done
+          for _ in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:4443/storage/v1/b?project=test" >/dev/null 2>&1 && break; sleep 1
+          done
+          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://walrs
+          curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
+            -H 'Content-Type: application/json' -d '{"name":"walrs"}'
+
+      - name: Run ${{ matrix.test }} against ${{ matrix.backend }}
+        env:
+          PG_VERSION: 16
+          PG_BIN: /usr/lib/postgresql/16/bin
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
+          WALRS_STORAGE_BACKEND: ${{ matrix.backend }}
+          MINIO_ENDPOINT: http://127.0.0.1:9000
+          FAKE_GCS_ENDPOINT: http://127.0.0.1:4443
+        run: scripts/ci/${{ matrix.test }}.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-storage-${{ matrix.backend }}-${{ matrix.test }}
+          path: |
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # TLS + SCRAM live handshakes. Auth/TLS code is PG-version-independent, so one
+  # version suffices. These need TCP (TLS is skipped on unix sockets).
+  pg-tls-scram:
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [tls_replication, scram_auth]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch wal-rs binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wal-rs-bin
+          path: bin
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+
+      - name: Install PostgreSQL 16
+        uses: ./.github/actions/install-pg
+        with:
+          pg-version: 16
+
+      - name: Run ${{ matrix.test }}
+        env:
+          PG_VERSION: 16
+          PG_BIN: /usr/lib/postgresql/16/bin
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
+        run: scripts/ci/${{ matrix.test }}.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-tlsscram-${{ matrix.test }}
+          path: |
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Non-zstd codecs end-to-end (push → fetch → WAL replay). zstd is already the
+  # default exercised by the main `pg` matrix; this covers the rest on one PG.
+  pg-codec:
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        codec: [brotli, lz4, lzma, gzip]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch wal-rs binary
+        uses: actions/download-artifact@v4
+        with:
+          name: wal-rs-bin
+          path: bin
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+
+      - name: Install PostgreSQL 16
+        uses: ./.github/actions/install-pg
+        with:
+          pg-version: 16
+
+      - name: full_backup with ${{ matrix.codec }}
+        env:
+          PG_VERSION: 16
+          PG_BIN: /usr/lib/postgresql/16/bin
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
+          WALG_COMPRESSION_METHOD: ${{ matrix.codec }}
+        run: scripts/ci/full_backup.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-codec-${{ matrix.codec }}
           path: |
             /tmp/wal-rs-ci-*/**/*.log
             /tmp/wal-rs-ci-*/**/log/*

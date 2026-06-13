@@ -21,7 +21,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-use super::{AsyncReader, ObjectMeta, ObjectStream, Result, Storage, StorageError};
+use super::{AsyncReader, CopySource, ObjectMeta, ObjectStream, Result, Storage, StorageError};
 
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const STORAGE_HOST: &str = "https://storage.googleapis.com";
@@ -50,12 +50,41 @@ pub struct GcsConfig {
 pub struct GcsStorage {
     cfg: GcsConfig,
     client: Client,
-    sa: ServiceAccount,
+    host: String,
+    /// None in emulator mode (fake-gcs-server): no service account, no oauth2
+    sa: Option<ServiceAccount>,
     token: Arc<Mutex<Option<CachedToken>>>,
 }
 
 impl GcsStorage {
     pub fn new(cfg: GcsConfig) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| StorageError::Config(e.to_string()))?;
+
+        // Emulator mode: WALG_GS_ENDPOINT / STORAGE_EMULATOR_HOST point at a
+        // fake-gcs-server which serves the JSON API over plain HTTP and ignores
+        // auth. Skip credentials + the oauth2 token mint entirely.
+        if let Some(ep) = std::env::var("WALG_GS_ENDPOINT")
+            .or_else(|_| std::env::var("STORAGE_EMULATOR_HOST"))
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            let host = if ep.starts_with("http://") || ep.starts_with("https://") {
+                ep.trim_end_matches('/').to_string()
+            } else {
+                format!("http://{}", ep.trim_end_matches('/'))
+            };
+            return Ok(Self {
+                cfg,
+                client,
+                host,
+                sa: None,
+                token: Arc::new(Mutex::new(None)),
+            });
+        }
+
         let path = cfg
             .credentials_path
             .clone()
@@ -70,14 +99,11 @@ impl GcsStorage {
             .map_err(|e| StorageError::Config(format!("read credentials {}: {}", path, e)))?;
         let sa: ServiceAccount = serde_json::from_str(&raw)
             .map_err(|e| StorageError::Config(format!("parse credentials: {e}")))?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| StorageError::Config(e.to_string()))?;
         Ok(Self {
             cfg,
             client,
-            sa,
+            host: STORAGE_HOST.to_string(),
+            sa: Some(sa),
             token: Arc::new(Mutex::new(None)),
         })
     }
@@ -95,6 +121,10 @@ impl GcsStorage {
     }
 
     async fn access_token(&self) -> Result<String> {
+        // Emulator mode: fake-gcs-server ignores the bearer token
+        let Some(sa) = self.sa.as_ref() else {
+            return Ok("emulator".into());
+        };
         let mut guard = self.token.lock().await;
         let now = SystemTime::now();
         if let Some(c) = guard.as_ref()
@@ -109,9 +139,9 @@ impl GcsStorage {
             .as_secs();
         let header = serde_json::json!({"alg":"RS256","typ":"JWT"});
         let claims = serde_json::json!({
-            "iss": self.sa.client_email,
+            "iss": sa.client_email,
             "scope": SCOPE,
-            "aud": self.sa.token_uri.clone().unwrap_or_else(|| TOKEN_URL.into()),
+            "aud": sa.token_uri.clone().unwrap_or_else(|| TOKEN_URL.into()),
             "iat": now_secs,
             "exp": now_secs + 3600,
         });
@@ -120,7 +150,7 @@ impl GcsStorage {
         let c_b64 = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
         let signing_input = format!("{h_b64}.{c_b64}");
 
-        let key_pair = parse_pkcs8_or_pkcs1(&self.sa.private_key)?;
+        let key_pair = parse_pkcs8_or_pkcs1(&sa.private_key)?;
         let rng = SystemRandom::new();
         let mut sig = vec![0u8; key_pair.public_key().modulus_len()];
         key_pair
@@ -129,7 +159,7 @@ impl GcsStorage {
         let s_b64 = URL_SAFE_NO_PAD.encode(&sig);
         let jwt = format!("{signing_input}.{s_b64}");
 
-        let token_url = self.sa.token_uri.as_deref().unwrap_or(TOKEN_URL);
+        let token_url = sa.token_uri.as_deref().unwrap_or(TOKEN_URL);
         let resp = self
             .client
             .post(token_url)
@@ -163,11 +193,36 @@ impl GcsStorage {
     fn object_url(&self, key: &str) -> String {
         let full = self.full_key(key);
         let enc = utf8_percent_encode(&full, NON_ALPHANUMERIC);
-        format!(
-            "{}/storage/v1/b/{}/o/{}",
-            STORAGE_HOST, self.cfg.bucket, enc
-        )
+        format!("{}/storage/v1/b/{}/o/{}", self.host, self.cfg.bucket, enc)
     }
+
+    /// Server-side copy identity: rewriteTo authorizes both sides with one
+    /// token, so same service account (or same emulator host) is the safe
+    /// equivalence
+    fn backend_id(&self) -> String {
+        match self.sa.as_ref() {
+            Some(sa) => format!("gs:{}", sa.client_email),
+            None => format!("gs:emulator:{}", self.host),
+        }
+    }
+}
+
+/// rewriteTo URL; object names percent-encoded as single path segments
+fn rewrite_url(
+    host: &str,
+    src_bucket: &str,
+    src_key: &str,
+    dst_bucket: &str,
+    dst_key: &str,
+) -> String {
+    format!(
+        "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
+        host,
+        src_bucket,
+        utf8_percent_encode(src_key, NON_ALPHANUMERIC),
+        dst_bucket,
+        utf8_percent_encode(dst_key, NON_ALPHANUMERIC),
+    )
 }
 
 #[async_trait]
@@ -181,7 +236,7 @@ impl Storage for GcsStorage {
         let full = self.full_key(key);
         let url = format!(
             "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
-            STORAGE_HOST,
+            self.host,
             self.cfg.bucket,
             utf8_percent_encode(&full, NON_ALPHANUMERIC),
         );
@@ -242,15 +297,24 @@ impl Storage for GcsStorage {
         let cfg_prefix = self.cfg.prefix.clone();
         let bucket = self.cfg.bucket.clone();
         let client = self.client.clone();
+        let host = self.host.clone();
         let token = self.access_token().await?;
 
         let s = stream::unfold(
-            (Some(String::new()), full, cfg_prefix, bucket, client, token),
-            |(token_page, prefix, strip, bucket, client, auth)| async move {
+            (
+                Some(String::new()),
+                full,
+                cfg_prefix,
+                bucket,
+                client,
+                host,
+                token,
+            ),
+            |(token_page, prefix, strip, bucket, client, host, auth)| async move {
                 let token_page = token_page?;
                 let mut url = format!(
                     "{}/storage/v1/b/{}/o?prefix={}",
-                    STORAGE_HOST,
+                    host,
                     bucket,
                     utf8_percent_encode(&prefix, NON_ALPHANUMERIC),
                 );
@@ -263,7 +327,10 @@ impl Storage for GcsStorage {
                 let resp = match client.get(&url).bearer_auth(&auth).send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        return Some((Err(e.into()), (None, prefix, strip, bucket, client, auth)));
+                        return Some((
+                            Err(e.into()),
+                            (None, prefix, strip, bucket, client, host, auth),
+                        ));
                     }
                 };
                 if !resp.status().is_success() {
@@ -274,7 +341,7 @@ impl Storage for GcsStorage {
                             status: st.as_u16(),
                             body: format!("gcs list: {body}"),
                         }),
-                        (None, prefix, strip, bucket, client, auth),
+                        (None, prefix, strip, bucket, client, host, auth),
                     ));
                 }
                 #[derive(Deserialize)]
@@ -294,7 +361,10 @@ impl Storage for GcsStorage {
                 let lr: ListResp = match resp.json().await {
                     Ok(v) => v,
                     Err(e) => {
-                        return Some((Err(e.into()), (None, prefix, strip, bucket, client, auth)));
+                        return Some((
+                            Err(e.into()),
+                            (None, prefix, strip, bucket, client, host, auth),
+                        ));
                     }
                 };
                 let items = lr.items.unwrap_or_default();
@@ -325,7 +395,7 @@ impl Storage for GcsStorage {
                     });
                 }
                 let next = lr.next_page_token;
-                Some((Ok(out), (next, prefix, strip, bucket, client, auth)))
+                Some((Ok(out), (next, prefix, strip, bucket, client, host, auth)))
             },
         )
         .flat_map(|res| match res {
@@ -353,6 +423,68 @@ impl Storage for GcsStorage {
                 status: st.as_u16(),
                 body: format!("gcs delete: {body}"),
             })
+        }
+    }
+
+    fn copy_source(&self, key: &str) -> Option<CopySource> {
+        Some(CopySource {
+            backend: self.backend_id(),
+            bucket: self.cfg.bucket.clone(),
+            key: self.full_key(key),
+        })
+    }
+
+    async fn copy_within(&self, src: &CopySource, dst_key: &str) -> Result<()> {
+        if src.backend != self.backend_id() {
+            return Err(StorageError::Unimplemented("copy_within backend mismatch"));
+        }
+        let token = self.access_token().await?;
+        let base = rewrite_url(
+            &self.host,
+            &src.bucket,
+            &src.key,
+            &self.cfg.bucket,
+            &self.full_key(dst_key),
+        );
+        // large objects rewrite in chunks; loop until done
+        let mut rewrite_token: Option<String> = None;
+        loop {
+            let url = match &rewrite_token {
+                Some(t) => format!(
+                    "{}?rewriteToken={}",
+                    base,
+                    utf8_percent_encode(t, NON_ALPHANUMERIC)
+                ),
+                None => base.clone(),
+            };
+            let resp = self.client.post(&url).bearer_auth(&token).send().await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(StorageError::NotFound(src.key.clone()));
+            }
+            if !resp.status().is_success() {
+                let st = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(StorageError::Http {
+                    status: st.as_u16(),
+                    body: format!("gcs rewrite: {body}"),
+                });
+            }
+            #[derive(Deserialize)]
+            struct RewriteResp {
+                done: bool,
+                #[serde(rename = "rewriteToken")]
+                rewrite_token: Option<String>,
+            }
+            let rr: RewriteResp = resp.json().await?;
+            if rr.done {
+                return Ok(());
+            }
+            if rr.rewrite_token.is_none() {
+                return Err(StorageError::InvalidResponse(
+                    "rewrite not done, no rewriteToken".into(),
+                ));
+            }
+            rewrite_token = rr.rewrite_token;
         }
     }
 }
@@ -395,5 +527,47 @@ mod tests {
         let pem = "-----BEGIN PRIVATE KEY-----\nAAEC\n-----END PRIVATE KEY-----\n";
         let der = pem_to_der(pem).unwrap();
         assert_eq!(der, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn rewrite_url_encodes_object_names() {
+        let url = rewrite_url(
+            STORAGE_HOST,
+            "src-b",
+            "p/wal_005/x.zst",
+            "dst-b",
+            "q/wal_005/x.zst",
+        );
+        assert_eq!(
+            url,
+            format!(
+                "{STORAGE_HOST}/storage/v1/b/src-b/o/p%2Fwal%5F005%2Fx%2Ezst\
+                 /rewriteTo/b/dst-b/o/q%2Fwal%5F005%2Fx%2Ezst"
+            )
+        );
+    }
+
+    #[test]
+    fn emulator_endpoint_overrides_host_and_skips_auth() {
+        // set_var unsafe in edition 2024; this test mutates process env so it
+        // must not run concurrently with other gcs env readers — there are none
+        unsafe {
+            std::env::set_var("WALG_GS_ENDPOINT", "http://127.0.0.1:4443");
+        }
+        let s = GcsStorage::new(GcsConfig {
+            bucket: "b".into(),
+            prefix: "p".into(),
+            credentials_path: None,
+        })
+        .expect("emulator mode needs no credentials");
+        unsafe {
+            std::env::remove_var("WALG_GS_ENDPOINT");
+        }
+        assert!(s.sa.is_none());
+        assert_eq!(s.host, "http://127.0.0.1:4443");
+        assert!(
+            s.object_url("wal_005/x")
+                .starts_with("http://127.0.0.1:4443/")
+        );
     }
 }

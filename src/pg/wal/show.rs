@@ -270,3 +270,110 @@ async fn _unused_reader(_r: &mut (dyn tokio::io::AsyncRead + Unpin)) {
     let mut buf = [0u8; 0];
     let _ = AsyncReadExt::read(_r, &mut buf).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{AsyncReader, fs::FsStorage};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn seg(tli: u32, seg_no: u32) -> SegmentName {
+        SegmentName {
+            timeline: tli,
+            log_id: 0,
+            seg_no,
+        }
+    }
+
+    fn set(tli: u32, nos: &[u32]) -> BTreeSet<SegmentName> {
+        nos.iter().map(|&n| seg(tli, n)).collect()
+    }
+
+    #[test]
+    fn contiguous_timeline_has_no_gaps() {
+        let info = summarize_timeline(1, set(1, &[1, 2, 3, 4]), vec![]);
+        assert_eq!(info.status, TimelineStatus::Ok);
+        assert!(info.gaps.is_empty());
+        assert_eq!(info.segments_count, 4);
+        assert_eq!(
+            info.start_segment.as_deref(),
+            Some("000000010000000000000001")
+        );
+        assert_eq!(
+            info.end_segment.as_deref(),
+            Some("000000010000000000000004")
+        );
+    }
+
+    #[test]
+    fn single_missing_segment_is_one_gap() {
+        let info = summarize_timeline(1, set(1, &[1, 2, 4, 5]), vec![]);
+        assert_eq!(info.status, TimelineStatus::Lost);
+        assert_eq!(info.gaps.len(), 1);
+        let g = &info.gaps[0];
+        assert_eq!(g.from, "000000010000000000000002");
+        assert_eq!(g.to, "000000010000000000000004");
+        assert_eq!(g.missing, 1);
+    }
+
+    #[test]
+    fn multi_segment_gap_counts_all_missing() {
+        let info = summarize_timeline(1, set(1, &[1, 5]), vec![]);
+        assert_eq!(info.gaps.len(), 1);
+        assert_eq!(info.gaps[0].from, "000000010000000000000001");
+        assert_eq!(info.gaps[0].to, "000000010000000000000005");
+        assert_eq!(info.gaps[0].missing, 3);
+    }
+
+    #[test]
+    fn empty_timeline_is_lost() {
+        let info = summarize_timeline(7, BTreeSet::new(), vec![]);
+        assert_eq!(info.status, TimelineStatus::Lost);
+        assert!(info.start_segment.is_none());
+        assert_eq!(info.segments_count, 0);
+    }
+
+    #[test]
+    fn single_segment_timeline_ok() {
+        let info = summarize_timeline(1, set(1, &[3]), vec![]);
+        assert_eq!(info.status, TimelineStatus::Ok);
+        assert!(info.gaps.is_empty());
+        assert_eq!(info.start_segment, info.end_segment);
+    }
+
+    fn empty_body() -> AsyncReader {
+        Box::pin(std::io::Cursor::new(Vec::new()))
+    }
+
+    // collect() over a seeded fs bucket: a timeline switch yields one
+    // TimelineInfo per TLI, a .history file is ignored (no phantom timeline),
+    // and a trailing .partial counts as a present segment (classify accepts it)
+    #[tokio::test]
+    async fn collect_splits_timelines_ignores_history_counts_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        for k in [
+            "wal_005/000000010000000000000001",
+            "wal_005/000000010000000000000002",
+            "wal_005/000000010000000000000003.partial",
+            "wal_005/000000020000000000000005",
+            "wal_005/000000020000000000000007",
+            "wal_005/00000002.history",
+        ] {
+            store.put(k, empty_body(), None).await.unwrap();
+        }
+
+        let tlis = collect(store).await.unwrap();
+        assert_eq!(tlis.len(), 2, "history must not create a phantom timeline");
+
+        let t1 = tlis.iter().find(|t| t.timeline == 1).unwrap();
+        assert_eq!(t1.segments_count, 3, ".partial segment must be counted");
+        assert_eq!(t1.status, TimelineStatus::Ok);
+
+        let t2 = tlis.iter().find(|t| t.timeline == 2).unwrap();
+        assert_eq!(t2.gaps.len(), 1);
+        assert_eq!(t2.gaps[0].missing, 1);
+        assert_eq!(t2.status, TimelineStatus::Lost);
+    }
+}

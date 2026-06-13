@@ -29,6 +29,17 @@ pub struct ObjectMeta {
     pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Absolute object location for server-side copy. `backend` is an opaque
+/// identity (service endpoint + credential); `copy_within` only proceeds
+/// when source & destination identities match
+#[derive(Debug, Clone)]
+pub struct CopySource {
+    pub backend: String,
+    pub bucket: String,
+    /// key with storage prefix applied, absolute within bucket
+    pub key: String,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("object not found: {0}")]
@@ -112,6 +123,22 @@ pub trait Storage: Send + Sync {
 
     /// Delete a single object (idempotent: ok if missing)
     async fn delete(&self, key: &str) -> Result<()>;
+
+    /// Location descriptor for server-side copy; None when backend has no
+    /// server-side copy support
+    fn copy_source(&self, key: &str) -> Option<CopySource> {
+        let _ = key;
+        None
+    }
+
+    /// Server-side copy of `src` to `dst_key` under this handle's prefix.
+    /// S3 `x-amz-copy-source` / GCS `rewriteTo`; no bytes through client.
+    /// Err(Unimplemented) on backend mismatch or no support, callers fall
+    /// back to get→put stream-through
+    async fn copy_within(&self, src: &CopySource, dst_key: &str) -> Result<()> {
+        let _ = (src, dst_key);
+        Err(StorageError::Unimplemented("copy_within"))
+    }
 }
 
 pub type DynStorage = Arc<dyn Storage>;

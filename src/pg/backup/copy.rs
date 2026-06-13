@@ -6,9 +6,9 @@
 //! caller supplies a second `DynStorage`
 //!
 //! The implementation walks source-side object listings (basebackup-relative
-//! +, optionally, WAL-relative) and pipes each `get` straight into a `put`
-//! against the destination storage. Server-side server-side copy
-//! (`x-amz-copy-source` / GCS `rewriteTo`) is a follow-up optimization
+//! +, optionally, WAL-relative) and copies each key server-side
+//! (`x-amz-copy-source` / GCS `rewriteTo`) when both handles sit on the same
+//! backend, falling back to piping `get` into `put` otherwise
 
 use std::sync::Arc;
 
@@ -117,6 +117,17 @@ pub async fn handle(
 }
 
 async fn copy_one(src: &DynStorage, dst: &DynStorage, key: &str) -> Result<()> {
+    // server-side first; any failure falls back to stream-through, which can
+    // still succeed where one-sided auth can't (src & dst use separate creds)
+    if let Some(loc) = src.copy_source(key) {
+        match dst.copy_within(&loc, key).await {
+            Ok(()) => return Ok(()),
+            Err(crate::storage::StorageError::Unimplemented(_)) => {}
+            Err(e) => {
+                tracing::debug!(target = "copy", "server-side copy {key}: {e}; streaming")
+            }
+        }
+    }
     let body = src.get(key).await.with_context(|| format!("get {key}"))?;
     dst.put(key, body, None)
         .await

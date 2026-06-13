@@ -1075,4 +1075,67 @@ mod tests {
         assert_eq!(parts[0].0, 8);
         assert_eq!(res.last_file_no, 8);
     }
+
+    /// Thousands of tiny entries against a part-size threshold: a single part
+    /// must pack many thousands of entries, all entries survive byte-clean
+    /// across the parts, and tar_file_sets accounts for each exactly once.
+    /// Downscaled from the ~130k-entries-per-part production worry (8.2 KiB
+    /// on-wire each vs a 1 GiB threshold) to keep the test fast.
+    #[tokio::test]
+    async fn many_tiny_entries_pack_across_parts() {
+        const N: usize = 5000;
+        let bodies: Vec<(String, Vec<u8>)> = (0..N)
+            .map(|i| {
+                (
+                    format!("base/16384/{}", 16384 + i),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let entries: Vec<(&str, &[u8])> = bodies
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        let input = build_input_tar(&entries);
+
+        let (rx, h) = start(
+            std::io::Cursor::new(input),
+            StreamerOpts {
+                max_tar_size: 2 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        let parts = collect_parts(rx).await;
+        let res = h.await.unwrap().unwrap();
+
+        assert!(
+            parts.len() >= 2,
+            "expected multiple parts, got {}",
+            parts.len()
+        );
+        let max_entries = res.tar_file_sets.values().map(|v| v.len()).max().unwrap();
+        assert!(
+            max_entries > 1000,
+            "no part packed many entries: {max_entries}"
+        );
+
+        // Every entry survives byte-clean across all parts
+        let mut seen: HashMap<String, Vec<u8>> = HashMap::new();
+        for (_no, bytes) in &parts {
+            let mut a = tar::Archive::new(bytes.as_slice());
+            for e in a.entries().unwrap() {
+                let mut e = e.unwrap();
+                let name = e.path().unwrap().to_string_lossy().into_owned();
+                let mut body = Vec::new();
+                e.read_to_end(&mut body).unwrap();
+                seen.insert(name, body);
+            }
+        }
+        assert_eq!(seen.len(), N, "entry count mismatch after repack");
+        for (name, want) in &bodies {
+            assert_eq!(seen.get(name), Some(want), "entry {name} corrupted/missing");
+        }
+        let total: usize = res.tar_file_sets.values().map(|v| v.len()).sum();
+        assert_eq!(total, N, "tar_file_sets must account for every entry once");
+    }
 }
