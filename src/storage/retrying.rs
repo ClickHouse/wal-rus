@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use crate::retry::{RetryPolicy, with_retry};
 
-use super::{AsyncReader, ObjectStream, Result, Storage, StorageError};
+use super::{AsyncReader, CopySource, ObjectStream, Result, Storage, StorageError};
 
 /// Buffer-then-retry threshold for put bodies (matches wal-g's small-object
 /// path: sentinels, history files, manifest fragments)
@@ -78,6 +78,18 @@ impl<S: Storage + 'static> Storage for RetryingStorage<S> {
     async fn delete(&self, key: &str) -> Result<()> {
         with_retry(&self.policy, StorageError::is_transient, || async {
             self.inner.delete(key).await
+        })
+        .await
+    }
+
+    fn copy_source(&self, key: &str) -> Option<CopySource> {
+        self.inner.copy_source(key)
+    }
+
+    async fn copy_within(&self, src: &CopySource, dst_key: &str) -> Result<()> {
+        // idempotent, safe to replay
+        with_retry(&self.policy, StorageError::is_transient, || async {
+            self.inner.copy_within(src, dst_key).await
         })
         .await
     }

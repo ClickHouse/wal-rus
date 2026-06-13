@@ -375,6 +375,49 @@ fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // set_var/remove_var are unsafe in edition 2024 and process-global;
+    // serialize env-touching tests so they can't observe each other's writes
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(vars: &[(&str, Option<&str>)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = vars
+                .iter()
+                .map(|(k, v)| {
+                    let prev = std::env::var(k).ok();
+                    unsafe {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                    (k.to_string(), prev)
+                })
+                .collect();
+            EnvGuard { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_s3_uri() {
@@ -390,5 +433,100 @@ mod tests {
     #[test]
     fn rejects_wrong_scheme() {
         assert!(parse_uri_prefix("gs://x/y", "s3://").is_err());
+    }
+
+    #[test]
+    fn parse_uri_prefix_trims_trailing_slash_and_rejects_empty_bucket() {
+        let (b, p) = parse_uri_prefix("s3://bucket/some/prefix/", "s3://").unwrap();
+        assert_eq!(b, "bucket");
+        assert_eq!(p, "some/prefix");
+        assert!(parse_uri_prefix("s3:///prefix", "s3://").is_err());
+    }
+
+    #[test]
+    fn parse_env_int_default_valid_and_malformed() {
+        let key = "WALRS_TEST_PARSE_INT";
+        {
+            let _g = EnvGuard::new(&[(key, None)]);
+            assert_eq!(parse_env_int(key, 7).unwrap(), 7);
+        }
+        {
+            let _g = EnvGuard::new(&[(key, Some("42"))]);
+            assert_eq!(parse_env_int(key, 7).unwrap(), 42);
+        }
+        {
+            let _g = EnvGuard::new(&[(key, Some("-5"))]);
+            assert_eq!(parse_env_int(key, 7).unwrap(), -5);
+        }
+        for bad in ["abc", "", "1.5", "9999999999999999999999"] {
+            let _g = EnvGuard::new(&[(key, Some(bad))]);
+            assert!(parse_env_int(key, 7).is_err(), "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn parse_env_bool_tokens_and_rejection() {
+        let key = "WALRS_TEST_PARSE_BOOL";
+        for t in ["1", "true", "TRUE", "yes", "On"] {
+            let _g = EnvGuard::new(&[(key, Some(t))]);
+            assert!(parse_env_bool(key, false).unwrap(), "{t:?} should be true");
+        }
+        for f in ["0", "false", "NO", "off"] {
+            let _g = EnvGuard::new(&[(key, Some(f))]);
+            assert!(!parse_env_bool(key, true).unwrap(), "{f:?} should be false");
+        }
+        for bad in ["maybe", "", "2"] {
+            let _g = EnvGuard::new(&[(key, Some(bad))]);
+            assert!(parse_env_bool(key, false).is_err(), "{bad:?} should error");
+        }
+        {
+            let _g = EnvGuard::new(&[(key, None)]);
+            assert!(parse_env_bool(key, true).unwrap());
+            assert!(!parse_env_bool(key, false).unwrap());
+        }
+    }
+
+    #[test]
+    fn delta_settings_origin_and_steps() {
+        let keys = [
+            "WALG_DELTA_MAX_STEPS",
+            "WALG_DELTA_ORIGIN",
+            "WALG_DELTA_FROM_NAME",
+            "WALG_DELTA_FROM_USER_DATA",
+        ];
+        let clear: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (*k, None)).collect();
+        // Unset → disabled, LATEST semantics
+        {
+            let _g = EnvGuard::new(&clear);
+            let d = DeltaSettings::from_env().unwrap();
+            assert!(!d.enabled());
+            assert!(!d.from_full);
+            assert_eq!(d.max_steps, 0);
+        }
+        // LATEST_FULL with steps
+        {
+            let mut v = clear.clone();
+            v[0] = ("WALG_DELTA_MAX_STEPS", Some("3"));
+            v[1] = ("WALG_DELTA_ORIGIN", Some("LATEST_FULL"));
+            let _g = EnvGuard::new(&v);
+            let d = DeltaSettings::from_env().unwrap();
+            assert!(d.enabled());
+            assert!(d.from_full);
+            assert_eq!(d.max_steps, 3);
+        }
+        // Explicit LATEST → not from_full
+        {
+            let mut v = clear.clone();
+            v[1] = ("WALG_DELTA_ORIGIN", Some("LATEST"));
+            let _g = EnvGuard::new(&v);
+            assert!(!DeltaSettings::from_env().unwrap().from_full);
+        }
+        // Garbage origin → error
+        {
+            let mut v = clear.clone();
+            v[1] = ("WALG_DELTA_ORIGIN", Some("SIDEWAYS"));
+            let _g = EnvGuard::new(&v);
+            assert!(DeltaSettings::from_env().is_err());
+        }
     }
 }

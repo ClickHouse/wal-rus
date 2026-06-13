@@ -9,7 +9,7 @@ use futures::stream::{self, StreamExt};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use super::{AsyncReader, ObjectMeta, ObjectStream, Result, Storage, StorageError};
+use super::{AsyncReader, CopySource, ObjectMeta, ObjectStream, Result, Storage, StorageError};
 
 pub struct FsStorage {
     root: PathBuf,
@@ -27,6 +27,18 @@ impl FsStorage {
     }
 }
 
+/// tmp lives next to final so rename stays on same fs
+fn tmp_sibling(final_path: &Path) -> PathBuf {
+    final_path.with_extension(format!(
+        "{}.tmp.{}",
+        final_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or(""),
+        std::process::id(),
+    ))
+}
+
 #[async_trait]
 impl Storage for FsStorage {
     fn describe(&self) -> String {
@@ -38,15 +50,7 @@ impl Storage for FsStorage {
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        // tmp lives next to final so rename stays on same fs
-        let tmp_path = final_path.with_extension(format!(
-            "{}.tmp.{}",
-            final_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or(""),
-            std::process::id(),
-        ));
+        let tmp_path = tmp_sibling(&final_path);
         let mut tmp = fs::File::create(&tmp_path).await?;
         match tokio::io::copy(&mut body, &mut tmp).await {
             Ok(_) => {
@@ -98,6 +102,39 @@ impl Storage for FsStorage {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    fn copy_source(&self, key: &str) -> Option<CopySource> {
+        Some(CopySource {
+            backend: "fs".into(),
+            bucket: String::new(),
+            key: self.full(key).to_string_lossy().into_owned(),
+        })
+    }
+
+    async fn copy_within(&self, src: &CopySource, dst_key: &str) -> Result<()> {
+        if src.backend != "fs" {
+            return Err(StorageError::Unimplemented("copy_within backend mismatch"));
+        }
+        let final_path = self.full(dst_key);
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = tmp_sibling(&final_path);
+        // fs::copy uses copy_file_range / reflink where kernel supports it
+        match fs::copy(&src.key, &tmp_path).await {
+            Ok(_) => {
+                fs::rename(&tmp_path, &final_path).await?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StorageError::NotFound(src.key.clone()))
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                Err(e.into())
+            }
         }
     }
 }
@@ -187,6 +224,37 @@ mod tests {
             .await;
         keys.sort();
         assert_eq!(keys, vec!["a/b.txt", "a/c/d.txt"]);
+    }
+
+    #[tokio::test]
+    async fn copy_within_across_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = FsStorage::new(dir.path().join("src")).unwrap();
+        let dst = FsStorage::new(dir.path().join("dst")).unwrap();
+        src.put("a/b.zst", reader(b"payload"), None).await.unwrap();
+
+        let loc = src.copy_source("a/b.zst").unwrap();
+        dst.copy_within(&loc, "a/b.zst").await.unwrap();
+        let mut r = dst.get("a/b.zst").await.unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"payload");
+
+        let missing = src.copy_source("nope").unwrap();
+        match dst.copy_within(&missing, "x").await {
+            Err(StorageError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {:?}", other.err()),
+        }
+
+        let mismatched = CopySource {
+            backend: "s3:other".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        match dst.copy_within(&mismatched, "x").await {
+            Err(StorageError::Unimplemented(_)) => {}
+            other => panic!("expected Unimplemented, got {:?}", other.err()),
+        }
     }
 
     #[tokio::test]
