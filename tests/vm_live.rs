@@ -67,7 +67,9 @@ async fn wal_push_fetch_byte_identity() {
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
 
     let dst = dir.path().join("restored");
-    wal::fetch::handle(&s, store, segment, &dst).await.unwrap();
+    wal::fetch::handle(&s, store, segment, &dst, wal::fetch::Prefetch::Off)
+        .await
+        .unwrap();
     let restored = std::fs::read(&dst).unwrap();
     assert_eq!(restored.len(), payload.len());
     assert_eq!(restored, payload);

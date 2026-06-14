@@ -9,6 +9,9 @@
 //! wal-fetch consults `<pg_wal>/.wal-g/prefetch/<seg>` first (see
 //! `super::fetch::handle`); a successful prefetch turns a network round-trip
 //! into a local rename. Skipped on .history files (those re-resolve cheaply).
+//!
+//! Invoked two ways, mirroring wal-g: standalone (`walross wal-prefetch`, also
+//! the fork target) and triggered from wal-fetch (see `fetch::trigger_prefetch`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,8 +30,18 @@ use super::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 pub const PREFETCH_SUBDIR: &str = ".wal-g/prefetch";
 pub const RUNNING_SUBDIR: &str = "running";
 
+/// Base dir holding `.wal-g/prefetch/`. `WALG_PREFETCH_DIR` overrides the
+/// pg_wal-relative default; honored by both the writer here & the consumer in
+/// `fetch::try_promote_prefetched` so the two stay in sync (wal-g parity)
+fn prefetch_base(pg_wal: &Path) -> PathBuf {
+    match std::env::var_os("WALG_PREFETCH_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => pg_wal.to_path_buf(),
+    }
+}
+
 pub fn prefetch_dir(pg_wal: &Path) -> PathBuf {
-    pg_wal.join(PREFETCH_SUBDIR)
+    prefetch_base(pg_wal).join(PREFETCH_SUBDIR)
 }
 
 pub fn running_dir(pg_wal: &Path) -> PathBuf {
@@ -58,6 +71,9 @@ pub async fn handle(
         .await
         .with_context(|| format!("create {}", run.display()))?;
 
+    // wal-g CleanupPrefetchDirectories: drop already-replayed segments (< seed)
+    cleanup_stale(&pre, &run, seed_seg).await;
+
     let mut next = seed_seg.next(DEFAULT_WAL_SEG_SIZE);
     let sem = Arc::new(Semaphore::new(settings.download_concurrency.max(1)));
     let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
@@ -67,8 +83,11 @@ pub async fn handle(
         next = next.next(DEFAULT_WAL_SEG_SIZE);
 
         let ready = pre.join(&name);
+        let running = run.join(&name);
         let local_in_pgwal = pg_wal.join(&name);
+        // skip when ready, in-flight (running/), or already restored into pg_wal
         if fs::try_exists(&ready).await.unwrap_or(false)
+            || fs::try_exists(&running).await.unwrap_or(false)
             || fs::try_exists(&local_in_pgwal).await.unwrap_or(false)
         {
             tracing::debug!(target = "wal_prefetch", "{name} already staged, skipping");
@@ -81,7 +100,6 @@ pub async fn handle(
             .context("acquire prefetch permit")?;
         let st = storage.clone();
         let cfg = settings.clone();
-        let running = run.join(&name);
         let ready_path = ready.clone();
         let task_name = name.clone();
         tasks.spawn(async move {
@@ -110,8 +128,16 @@ async fn fetch_one(
     ready: &Path,
 ) -> Result<()> {
     // Reuse the regular wal-fetch download path so candidate-ext fallback,
-    // decompression, and rate limits stay consistent
-    let res = super::fetch::handle(settings, storage, name, running).await;
+    // decompression, and rate limits stay consistent. Off: a prefetch must not
+    // recursively trigger more prefetch (wal-g's prefetchFile downloads direct)
+    let res = super::fetch::handle(
+        settings,
+        storage,
+        name,
+        running,
+        super::fetch::Prefetch::Off,
+    )
+    .await;
     match res {
         Ok(()) => fs::rename(running, ready)
             .await
@@ -119,6 +145,28 @@ async fn fetch_one(
         Err(e) => {
             let _ = fs::remove_file(running).await;
             Err(e)
+        }
+    }
+}
+
+/// Remove staged segments older than `current` (already replayed) from both the
+/// ready dir & `running/`, matching wal-g CleanupPrefetchDirectories. Entries
+/// that don't parse as a segment name (`running/` itself, `.history`) are left
+async fn cleanup_stale(pre: &Path, run: &Path, current: SegmentName) {
+    for dir in [pre, run] {
+        let mut rd = match fs::read_dir(dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let drop_it = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| SegmentName::parse(n).ok())
+                .is_some_and(|seg| seg < current);
+            if drop_it {
+                let _ = fs::remove_file(entry.path()).await;
+            }
         }
     }
 }
