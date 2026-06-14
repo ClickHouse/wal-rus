@@ -36,9 +36,9 @@ pub enum Cmd {
         seed: String,
         /// Path to PostgreSQL `pg_wal` directory
         pg_wal: PathBuf,
-        /// Number of segments to prefetch
-        #[arg(long, default_value_t = 8)]
-        count: u32,
+        /// Segments to prefetch (default: WALG_DOWNLOAD_CONCURRENCY, as wal-g)
+        #[arg(long)]
+        count: Option<u32>,
     },
     /// Print archived timelines, segment ranges, gaps, & known backups
     WalShow {
@@ -253,7 +253,7 @@ impl Cli {
             Cmd::WalFetch { name, dst } => {
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
-                wal::fetch::handle(&s, storage, &name, &dst).await
+                wal::fetch::handle(&s, storage, &name, &dst, wal::fetch::Prefetch::Fork).await
             }
             Cmd::WalPrefetch {
                 seed,
@@ -262,6 +262,7 @@ impl Cli {
             } => {
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
+                let count = count.unwrap_or(s.download_concurrency as u32);
                 wal::prefetch::handle(&s, storage, &seed, &pg_wal, count).await
             }
             Cmd::WalShow { json } => {

@@ -63,7 +63,7 @@ async fn push_fetch_zstd_roundtrip() {
     );
 
     let dst: PathBuf = restore.join(segment_name);
-    wal::fetch::handle(&s, store, segment_name, &dst)
+    wal::fetch::handle(&s, store, segment_name, &dst, wal::fetch::Prefetch::Off)
         .await
         .unwrap();
 
@@ -93,9 +93,15 @@ async fn push_fetch_uncompressed() {
     );
 
     let dst = dir.path().join("000000010000000000000002");
-    wal::fetch::handle(&s, store, "000000010000000000000002", &dst)
-        .await
-        .unwrap();
+    wal::fetch::handle(
+        &s,
+        store,
+        "000000010000000000000002",
+        &dst,
+        wal::fetch::Prefetch::Off,
+    )
+    .await
+    .unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), b"raw payload, not 16MB");
 }
 
@@ -224,13 +230,107 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
 
     // Now wal-fetch should promote the staged segment via rename
     let dst = pg_wal.join("000000010000000000000002");
-    walross::pg::wal::fetch::handle(&s, store, "000000010000000000000002", &dst)
-        .await
-        .unwrap();
+    walross::pg::wal::fetch::handle(
+        &s,
+        store,
+        "000000010000000000000002",
+        &dst,
+        wal::fetch::Prefetch::Off,
+    )
+    .await
+    .unwrap();
     assert!(dst.exists());
     assert!(
         !staged_2.exists(),
         "promotion must consume the staged file via rename"
+    );
+}
+
+#[tokio::test]
+async fn prefetch_cleans_stale_already_replayed_segments() {
+    use walross::pg::wal::prefetch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let pg_wal = dir.path().join("pg_wal");
+    std::fs::create_dir_all(&pg_wal).unwrap();
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
+
+    // segment 6 is what we prefetch forward from seed 5
+    let stage_dir = dir.path().join("stage");
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    let six = "000000010000000000000006";
+    let stage = stage_dir.join(six);
+    std::fs::write(&stage, six.as_bytes()).unwrap();
+    walross::pg::wal::push::handle(&s, store.clone(), &stage)
+        .await
+        .unwrap();
+
+    // leftover from an earlier replay point: a staged segment older than seed 5
+    let stale = prefetch::prefetched_path(&pg_wal, "000000010000000000000002");
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, b"stale").unwrap();
+
+    prefetch::handle(&s, store, "000000010000000000000005", &pg_wal, 1)
+        .await
+        .unwrap();
+
+    assert!(
+        !stale.exists(),
+        "cleanup must drop already-replayed staged segment"
+    );
+    assert!(
+        prefetch::prefetched_path(&pg_wal, six).exists(),
+        "segment after the seed must be staged"
+    );
+}
+
+#[tokio::test]
+async fn wal_fetch_triggers_in_process_prefetch() {
+    use std::time::Duration;
+    use walross::pg::wal::prefetch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let pg_wal = dir.path().join("pg_wal");
+    std::fs::create_dir_all(&pg_wal).unwrap();
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let mut s = settings_for(storage_dir.to_str().unwrap(), Method::None);
+    s.download_concurrency = 2; // >1 so wal-g's checkPrefetchPossible enables it
+
+    let stage_dir = dir.path().join("stage");
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    for hex in ["000000010000000000000001", "000000010000000000000002"] {
+        let stage = stage_dir.join(hex);
+        std::fs::write(&stage, hex.as_bytes()).unwrap();
+        walross::pg::wal::push::handle(&s, store.clone(), &stage)
+            .await
+            .unwrap();
+    }
+
+    let dst = pg_wal.join("000000010000000000000001");
+    wal::fetch::handle(
+        &s,
+        store,
+        "000000010000000000000001",
+        &dst,
+        wal::fetch::Prefetch::InProcess,
+    )
+    .await
+    .unwrap();
+    assert!(dst.exists());
+
+    // prefetch fires as a detached task; poll for the next segment to be staged
+    let staged_2 = prefetch::prefetched_path(&pg_wal, "000000010000000000000002");
+    let mut waited = Duration::ZERO;
+    while !staged_2.exists() && waited < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waited += Duration::from_millis(10);
+    }
+    assert!(
+        staged_2.exists(),
+        "wal-fetch should trigger in-process prefetch of the next segment"
     );
 }
 
@@ -426,9 +526,15 @@ async fn fetch_falls_back_to_uncompressed_when_zstd_missing() {
 
     let fetch_settings = settings_for(storage_dir.to_str().unwrap(), Method::Zstd);
     let dst = dir.path().join("restored");
-    wal::fetch::handle(&fetch_settings, store, "000000010000000000000003", &dst)
-        .await
-        .unwrap();
+    wal::fetch::handle(
+        &fetch_settings,
+        store,
+        "000000010000000000000003",
+        &dst,
+        wal::fetch::Prefetch::Off,
+    )
+    .await
+    .unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), b"hello world");
 }
 
@@ -472,7 +578,9 @@ async fn push_fetch_libsodium_encrypted_roundtrip() {
     assert_ne!(stored, raw, "ciphertext must differ from plaintext");
 
     let dst = restore.join(segment);
-    wal::fetch::handle(&s, store, segment, &dst).await.unwrap();
+    wal::fetch::handle(&s, store, segment, &dst, wal::fetch::Prefetch::Off)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), raw);
 }
 
@@ -503,9 +611,15 @@ async fn fetch_with_wrong_key_fails() {
     let mut fetch_settings = settings_for(storage_dir.to_str().unwrap(), Method::None);
     fetch_settings.crypter = Some(Arc::new(LibsodiumCrypter::new(bad_key)));
     let dst = dir.path().join("out");
-    let err = wal::fetch::handle(&fetch_settings, store, segment, &dst)
-        .await
-        .expect_err("must fail with wrong key");
+    let err = wal::fetch::handle(
+        &fetch_settings,
+        store,
+        segment,
+        &dst,
+        wal::fetch::Prefetch::Off,
+    )
+    .await
+    .expect_err("must fail with wrong key");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("libsodium") || msg.contains("corrupted") || msg.contains("pull"),

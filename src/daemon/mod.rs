@@ -85,7 +85,14 @@ async fn dispatch(
             if args.len() != 2 {
                 anyhow::bail!("wal-fetch expects 2 args, got {}", args.len());
             }
-            wal::fetch::handle(settings, storage.clone(), &args[0], Path::new(&args[1])).await
+            wal::fetch::handle(
+                settings,
+                storage.clone(),
+                &args[0],
+                Path::new(&args[1]),
+                wal::fetch::Prefetch::InProcess,
+            )
+            .await
         }
         other => anyhow::bail!("unsupported message type {other:?}"),
     }

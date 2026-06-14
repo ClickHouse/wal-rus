@@ -87,7 +87,9 @@ pub async fn handle(
         let task_name = name.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            let r = super::fetch::handle(&cfg, st, &task_name, &dst_path).await;
+            let r =
+                super::fetch::handle(&cfg, st, &task_name, &dst_path, super::fetch::Prefetch::Off)
+                    .await;
             (task_name, r)
         });
     }
