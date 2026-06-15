@@ -298,9 +298,8 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     );
 
     let cmd = format!(
-        "START_REPLICATION {}/{:X} TIMELINE {timeline}",
-        aligned >> 32,
-        aligned as u32
+        "START_REPLICATION {} TIMELINE {timeline}",
+        crate::pg::backup::format_pg_lsn(aligned)
     );
     conn.send_query(&cmd).await?;
     // START_REPLICATION returns CopyBothResponse ('W'), which postgres-
