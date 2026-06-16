@@ -26,6 +26,8 @@ use bytes::{Buf, Bytes, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::pg::backup::format_pg_lsn;
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("io: {0}")]
@@ -493,10 +495,6 @@ fn encode_error_response(tx: &mut BytesMut, code: &str, message: &str) {
     tx.extend_from_slice(message.as_bytes());
     tx.extend_from_slice(b"\0");
     tx.extend_from_slice(b"\0");
-}
-
-fn format_pg_lsn(lsn: u64) -> String {
-    format!("{:X}/{:X}", lsn >> 32, lsn as u32)
 }
 
 /// Decoded `'r'` standby status frame.

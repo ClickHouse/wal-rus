@@ -293,3 +293,96 @@ jobs:
             /tmp/walross-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
+
+  # Line-coverage baseline. Instruments the vm-test suite (tests/vm_live.rs)
+  # against a real PG 17 cluster under cargo-llvm-cov so PG-dependent library
+  # code is exercised, not just the unit tests. One major is enough for a
+  # baseline; the pg matrix proves cross-version behaviour separately. Uploads
+  # lcov.info + HTML; summary lands in the job log; fails on any 0%-coverage
+  # source file.
+  coverage:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov needs llvm-profdata + llvm-cov from this component.
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Instrumented builds differ from the other jobs'; isolate the cache.
+          key: coverage
+
+      - name: Install PostgreSQL 17
+        uses: ./.github/actions/install-pg
+        with:
+          pg-version: 17
+
+      # Single instrumented pass (--no-report); the report steps re-read the
+      # cached profdata to emit summary + lcov + html.
+      - name: Run instrumented vm-test suite (cargo llvm-cov)
+        env:
+          PG_VERSION: 17
+          PG_BIN: /usr/lib/postgresql/17/bin
+          # Unused by the cargo tests (they call library functions directly),
+          # but lib.sh requires it set; point at the build output.
+          WALROSS_BIN: ${{ github.workspace }}/target/debug/walross
+        run: |
+          cargo llvm-cov clean
+          scripts/ci/vm_test_cluster.sh \
+            cargo llvm-cov --no-report --features vm-test --locked -- --nocapture
+
+      - name: Coverage summary (job log)
+        run: cargo llvm-cov report --summary-only
+
+      - name: Coverage lcov.info
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Coverage HTML
+        run: cargo llvm-cov report --html
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            target/llvm-cov/html
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail on any 0%-coverage file
+        run: |
+          zero=$(awk '
+            /^SF:/ { f = substr($0, 4) }
+            /^LF:/ { lf = substr($0, 4) + 0 }
+            /^LH:/ {
+              if (substr($0, 4) + 0 == 0 && lf > 0) {
+                i = index(f, "/src/"); if (i) f = substr(f, i + 1)
+                print f
+              }
+            }
+          ' lcov.info)
+          if [ -n "$zero" ]; then
+            count=$(printf '%s\n' "$zero" | grep -c .)
+            echo "Files with 0% line coverage (every source file must be exercised by a test):"
+            printf '%s\n' "$zero" | sed 's/^/  /'
+            echo "::error::${count} file(s) have 0% line coverage"
+            exit 1
+          fi
+          echo "OK: all instrumented files have >0% line coverage."
+
+      - name: Collect PG logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-coverage
+          path: |
+            /tmp/walross-ci-*/**/*.log
+            /tmp/walross-ci-*/**/log/*
+          if-no-files-found: ignore
+          retention-days: 14

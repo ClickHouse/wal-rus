@@ -447,12 +447,33 @@ mod tests {
             parse_pg_lsn("2/3000000").unwrap(),
             (2u64 << 32) | 0x0300_0000
         );
+        // high word > 10: hex parse must not collapse to decimal
+        assert_eq!(parse_pg_lsn("2A/16").unwrap(), (0x2A_u64 << 32) | 0x16);
+        assert_eq!(parse_pg_lsn("FF/FF").unwrap(), (0xFF_u64 << 32) | 0xFF);
     }
 
     #[test]
     fn formats_lsn_uppercase() {
         assert_eq!(format_pg_lsn(0x0300_0000), "0/3000000");
         assert_eq!(format_pg_lsn((2u64 << 32) | 0xab), "2/AB");
+        // high word > 10 separates hex from decimal: "2A" vs decimal "42"
+        assert_eq!(format_pg_lsn((0x2A_u64 << 32) | 0x16), "2A/16");
+        assert_eq!(format_pg_lsn((0xFF_u64 << 32) | 0xFF), "FF/FF");
+        assert_eq!(format_pg_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+    }
+
+    #[test]
+    fn lsn_format_parse_round_trip() {
+        for lsn in [
+            0,
+            0x0300_0000,
+            (2u64 << 32) | 0xab,
+            (0x2A_u64 << 32) | 0x16,
+            (0xA_u64 << 32) | 0xDEAD_BEEF,
+            u64::MAX,
+        ] {
+            assert_eq!(parse_pg_lsn(&format_pg_lsn(lsn)).unwrap(), lsn);
+        }
     }
 
     #[test]

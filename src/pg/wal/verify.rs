@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::cli::WalVerifyOp;
 use crate::pg::backup::list as backup_list;
-use crate::pg::backup::parse_timeline_from_backup_name;
+use crate::pg::backup::{format_pg_lsn, parse_timeline_from_backup_name};
 use crate::pg::wal::show::{self, GapInfo};
 use crate::storage::DynStorage;
 
@@ -163,9 +163,7 @@ fn print_integrity(r: &IntegrityReport) {
         println!(
             "  backup: {name} timeline={} start_lsn={}",
             r.timeline,
-            r.start_lsn
-                .map(|l| format!("{:X}/{:X}", l >> 32, l as u32))
-                .unwrap_or_else(|| "-".into())
+            r.start_lsn.map(format_pg_lsn).unwrap_or_else(|| "-".into())
         );
     }
     for g in &r.gaps {

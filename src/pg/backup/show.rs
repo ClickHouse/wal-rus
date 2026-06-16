@@ -9,7 +9,7 @@ use crate::compression::AsyncReader;
 use crate::pg::backup::{
     BackupSentinelDtoV2, FilesMetadataDto,
     fetch::{fetch_sentinel, resolve_name},
-    files_metadata_key, load_json, name_from_sentinel_key, sentinel_key,
+    files_metadata_key, format_pg_lsn, load_json, name_from_sentinel_key, sentinel_key,
 };
 use crate::storage::DynStorage;
 
@@ -152,14 +152,14 @@ fn print_plain(name: &str, s: &BackupSentinelDtoV2, files: Option<&FilesMetadata
         "start_lsn         {}",
         s.sentinel
             .backup_start_lsn
-            .map(crate::pg::backup::format_pg_lsn)
+            .map(format_pg_lsn)
             .unwrap_or_else(|| "-".into())
     );
     println!(
         "finish_lsn        {}",
         s.sentinel
             .backup_finish_lsn
-            .map(crate::pg::backup::format_pg_lsn)
+            .map(format_pg_lsn)
             .unwrap_or_else(|| "-".into())
     );
     println!("uncompressed_size {}", s.sentinel.uncompressed_size);
