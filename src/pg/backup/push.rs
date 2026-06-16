@@ -31,8 +31,8 @@ use crate::pg::backup::tar_streamer::{self, DeltaContext, StreamerOpts, tablespa
 use crate::pg::backup::{
     BACKUP_NAME_PREFIX, BackupSentinelDto, BackupSentinelDtoV2, ExtendedMetadataDto,
     FileDescription, FilesMetadataDto, METADATA_DATETIME_FORMAT, TablespaceSpec,
-    files_metadata_key, format_backup_name, metadata_key, sentinel_key, tar_part_key,
-    tar_partitions_prefix,
+    files_metadata_key, format_backup_name, format_pg_lsn, metadata_key, sentinel_key,
+    tar_part_key, tar_partitions_prefix,
 };
 use crate::pg::replication::PgConfig;
 use crate::pg::replication::base_backup::{
@@ -85,11 +85,10 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     if let Some(p) = parent.as_ref() {
         tracing::info!(
             target = "backup_push",
-            "delta parent {} (count={}, start_lsn={:X}/{:X}, format={:?})",
+            "delta parent {} (count={}, start_lsn={}, format={:?})",
             p.name,
             p.increment_count,
-            p.start_lsn >> 32,
-            p.start_lsn as u32,
+            format_pg_lsn(p.start_lsn),
             increment_format,
         );
     }
@@ -200,9 +199,8 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                 backup_name = Some(resolved_name);
                 tracing::info!(
                     target = "backup_push",
-                    "BASE_BACKUP started: lsn={:X}/{:X} timeline={} tablespaces={}",
-                    info.start_lsn >> 32,
-                    info.start_lsn as u32,
+                    "BASE_BACKUP started: lsn={} timeline={} tablespaces={}",
+                    format_pg_lsn(info.start_lsn),
                     info.timeline,
                     info.tablespaces.len()
                 );
@@ -386,9 +384,8 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                 end_lsn = Some(info.end_lsn);
                 tracing::info!(
                     target = "backup_push",
-                    "BASE_BACKUP finished at {:X}/{:X}",
-                    info.end_lsn >> 32,
-                    info.end_lsn as u32
+                    "BASE_BACKUP finished at {}",
+                    format_pg_lsn(info.end_lsn)
                 );
             }
         }
