@@ -432,3 +432,48 @@ impl Cli {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    fn worker_threads_of(args: &[&str]) -> usize {
+        Cli::parse_from(args).worker_threads().unwrap()
+    }
+
+    #[test]
+    fn explicit_threads_override_per_command_default() {
+        assert_eq!(
+            worker_threads_of(&["walross", "--threads", "3", "wal-show"]),
+            3
+        );
+    }
+
+    #[test]
+    fn default_commands_stay_single_threaded() {
+        assert_eq!(worker_threads_of(&["walross", "wal-show"]), 1);
+        assert_eq!(
+            worker_threads_of(&["walross", "wal-fetch", "seg", "/dst"]),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_commands_scale_with_cores() {
+        // min(cores, concurrency-from-env); both factors are >=1
+        for args in [
+            vec!["walross", "backup-push"],
+            vec!["walross", "backup-fetch", "LATEST", "/dst"],
+            vec!["walross", "wal-prefetch", "seg", "/pg_wal"],
+            vec!["walross", "wal-restore", "/dst"],
+        ] {
+            assert!(worker_threads_of(&args) >= 1);
+        }
+    }
+}

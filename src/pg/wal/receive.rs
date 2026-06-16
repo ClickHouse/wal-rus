@@ -30,6 +30,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::config::Settings;
+use crate::pg::backup::format_pg_lsn;
 use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
 use crate::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use crate::pg::wal::push;
@@ -290,16 +291,14 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     let aligned = start_lsn - (start_lsn % seg_size);
     tracing::info!(
         target = "wal_receive",
-        "system={sysid} timeline={timeline} start_lsn={:X}/{:X} (aligned={:X}/{:X})",
-        start_lsn >> 32,
-        start_lsn as u32,
-        aligned >> 32,
-        aligned as u32,
+        "system={sysid} timeline={timeline} start_lsn={} (aligned={})",
+        format_pg_lsn(start_lsn),
+        format_pg_lsn(aligned),
     );
 
     let cmd = format!(
         "START_REPLICATION {} TIMELINE {timeline}",
-        crate::pg::backup::format_pg_lsn(aligned)
+        format_pg_lsn(aligned)
     );
     conn.send_query(&cmd).await?;
     // START_REPLICATION returns CopyBothResponse ('W'), which postgres-

@@ -14,7 +14,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::pg::WAL_FOLDER;
 use crate::pg::backup::list as backup_list;
-use crate::pg::backup::parse_timeline_from_backup_name;
+use crate::pg::backup::{format_pg_lsn, parse_timeline_from_backup_name};
 use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 use crate::pg::wal::segment_file::classify_segment_name;
 use crate::storage::DynStorage;
@@ -189,13 +189,10 @@ fn print_plain(timelines: &[TimelineInfo]) {
             println!("  gap: {} -> {} (missing {})", g.from, g.to, g.missing);
         }
         for b in &t.backups {
-            let start = b
-                .start_lsn
-                .map(|l| format!("{:X}/{:X}", l >> 32, l as u32))
-                .unwrap_or_else(|| "-".into());
+            let start = b.start_lsn.map(format_pg_lsn).unwrap_or_else(|| "-".into());
             let finish = b
                 .finish_lsn
-                .map(|l| format!("{:X}/{:X}", l >> 32, l as u32))
+                .map(format_pg_lsn)
                 .unwrap_or_else(|| "-".into());
             println!("  backup: {} start={} finish={}", b.name, start, finish);
         }
