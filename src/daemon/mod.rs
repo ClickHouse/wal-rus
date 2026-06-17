@@ -53,18 +53,22 @@ async fn handle_conn(
     settings: Arc<Settings>,
     storage: DynStorage,
 ) -> Result<()> {
-    let (msg_type, body) = read_message(&mut stream).await?;
-    let result = dispatch(msg_type, body, &settings, &storage).await;
-    let resp = match &result {
-        Ok(_) => MessageType::Ok,
-        Err(e) => {
-            tracing::error!("op {msg_type:?} failed: {e:#}");
-            MessageType::Error
+    while let Ok((msg_type, body)) = read_message(&mut stream).await {
+        let result = dispatch(msg_type, body, &settings, &storage).await;
+        let resp = match &result {
+            Ok(_) => MessageType::Ok,
+            Err(e) => {
+                tracing::error!("op {msg_type:?} failed: {e:#}");
+                MessageType::Error
+            }
+        };
+        write_message(&mut stream, resp, &[]).await?;
+        if matches!(msg_type, MessageType::WalPush | MessageType::WalFetch) {
+            break;
         }
-    };
-    write_message(&mut stream, resp, &[]).await?;
+    }
     stream.shutdown().await.ok();
-    result
+    Ok(())
 }
 
 async fn dispatch(
