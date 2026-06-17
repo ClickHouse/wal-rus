@@ -575,7 +575,7 @@ pub enum ExtractError {
 /// Flatten the block-locations referenced by a slice of records.
 /// Equivalent to wal-g's `ExtractBlockLocations`
 pub fn extract_block_locations(records: &[XLogRecord<'_>]) -> Vec<BlockLocation> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(records.iter().map(|r| r.blocks.len()).sum());
     for r in records {
         if r.is_zero() {
             continue;
