@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod protocol;
+mod uploader;
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ use crate::pg::wal;
 use crate::storage::DynStorage;
 
 use protocol::{MessageType, parse_args, read_message, write_message};
+use uploader::Uploader;
 
 pub async fn serve(socket: &Path, settings: Settings, storage: DynStorage) -> Result<()> {
     if socket.exists() {
@@ -34,35 +36,33 @@ pub async fn serve(socket: &Path, settings: Settings, storage: DynStorage) -> Re
         UnixListener::bind(socket).with_context(|| format!("bind {}", socket.display()))?;
     tracing::info!("daemon listening on {}", socket.display());
 
-    let settings = Arc::new(settings);
+    // One standing uploader shared across connections holds the look-ahead
+    // pool + in-process bookkeeping (see uploader.rs)
+    let uploader = Arc::new(Uploader::new(Arc::new(settings), storage));
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let s = settings.clone();
-        let st = storage.clone();
+        let up = uploader.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, s, st).await {
+            if let Err(e) = handle_conn(stream, up).await {
                 tracing::error!("daemon conn: {e:#}");
             }
         });
     }
 }
 
-async fn handle_conn(
-    mut stream: UnixStream,
-    settings: Arc<Settings>,
-    storage: DynStorage,
-) -> Result<()> {
+async fn handle_conn(mut stream: UnixStream, uploader: Arc<Uploader>) -> Result<()> {
     while let Ok((msg_type, body)) = read_message(&mut stream).await {
-        let resp = match dispatch(msg_type, body, &settings, &storage).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("op {msg_type:?} failed: {e:#}");
-                MessageType::Error
-            }
-        };
+        let result = dispatch(msg_type, body, &uploader).await;
+        let errored = result.is_err();
+        let resp = result.unwrap_or_else(|e| {
+            tracing::error!("op {msg_type:?} failed: {e:#}");
+            MessageType::Error
+        });
         write_message(&mut stream, resp, &[]).await?;
-        if matches!(msg_type, MessageType::WalPush | MessageType::WalFetch) {
+        // wal-g's ProcessConnection closes on any handler error and after the
+        // terminal WalPush/WalFetch; only a successful Check loops for more
+        if errored || matches!(msg_type, MessageType::WalPush | MessageType::WalFetch) {
             break;
         }
     }
@@ -73,15 +73,14 @@ async fn handle_conn(
 async fn dispatch(
     msg_type: MessageType,
     body: Vec<u8>,
-    settings: &Settings,
-    storage: &DynStorage,
+    uploader: &Arc<Uploader>,
 ) -> Result<MessageType> {
     match msg_type {
         MessageType::Check => Ok(MessageType::Ok),
         MessageType::WalPush => {
             let arg = single_arg(&body)?;
             let path = PathBuf::from(arg);
-            wal::push::handle(settings, storage.clone(), &path).await?;
+            uploader.wal_push(&path).await?;
             Ok(MessageType::Ok)
         }
         MessageType::WalFetch => {
@@ -90,8 +89,8 @@ async fn dispatch(
                 anyhow::bail!("wal-fetch expects 2 args, got {}", args.len());
             }
             match wal::fetch::handle(
-                settings,
-                storage.clone(),
+                uploader.settings(),
+                uploader.storage(),
                 &args[0],
                 Path::new(&args[1]),
                 wal::fetch::Prefetch::InProcess,

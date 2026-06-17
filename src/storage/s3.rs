@@ -184,6 +184,16 @@ impl S3Storage {
         Ok(())
     }
 
+    /// Single PUT retrying transients in place; `body` is buffered so replayable,
+    /// matching multipart's per-part retry
+    async fn put_single_retrying(&self, key: &str, body: Bytes) -> Result<()> {
+        with_retry(&self.retry_policy, StorageError::is_transient, || {
+            let body = body.clone();
+            async move { self.put_single(key, body).await }
+        })
+        .await
+    }
+
     async fn put_multipart(&self, key: &str, mut body: AsyncReader) -> Result<()> {
         // initiate
         let init_resp = self
@@ -333,11 +343,11 @@ impl Storage for S3Storage {
 
     async fn put(&self, key: &str, mut body: AsyncReader, size_hint: Option<u64>) -> Result<()> {
         match size_hint {
-            // known small: buffer & single PUT
+            // known small: buffer & single PUT, retrying transients in place
             Some(s) if s <= MULTIPART_THRESHOLD => {
-                let mut buf = Vec::new();
+                let mut buf = Vec::with_capacity(s as usize);
                 body.read_to_end(&mut buf).await?;
-                self.put_single(key, Bytes::from(buf)).await
+                self.put_single_retrying(key, Bytes::from(buf)).await
             }
             // known large: stream to multipart
             Some(_) => self.put_multipart(key, body).await,
@@ -352,14 +362,7 @@ impl Storage for S3Storage {
                 let mut buf = Vec::new();
                 limited.read_to_end(&mut buf).await?;
                 if buf.len() <= limit {
-                    // buffered body is replayable: retry transients in place,
-                    // matching multipart's per-part retry
-                    let bytes = Bytes::from(buf);
-                    with_retry(&self.retry_policy, StorageError::is_transient, || {
-                        let bytes = bytes.clone();
-                        async move { self.put_single(key, bytes).await }
-                    })
-                    .await
+                    self.put_single_retrying(key, Bytes::from(buf)).await
                 } else {
                     // overflow: prepend buffered prefix to the unread remainder
                     let combined = Cursor::new(buf).chain(limited.into_inner());
