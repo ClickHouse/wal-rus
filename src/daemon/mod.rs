@@ -54,9 +54,8 @@ async fn handle_conn(
     storage: DynStorage,
 ) -> Result<()> {
     while let Ok((msg_type, body)) = read_message(&mut stream).await {
-        let result = dispatch(msg_type, body, &settings, &storage).await;
-        let resp = match &result {
-            Ok(_) => MessageType::Ok,
+        let resp = match dispatch(msg_type, body, &settings, &storage).await {
+            Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("op {msg_type:?} failed: {e:#}");
                 MessageType::Error
@@ -76,20 +75,21 @@ async fn dispatch(
     body: Vec<u8>,
     settings: &Settings,
     storage: &DynStorage,
-) -> Result<()> {
+) -> Result<MessageType> {
     match msg_type {
-        MessageType::Check => Ok(()),
+        MessageType::Check => Ok(MessageType::Ok),
         MessageType::WalPush => {
             let arg = single_arg(&body)?;
             let path = PathBuf::from(arg);
-            wal::push::handle(settings, storage.clone(), &path).await
+            wal::push::handle(settings, storage.clone(), &path).await?;
+            Ok(MessageType::Ok)
         }
         MessageType::WalFetch => {
             let args = parse_args(&body)?;
             if args.len() != 2 {
                 anyhow::bail!("wal-fetch expects 2 args, got {}", args.len());
             }
-            wal::fetch::handle(
+            match wal::fetch::handle(
                 settings,
                 storage.clone(),
                 &args[0],
@@ -97,6 +97,13 @@ async fn dispatch(
                 wal::fetch::Prefetch::InProcess,
             )
             .await
+            {
+                Ok(()) => Ok(MessageType::Ok),
+                Err(e) if e.downcast_ref::<wal::fetch::ArchiveNotFound>().is_some() => {
+                    Ok(MessageType::ArchiveNonExistence)
+                }
+                Err(e) => Err(e),
+            }
         }
         other => anyhow::bail!("unsupported message type {other:?}"),
     }

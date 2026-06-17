@@ -6,6 +6,7 @@
 //! AWS_REGION (default us-east-1), AWS_ENDPOINT_URL or WALG_S3_ENDPOINT,
 //! WALG_S3_FORCE_PATH_STYLE
 
+use std::io::Cursor;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -331,18 +332,40 @@ impl Storage for S3Storage {
     }
 
     async fn put(&self, key: &str, mut body: AsyncReader, size_hint: Option<u64>) -> Result<()> {
-        let single = match size_hint {
-            Some(s) if s <= MULTIPART_THRESHOLD => true,
-            None => false,
-            _ => false,
-        };
-        if single {
-            // small known-size body: buffer & single PUT
-            let mut buf = Vec::new();
-            body.read_to_end(&mut buf).await?;
-            self.put_single(key, Bytes::from(buf)).await
-        } else {
-            self.put_multipart(key, body).await
+        match size_hint {
+            // known small: buffer & single PUT
+            Some(s) if s <= MULTIPART_THRESHOLD => {
+                let mut buf = Vec::new();
+                body.read_to_end(&mut buf).await?;
+                self.put_single(key, Bytes::from(buf)).await
+            }
+            // known large: stream to multipart
+            Some(_) => self.put_multipart(key, body).await,
+            // unknown size (compressed/encrypted WAL, tar parts): buffer up to
+            // the multipart threshold. Bodies under it, every WAL segment since
+            // 16 MiB raw compresses smaller, go out as one PUT with a known
+            // Content-Length instead of multipart's create/upload/complete trio.
+            // Read one past the cap to tell a fitting EOF from overflow.
+            None => {
+                let limit = MULTIPART_THRESHOLD as usize;
+                let mut limited = body.take(limit as u64 + 1);
+                let mut buf = Vec::new();
+                limited.read_to_end(&mut buf).await?;
+                if buf.len() <= limit {
+                    // buffered body is replayable: retry transients in place,
+                    // matching multipart's per-part retry
+                    let bytes = Bytes::from(buf);
+                    with_retry(&self.retry_policy, StorageError::is_transient, || {
+                        let bytes = bytes.clone();
+                        async move { self.put_single(key, bytes).await }
+                    })
+                    .await
+                } else {
+                    // overflow: prepend buffered prefix to the unread remainder
+                    let combined = Cursor::new(buf).chain(limited.into_inner());
+                    self.put_multipart(key, Box::pin(combined)).await
+                }
+            }
         }
     }
 
@@ -384,12 +407,13 @@ impl Storage for S3Storage {
                     base: base.clone(),
                     retry_policy,
                 };
-                let mut q: Vec<(&str, &str)> =
-                    vec![("list-type", "2"), ("prefix", prefix.as_str())];
-                if !token.is_empty() {
-                    q.push(("continuation-token", token.as_str()));
-                }
-                let resp = match s.signed_request("GET", "", &q, Bytes::new(), &[]).await {
+                let q: [(&str, &str); _] = [
+                    ("list-type", "2"),
+                    ("prefix", prefix.as_str()),
+                    ("continuation-token", token.as_str()),
+                ];
+                let q = if token.is_empty() { &q[..2] } else { &q[..] };
+                let resp = match s.signed_request("GET", "", q, Bytes::new(), &[]).await {
                     Ok(r) => r,
                     Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
                 };
