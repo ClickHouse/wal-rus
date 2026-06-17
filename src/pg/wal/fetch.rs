@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -34,6 +34,12 @@ pub enum Prefetch {
     InProcess,
 }
 
+/// WAL segment absent from storage; daemon maps to ArchiveNonExistence ('N')
+/// response, mirroring wal-g's ArchiveNonExistenceError
+#[derive(Debug, thiserror::Error)]
+#[error("WAL {0} not found in storage")]
+pub struct ArchiveNotFound(pub String);
+
 pub async fn handle(
     settings: &Settings,
     storage: DynStorage,
@@ -54,7 +60,7 @@ pub async fn handle(
 
     let (key, method) = match find_object(storage.as_ref(), name, preferred).await? {
         Some(p) => p,
-        None => return Err(anyhow!("WAL {name} not found in storage")),
+        None => return Err(ArchiveNotFound(name.to_string()).into()),
     };
 
     let body = storage
