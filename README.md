@@ -11,7 +11,7 @@ no-overcommit hosts (streaming I/O, no full-segment buffering).
 
 ## Compression
 
-`none`, `zstd`, `brotli`, `lz4`, `lzma`
+`none`, `zstd`, `brotli`, `lz4`, `lzma`, `gzip`
 
 ## Commands
 
