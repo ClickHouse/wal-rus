@@ -3,6 +3,7 @@ pub mod compression;
 pub mod config;
 pub mod crypto;
 pub mod daemon;
+pub mod log;
 pub mod pg;
 pub mod retry;
 pub mod storage;

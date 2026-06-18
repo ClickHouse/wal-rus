@@ -65,7 +65,10 @@ async fn daemon_check_and_wal_roundtrip() {
 
     wait_for_socket(&socket).await;
 
-    walross::daemon::client::run(&socket, DaemonOp::Check)
+    let op_to = Duration::from_secs(60);
+    let conn_to = Duration::from_secs(5);
+
+    walross::daemon::client::run(&socket, DaemonOp::Check, op_to, conn_to)
         .await
         .unwrap();
 
@@ -74,6 +77,8 @@ async fn daemon_check_and_wal_roundtrip() {
         DaemonOp::WalPush {
             wal_filepath: src.clone(),
         },
+        op_to,
+        conn_to,
     )
     .await
     .unwrap();
@@ -85,6 +90,8 @@ async fn daemon_check_and_wal_roundtrip() {
             name: segment.into(),
             dst: dst.clone(),
         },
+        op_to,
+        conn_to,
     )
     .await
     .unwrap();
@@ -130,6 +137,31 @@ async fn daemon_closes_connection_on_handler_error() {
         read_message(&mut stream).await.is_err(),
         "connection should be closed after handler error"
     );
+
+    server.abort();
+}
+
+/// Client operation timeout fires when the daemon accepts but never replies
+#[tokio::test]
+async fn client_operation_timeout_fires() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("slow.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        // accept then hold the connection open without ever responding
+        let (_s, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+
+    let err = walross::daemon::client::run(
+        &socket,
+        DaemonOp::Check,
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "got: {err}");
 
     server.abort();
 }

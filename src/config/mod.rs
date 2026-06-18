@@ -1,6 +1,7 @@
 //! Config loading from env, mirroring wal-g WALG_/AWS_/GOOGLE_ vars
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -354,6 +355,64 @@ pub fn download_concurrency_from_env() -> Result<usize> {
     Ok(parse_env_int("WALG_DOWNLOAD_CONCURRENCY", 4)?.max(1) as usize)
 }
 
+/// Parse a Go-style duration (`time.ParseDuration`): one or more
+/// `<number><unit>` segments, units ns/us/µs/ms/s/m/h, e.g. `60s`, `1h30m`,
+/// `300ms`. `0` is the only unitless value. Used for `WALG_*_TIMEOUT` env +
+/// daemon-client flags so values stay copy-paste compatible with wal-g.
+/// Returns a `String` error so it doubles as a clap `value_parser`
+pub fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("empty duration".into());
+    }
+    if t == "0" {
+        return Ok(Duration::ZERO);
+    }
+    let mut rest = t;
+    let mut total = Duration::ZERO;
+    let mut saw_unit = false;
+    while !rest.is_empty() {
+        let num_end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        if num_end == 0 {
+            return Err(format!("invalid duration {s:?}: expected number"));
+        }
+        let value: f64 = rest[..num_end]
+            .parse()
+            .map_err(|_| format!("invalid duration {s:?}: bad number {:?}", &rest[..num_end]))?;
+        rest = &rest[num_end..];
+        let unit_end = rest
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let scale_ns: f64 = match &rest[..unit_end] {
+            "ns" => 1.0,
+            "us" => 1e3,
+            "ms" => 1e6,
+            "s" => 1e9,
+            "m" => 60e9,
+            "h" => 3600e9,
+            "" => return Err(format!("invalid duration {s:?}: missing unit")),
+            other => return Err(format!("invalid duration {s:?}: unknown unit {other:?}")),
+        };
+        total += Duration::from_nanos((value * scale_ns) as u64);
+        saw_unit = true;
+        rest = &rest[unit_end..];
+    }
+    if !saw_unit {
+        return Err(format!("invalid duration {s:?}"));
+    }
+    Ok(total)
+}
+
+/// Read a Go-style duration env var, falling back to `default` when unset
+pub fn duration_env(key: &str, default: Duration) -> Result<Duration> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(v) => parse_duration(&v).map_err(|e| anyhow!("{key}: {e}")),
+    }
+}
+
 fn parse_env_int(key: &str, default: i64) -> Result<i64> {
     match std::env::var(key) {
         Err(_) => Ok(default),
@@ -483,6 +542,24 @@ mod tests {
             let _g = EnvGuard::new(&[(key, None)]);
             assert!(parse_env_bool(key, true).unwrap());
             assert!(!parse_env_bool(key, false).unwrap());
+        }
+    }
+
+    #[test]
+    fn parse_duration_units_and_compounds() {
+        assert_eq!(parse_duration("60s").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("300ms").unwrap(), Duration::from_millis(300));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("500us").unwrap(), Duration::from_micros(500));
+        assert_eq!(parse_duration("100ns").unwrap(), Duration::from_nanos(100));
+        for bad in ["", "abc", "10", "5sec", "-5s", "s", "1x"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should not parse");
         }
     }
 

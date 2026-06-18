@@ -48,7 +48,6 @@ the bump PR, not master).
 | OpenPGP (`WALG_PGP_*`) | hard error at startup, never silently plaintext; re-encrypt to libsodium when migrating (see DESIGN.md for rationale) |
 | Backends | `file://`, `s3://`, `gs://` only; no azure / oss / swift / sh |
 | statsd (`WALG_STATSD_*`) | not implemented |
-| Daemon WAL-upload timeout (`WALG_DAEMON_WAL_UPLOAD_TIMEOUT`) | not implemented; bounded in-flight concurrency, per-request HTTP timeout and retry policy bound foreground wal-push latency instead |
 | catchup-push / -fetch / -send / -receive / -list | not implemented |
 | Windows | non-goal |
 | Other databases (mongo, mysql, redis, …) | non-goal, Postgres only |
