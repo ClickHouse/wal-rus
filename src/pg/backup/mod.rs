@@ -325,6 +325,15 @@ pub struct BackupSentinelDto {
         skip_serializing_if = "Option::is_none"
     )]
     pub increment_count: Option<i32>,
+    /// Wire format of this backup's increment files. Omitted (= `Wi1`) for
+    /// full backups & wal-g-compatible `wi1` deltas; present only for native.
+    /// Absent on read defaults to `Wi1` (wal-g & pre-field walross sentinels)
+    #[serde(
+        rename = "IncrementFormat",
+        default,
+        skip_serializing_if = "is_default"
+    )]
+    pub increment_format: increment::Format,
 
     #[serde(rename = "PgVersion", default)]
     pub pg_version: i32,
@@ -421,6 +430,10 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    v == &T::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +516,7 @@ mod tests {
             increment_from: None,
             increment_full_name: None,
             increment_count: None,
+            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(0x0300_1000),
             system_identifier: Some(7000000000000000000),
@@ -524,6 +538,49 @@ mod tests {
         let back: BackupSentinelDto = serde_json::from_str(&j).unwrap();
         assert_eq!(back.backup_start_lsn, Some(0x0300_0000));
         assert_eq!(back.system_identifier, Some(7000000000000000000));
+    }
+
+    #[test]
+    fn increment_format_sentinel_field() {
+        use increment::Format;
+        let mut s = BackupSentinelDto {
+            backup_start_lsn: Some(1),
+            increment_from_lsn: Some(0),
+            increment_from: Some("base_x".into()),
+            increment_full_name: Some("base_x".into()),
+            increment_count: Some(1),
+            increment_format: Format::Native,
+            pg_version: 170000,
+            backup_finish_lsn: Some(2),
+            system_identifier: None,
+            uncompressed_size: 0,
+            compressed_size: 0,
+            data_catalog_size: 0,
+            user_data: None,
+            files_metadata_disabled: false,
+            tablespace_spec: None,
+            backup_start_chkp_num: None,
+            increment_from_chkp_num: None,
+        };
+        // Native deltas record the format
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"IncrementFormat\":\"native\""), "{j}");
+
+        // wi1 (default) omits the field — wal-g-compatible sentinel
+        s.increment_format = Format::Wi1;
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(!j.contains("IncrementFormat"), "{j}");
+
+        // Absent field reads as wi1 (wal-g & pre-field walross sentinels)
+        let back: BackupSentinelDto = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.increment_format, Format::Wi1);
+
+        // Explicit native parses back
+        let back: BackupSentinelDto = serde_json::from_str(
+            r#"{"IncrementFormat":"native","UncompressedSize":0,"CompressedSize":0}"#,
+        )
+        .unwrap();
+        assert_eq!(back.increment_format, Format::Native);
     }
 
     #[test]
@@ -553,6 +610,7 @@ mod tests {
                 increment_from: None,
                 increment_full_name: None,
                 increment_count: None,
+                increment_format: Default::default(),
                 pg_version: 160003,
                 backup_finish_lsn: Some(2),
                 system_identifier: None,

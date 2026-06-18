@@ -469,6 +469,7 @@ async fn wal_verify_integrity_detects_gap_after_backup() {
             increment_from: None,
             increment_full_name: None,
             increment_count: None,
+            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(seg_size + 16),
             system_identifier: Some(1),

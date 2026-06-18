@@ -30,7 +30,7 @@ use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
 use crate::pg::backup::fetch::fetch_sentinel;
-use crate::pg::backup::{BackupSentinelDtoV2, name_from_sentinel_key};
+use crate::pg::backup::{BackupSentinelDtoV2, increment, name_from_sentinel_key};
 use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 use crate::pg::walparser::{
     BlockLocation, ParsePageError, RelFileNode, WalParser, extract_locations_from_wal_file,
@@ -272,6 +272,9 @@ pub struct PrevBackupInfo {
     pub is_permanent: bool,
     pub system_identifier: Option<u64>,
     pub user_data: Option<serde_json::Value>,
+    /// Increment format of the parent when it is itself a delta; `None` for a
+    /// full parent. A new delta must match this (chains can't mix wi1 & native)
+    pub parent_increment_format: Option<increment::Format>,
 }
 
 /// Configure delta vs full at the start of backup-push. Mirrors wal-g's
@@ -365,6 +368,13 @@ pub async fn configure_delta_parent(
         is_permanent: effective_v2.is_permanent,
         system_identifier: effective_v2.sentinel.system_identifier,
         user_data: effective_v2.sentinel.user_data.clone(),
+        // Constrain format only when the parent is itself a delta; a full
+        // parent starts a fresh chain that may pick either format
+        parent_increment_format: effective_v2
+            .sentinel
+            .increment_from
+            .as_ref()
+            .map(|_| effective_v2.sentinel.increment_format),
     };
     Ok(Some(info))
 }
@@ -528,6 +538,79 @@ async fn fetch_and_parse_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn delta_parent_carries_increment_format() {
+        use crate::config::DeltaSettings;
+        use crate::pg::backup::{
+            BackupSentinelDto, METADATA_DATETIME_FORMAT, format_backup_name, sentinel_key,
+        };
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg = DEFAULT_WAL_SEG_SIZE;
+        let ts = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let sentinel = |from: Option<&str>, fmt: increment::Format| BackupSentinelDtoV2 {
+            sentinel: BackupSentinelDto {
+                backup_start_lsn: Some(seg),
+                increment_from_lsn: from.map(|_| seg / 2),
+                increment_from: from.map(String::from),
+                increment_full_name: from.map(String::from),
+                increment_count: from.map(|_| 1),
+                increment_format: fmt,
+                pg_version: 170000,
+                backup_finish_lsn: Some(seg + 1),
+                system_identifier: None,
+                uncompressed_size: 0,
+                compressed_size: 0,
+                data_catalog_size: 0,
+                user_data: None,
+                files_metadata_disabled: true,
+                tablespace_spec: None,
+                backup_start_chkp_num: Some(0),
+                increment_from_chkp_num: None,
+            },
+            version: 2,
+            start_time: ts,
+            finish_time: ts,
+            date_fmt: METADATA_DATETIME_FORMAT.into(),
+            hostname: "h".into(),
+            data_dir: "/d".into(),
+            is_permanent: false,
+        };
+
+        // Parent is itself a delta → its format constrains the new push
+        let probe = |v2: BackupSentinelDtoV2| async move {
+            let delta = DeltaSettings {
+                max_steps: 5,
+                ..Default::default()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+            let name = format_backup_name(1, seg, seg);
+            let body = serde_json::to_vec(&v2).unwrap();
+            let len = body.len() as u64;
+            let r: crate::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
+            storage.put(&sentinel_key(&name), r, Some(len)).await.unwrap();
+            configure_delta_parent(&storage, &delta, false)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        let from_delta = probe(sentinel(Some("base_root"), increment::Format::Native)).await;
+        assert_eq!(
+            from_delta.parent_increment_format,
+            Some(increment::Format::Native)
+        );
+
+        // Full parent starts a fresh chain → no format constraint
+        let from_full = probe(sentinel(None, increment::Format::Wi1)).await;
+        assert_eq!(from_full.parent_increment_format, None);
+    }
 
     #[test]
     fn parse_default_tablespace_path() {

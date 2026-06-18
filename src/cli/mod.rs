@@ -11,6 +11,25 @@ use crate::config::Settings;
 use crate::pg::backup;
 use crate::pg::wal;
 
+/// `--increment-format`: delta file wire format. wal-g restores only `wi1`;
+/// `native` (PG17 INCREMENTAL) restores via pg_combinebackup, not wal-g
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum IncrementFormatArg {
+    #[value(name = "wi1")]
+    Wi1,
+    #[value(name = "native")]
+    Native,
+}
+
+impl From<IncrementFormatArg> for backup::increment::Format {
+    fn from(f: IncrementFormatArg) -> Self {
+        match f {
+            IncrementFormatArg::Wi1 => Self::Wi1,
+            IncrementFormatArg::Native => Self::Native,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "walross", version, about = "Rust port of wal-g for PostgreSQL")]
 pub struct Cli {
@@ -105,10 +124,15 @@ pub enum Cmd {
         #[arg(long, default_value_t = 0u64, env = "WALG_TAR_SIZE_THRESHOLD")]
         tar_size_threshold: u64,
         /// Build the delta map from `$PGDATA/pg_wal/summaries` (PG17+,
-        /// requires `summarize_wal=on`). Emits PG-native INCREMENTAL files
-        /// instead of wal-g's `wi1` format. Mutually exclusive with `--full`
+        /// requires `summarize_wal=on`) instead of walking archived WAL.
+        /// Source only; output format is `--increment-format`. Mutually
+        /// exclusive with `--full`
         #[arg(long)]
         delta_from_wal_summaries: bool,
+        /// Delta file wire format: `wi1` (wal-g native, default) or `native`
+        /// (PG17 INCREMENTAL). Independent of the delta-map source
+        #[arg(long, default_value = "wi1")]
+        increment_format: IncrementFormatArg,
         /// Force a full (non-delta) backup, ignoring `WALG_DELTA_MAX_STEPS`
         #[arg(long, conflicts_with = "delta_from_wal_summaries")]
         full: bool,
@@ -320,6 +344,7 @@ impl Cli {
                 no_verify_checksums,
                 tar_size_threshold,
                 delta_from_wal_summaries,
+                increment_format,
                 full,
             } => {
                 let s = Settings::from_env()?;
@@ -337,6 +362,7 @@ impl Cli {
                     no_verify_checksums,
                     tar_size_threshold,
                     delta_from_wal_summaries,
+                    increment_format: increment_format.into(),
                     full,
                 };
                 backup::push::handle(&s, storage, args).await

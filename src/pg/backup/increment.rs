@@ -14,8 +14,7 @@
 //! ### PG17 native INCREMENTAL (postgres source, magic `0xd3ae1f0d`)
 //! Per `src/include/backup/basebackup_incremental.h` and
 //! `src/backend/backup/basebackup.c:1625`. Emitted by `pg_basebackup
-//! --incremental`, wal-g's `--delta-from-wal-summaries`, & postgres 17+
-//! servers when an INCREMENTAL backup option is in effect:
+//! --incremental`, & PG17+ servers when INCREMENTAL option in effect:
 //! ```text
 //! 4  bytes  u32 LE: magic 0xd3ae1f0d
 //! 4  bytes  u32 LE: num_blocks
@@ -33,6 +32,7 @@
 
 use std::io::{self, Read, Write};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::delta::PG_PAGE_SIZE;
@@ -55,9 +55,14 @@ pub enum IncrementError {
     UnexpectedTrailing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serializes as `"wi1"` / `"native"`, matching the `--increment-format` CLI
+/// value names. Recorded per-backup in the sentinel; absent fields read as
+/// `Wi1` (wal-g sentinels and pre-field walross backups)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Format {
     /// wal-g `wi1`
+    #[default]
     Wi1,
     /// PG17 native INCREMENTAL
     Native,

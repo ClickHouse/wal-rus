@@ -45,6 +45,7 @@ fn make_sentinel_v2(name_data_dir: &str) -> BackupSentinelDtoV2 {
             increment_from: None,
             increment_full_name: None,
             increment_count: None,
+            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(0x0300_1000),
             system_identifier: Some(7000000000000000000),

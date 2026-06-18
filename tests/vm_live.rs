@@ -94,6 +94,7 @@ async fn backup_push_fetch_against_live_pg() {
         no_verify_checksums: false,
         tar_size_threshold: 0,
         delta_from_wal_summaries: false,
+        increment_format: Default::default(),
         full: false,
     };
     backup::push::handle(&s, store.clone(), args)
@@ -212,6 +213,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
         no_verify_checksums: false,
         tar_size_threshold: 0,
         delta_from_wal_summaries: false,
+        increment_format: Default::default(),
         full: false,
     };
     let push_res = backup::push::handle(&s, store.clone(), args).await;
@@ -290,6 +292,7 @@ fn default_push_args() -> backup::push::PushArgs {
         no_verify_checksums: false,
         tar_size_threshold: 0,
         delta_from_wal_summaries: false,
+        increment_format: Default::default(),
         full: false,
     }
 }

@@ -50,6 +50,7 @@ fn make_sentinel(start_lsn: u64, is_permanent: bool) -> BackupSentinelDtoV2 {
             increment_from: None,
             increment_full_name: None,
             increment_count: None,
+            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(start_lsn + seg_size()),
             system_identifier: Some(7000000000000000000),

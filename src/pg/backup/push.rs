@@ -55,9 +55,13 @@ pub struct PushArgs {
     pub no_verify_checksums: bool,
     /// `WALG_TAR_SIZE_THRESHOLD` override (bytes). 0 = use the streamer default
     pub tar_size_threshold: u64,
-    /// `--delta-from-wal-summaries`: build delta map from PG17 walsummarizer
-    /// output, emit native INCREMENTAL files instead of wal-g `wi1` format
+    /// `--delta-from-wal-summaries`: build the delta map from the PG17
+    /// walsummarizer instead of walking archived WAL. Source only; output
+    /// encoding is `increment_format`
     pub delta_from_wal_summaries: bool,
+    /// `--increment-format`: delta file wire format, `wi1` (default) or PG17
+    /// `native`. Independent of the delta-map source
+    pub increment_format: IncrementFormat,
     /// `--full`: explicit override to skip delta detection
     pub full: bool,
 }
@@ -70,19 +74,30 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     // (its end-LSN is only known then) & feed it into the streamer
     //
     // `--full` short-circuits delta detection entirely (matches wal-g's
-    // `--full` flag). `--delta-from-wal-summaries` flips the on-wire format
-    // from wal-g native `wi1` to PG17 INCREMENTAL
+    // `--full` flag). Output encoding is `--increment-format` (wi1 default),
+    // independent of whether the map came from WAL walk or wal-summaries
     let parent = if args.full {
         None
     } else {
         delta::configure_delta_parent(&storage, &settings.delta, args.is_permanent).await?
     };
-    let increment_format = if args.delta_from_wal_summaries {
-        IncrementFormat::Native
-    } else {
-        IncrementFormat::Wi1
-    };
+    let increment_format = args.increment_format;
     if let Some(p) = parent.as_ref() {
+        // A restore chain reconstructs linearly via increment_from, so it must
+        // use one format end-to-end: wal-g can't read native, & each apply
+        // assumes the parent state was written by the same scheme. Refuse to
+        // extend a delta parent with a different format (full parents start a
+        // fresh chain, so they're unconstrained)
+        if let Some(parent_fmt) = p.parent_increment_format
+            && parent_fmt != increment_format
+        {
+            bail!(
+                "increment format mismatch: delta parent {} uses {parent_fmt:?} but \
+                 --increment-format requests {increment_format:?}; a chain must use one \
+                 format end-to-end (match the parent, or pass --full for a new chain)",
+                p.name,
+            );
+        }
         tracing::info!(
             target = "backup_push",
             "delta parent {} (count={}, start_lsn={}, format={:?})",
@@ -455,15 +470,16 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     // build failed earlier, parent stays informational but the sentinel
     // must claim FULL — otherwise restore would walk a chain whose
     // increments don't exist
-    let (incr_from_lsn, incr_from_name, incr_full_name, incr_count) =
+    let (incr_from_lsn, incr_from_name, incr_full_name, incr_count, incr_format) =
         match (parent.as_ref(), delta_context.as_ref()) {
-            (Some(p), Some(_)) => (
+            (Some(p), Some(ctx)) => (
                 Some(p.start_lsn),
                 Some(p.name.clone()),
                 Some(resolve_increment_full_name(p)),
                 Some(p.increment_count as i32),
+                ctx.format,
             ),
-            _ => (None, None, None, None),
+            _ => (None, None, None, None, IncrementFormat::default()),
         };
     let sentinel = BackupSentinelDto {
         backup_start_lsn: Some(start_lsn),
@@ -471,6 +487,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         increment_from: incr_from_name,
         increment_full_name: incr_full_name,
         increment_count: incr_count,
+        increment_format: incr_format,
         pg_version,
         backup_finish_lsn: Some(end_lsn),
         system_identifier: Some(system_identifier),
