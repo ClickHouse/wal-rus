@@ -121,21 +121,15 @@ async fn fetch_one(
     running: &Path,
     ready: &Path,
 ) -> Result<()> {
-    // Reuse the regular wal-fetch download path so candidate-ext fallback,
-    // decompression, and rate limits stay consistent. Off: a prefetch must not
-    // recursively trigger more prefetch (wal-g's prefetchFile downloads direct)
-    let res = super::fetch::handle(
-        settings,
-        storage,
-        name,
-        running,
-        super::fetch::Prefetch::Off,
-    )
-    .await;
-    match res {
-        Ok(()) => fs::rename(running, ready)
+    // Download in place at running/<seg> (candidate-ext fallback, decompression
+    // and rate limits via the shared helper) so a concurrent wal-fetch can watch
+    // it grow and reuse it rather than re-downloading. Promote by rename on
+    // completion. Ok(false): another prefetcher already owns running/<seg>
+    match super::fetch::download_to_running(settings, &storage, name, running).await {
+        Ok(true) => fs::rename(running, ready)
             .await
             .with_context(|| format!("rename {} -> {}", running.display(), ready.display())),
+        Ok(false) => Ok(()),
         Err(e) => {
             let _ = fs::remove_file(running).await;
             Err(e)

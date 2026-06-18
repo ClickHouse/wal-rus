@@ -57,9 +57,13 @@ struct SegmentAccumulator {
     upload_sem: Arc<Semaphore>,
 }
 
+/// In-progress segment. Written to `<seg>.partial` (pg_receivewal convention),
+/// renamed to bare `<seg>` only once full, so only complete segments ever carry
+/// the bare name — a crash can't leave a torn partial masquerading as finished
 struct CurrentSegment {
     name: SegmentName,
     file: tokio::fs::File,
+    /// `<archive_dir>/<seg>.partial`
     path: PathBuf,
     bytes_written: u64,
 }
@@ -156,7 +160,7 @@ impl SegmentAccumulator {
             self.rotate_and_spawn().await?;
         }
         let seg = self.segment_for_lsn(lsn);
-        let path = self.archive_dir.join(seg.format());
+        let path = self.archive_dir.join(format!("{}.partial", seg.format()));
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -187,12 +191,19 @@ impl SegmentAccumulator {
         let CurrentSegment {
             name,
             mut file,
-            path,
+            path: partial,
             ..
         } = cur;
         file.flush().await?;
         file.sync_all().await?;
         drop(file);
+        // Publish the finished segment: <seg>.partial -> <seg>. Only bare <seg>
+        // files are complete, so a crash before upload leaves a re-pushable
+        // segment (see repush_leftover_segments), never a torn partial
+        let path = self.archive_dir.join(name.format());
+        fs::rename(&partial, &path)
+            .await
+            .with_context(|| format!("rename {} -> {}", partial.display(), path.display()))?;
         tracing::info!(
             target = "wal_receive",
             "segment {} complete, archiving",
@@ -248,10 +259,8 @@ impl SegmentAccumulator {
             let _ = fs::remove_file(&path).await;
             return Ok(());
         }
-        let partial_path = path.with_extension("partial");
-        fs::rename(&path, &partial_path)
-            .await
-            .with_context(|| format!("rename {} -> {}", path.display(), partial_path.display()))?;
+        // Already named <seg>.partial while streaming; leave it local and never
+        // upload it (pg_receivewal). Restart re-requests from the server-held LSN
         tracing::info!(
             target = "wal_receive",
             "wrote partial segment {} ({} bytes of {})",
@@ -274,6 +283,11 @@ impl SegmentAccumulator {
 }
 
 pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path) -> Result<()> {
+    let seg_size = DEFAULT_WAL_SEG_SIZE;
+    // Re-archive complete segments a prior crash left un-uploaded before the
+    // stream realigns to the server's LSN (which would skip past those holes)
+    repush_leftover_segments(settings, &storage, archive_dir, seg_size).await?;
+
     let cfg = PgConfig::from_env()?;
     tracing::info!(
         target = "wal_receive",
@@ -285,7 +299,6 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     );
     let mut conn = ReplicationConn::connect(&cfg).await?;
     let (sysid, timeline, start_lsn) = identify_system(&mut conn).await?;
-    let seg_size = DEFAULT_WAL_SEG_SIZE;
     // Round down to segment boundary so we always pick up at the start of a
     // segment — partial-segment recovery is the server's job
     let aligned = start_lsn - (start_lsn % seg_size);
@@ -373,6 +386,59 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     Ok(())
 }
 
+/// Re-archive complete segments a prior crash left on local disk. A hard crash
+/// between rotation (rename to `<seg>`) and upload completion (remove `<seg>`)
+/// leaves up to WALG_UPLOAD_CONCURRENCY finished segments un-uploaded; the stream
+/// realigns to the server's current LSN on restart, so those would otherwise
+/// become permanent archive holes. In-progress segments are `<seg>.partial` and
+/// so excluded (parse rejects the suffix). Idempotent: push byte-compares under
+/// prevent-wal-overwrite, plain-overwrites otherwise
+async fn repush_leftover_segments(
+    settings: &Settings,
+    storage: &DynStorage,
+    archive_dir: &Path,
+    seg_size: u64,
+) -> Result<()> {
+    let mut rd = match fs::read_dir(archive_dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("scan {}", archive_dir.display())),
+    };
+    let mut leftovers = Vec::new();
+    while let Some(entry) = rd.next_entry().await.context("read archive dir entry")? {
+        let file_name = entry.file_name();
+        // SegmentName::parse rejects `.partial`/`.history`/tmp names by length
+        let Some(seg) = file_name.to_str().and_then(|n| SegmentName::parse(n).ok()) else {
+            continue;
+        };
+        let meta = entry
+            .metadata()
+            .await
+            .with_context(|| format!("stat {}", entry.path().display()))?;
+        if meta.is_file() && meta.len() == seg_size {
+            leftovers.push((seg, entry.path()));
+        }
+    }
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    // archive in LSN order, matching the streaming push sequence
+    leftovers.sort_by_key(|(seg, _)| *seg);
+    tracing::info!(
+        target = "wal_receive",
+        "re-pushing {} leftover segment(s) from {}",
+        leftovers.len(),
+        archive_dir.display()
+    );
+    for (seg, path) in leftovers {
+        push::handle(settings, storage.clone(), &path)
+            .await
+            .with_context(|| format!("re-push leftover {}", seg.format()))?;
+        let _ = fs::remove_file(&path).await;
+    }
+    Ok(())
+}
+
 /// Resolve on SIGINT or SIGTERM (Unix) / Ctrl-C (other). Splitting into
 /// a helper keeps the main loop's `select!` arm short
 async fn shutdown_signal() -> Result<()> {
@@ -445,10 +511,9 @@ async fn identify_system(conn: &mut ReplicationConn) -> Result<(String, u32, u64
 mod tests {
     use super::*;
 
-    /// Accumulator backed by fs storage at `<dir>/store`, timeline 1
-    async fn test_acc(dir: &Path, seg_size: u64) -> SegmentAccumulator {
-        let store = dir.join("store");
-        let settings = Settings {
+    /// Settings writing uncompressed, unencrypted to fs storage rooted at `store`
+    fn test_settings(store: &Path) -> Settings {
+        Settings {
             storage: crate::config::StorageSettings::Fs {
                 path: store.to_string_lossy().into(),
             },
@@ -464,7 +529,13 @@ mod tests {
             disk_rate_limit: 0,
             delta: Default::default(),
             crypter: None,
-        };
+        }
+    }
+
+    /// Accumulator backed by fs storage at `<dir>/store`, timeline 1
+    async fn test_acc(dir: &Path, seg_size: u64) -> SegmentAccumulator {
+        let store = dir.join("store");
+        let settings = test_settings(&store);
         let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
         SegmentAccumulator::new(1, dir.to_path_buf(), seg_size, settings, storage)
             .await
@@ -525,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_partial_renames_inflight_segment() {
+    async fn finalize_partial_keeps_partial_segment() {
         let dir = tempfile::tempdir().unwrap();
         let seg_size = 16u64;
         let mut acc = test_acc(dir.path(), seg_size).await;
@@ -541,7 +612,7 @@ mod tests {
         let partial = dir.path().join(format!("{live_name}.partial"));
         let original = dir.path().join(&live_name);
         assert!(partial.exists(), "partial file missing: {partial:?}");
-        assert!(!original.exists(), "unrenamed segment leaked: {original:?}");
+        assert!(!original.exists(), "complete segment leaked: {original:?}");
         let meta = std::fs::metadata(&partial).unwrap();
         assert_eq!(meta.len(), seg_size, "partial should keep zero pad");
     }
@@ -614,5 +685,68 @@ mod tests {
         assert_eq!(bytes.len() as u64, seg_size, "zero pad retained");
         assert_eq!(&bytes[..4], &[0xCD; 4]);
         assert!(bytes[4..].iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn startup_repushes_complete_leftover_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        let archive_dir = dir.path().join("archive");
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let settings = test_settings(&store);
+        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
+
+        // complete segment left by a crash between rotation and upload
+        let complete = SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: 7,
+        }
+        .format();
+        std::fs::write(archive_dir.join(&complete), vec![0xAB; seg_size as usize]).unwrap();
+        // in-progress segment: full size on disk but .partial -> must be skipped
+        let partial = SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: 8,
+        }
+        .format();
+        std::fs::write(
+            archive_dir.join(format!("{partial}.partial")),
+            vec![0xCD; seg_size as usize],
+        )
+        .unwrap();
+        // wrong-size file (e.g. truncated) -> must be skipped
+        let short = SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: 9,
+        }
+        .format();
+        std::fs::write(archive_dir.join(&short), vec![0xEE; 4]).unwrap();
+
+        repush_leftover_segments(&settings, &storage, &archive_dir, seg_size)
+            .await
+            .unwrap();
+
+        let wal = |seg: &str| store.join(crate::pg::WAL_FOLDER).join(seg);
+        // complete segment archived, then removed locally
+        assert_eq!(
+            std::fs::read(wal(&complete)).unwrap(),
+            vec![0xAB; seg_size as usize]
+        );
+        assert!(
+            !archive_dir.join(&complete).exists(),
+            "leftover must be removed after re-push"
+        );
+        // partial + short left untouched, never archived
+        assert!(archive_dir.join(format!("{partial}.partial")).exists());
+        assert!(!wal(&partial).exists(), "partial must not be uploaded");
+        assert!(archive_dir.join(&short).exists());
+        assert!(
+            !wal(&short).exists(),
+            "wrong-size file must not be uploaded"
+        );
     }
 }

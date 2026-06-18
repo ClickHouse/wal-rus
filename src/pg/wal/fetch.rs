@@ -4,6 +4,7 @@
 //! buckets written by mixed-config wal-g/wal-rs invocations
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::fs;
@@ -19,6 +20,13 @@ use super::segment::is_history_filename;
 // Fallback order covers wal-g's compressed formats plus uncompressed, so a
 // bucket written by any of (zstd, brotli, lz4, lzma, none) is readable.
 const CANDIDATE_EXTS: &[&str] = &["zst", "br", "lz4", "lzma", ""];
+
+/// Poll cadence while waiting on an in-flight prefetch (`running/<seg>`); wal-g
+/// HandleWALFetch uses 2 ms
+const PREFETCH_POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// Abandon the wait after this many polls without the running file growing
+/// (~200 ms), presuming a dead/too-slow prefetcher (wal-g maxSizeStallTerations)
+const PREFETCH_MAX_STALLS: u32 = 100;
 
 /// Whether & how to prefetch subsequent segments once the requested one is
 /// served, mirroring wal-g's injected WalPrefetcher (Regular / Daemon / Nop)
@@ -63,14 +71,7 @@ pub async fn handle(
         None => return Err(ArchiveNotFound(name.to_string()).into()),
     };
 
-    let body = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let throttled = settings.throttle_network(body);
-    let decrypted = settings.decrypt(throttled);
-    let mut decoded = compression::decode(method, decrypted);
-
+    // tmp + atomic rename so PG never observes a partial segment at `dst`
     let tmp = tmp_path(dst);
     if let Some(parent) = tmp.parent() {
         fs::create_dir_all(parent).await?;
@@ -78,9 +79,7 @@ pub async fn handle(
     let mut out = fs::File::create(&tmp)
         .await
         .with_context(|| format!("create {}", tmp.display()))?;
-    tokio::io::copy(&mut decoded, &mut out).await?;
-    out.flush().await?;
-    out.sync_all().await?;
+    stream_object_into(settings, &storage, &key, method, &mut out).await?;
     drop(out);
     fs::rename(&tmp, dst)
         .await
@@ -149,6 +148,62 @@ fn fork_prefetch(name: &str, pg_wal: &Path) {
     }
 }
 
+/// Stream a located object into `out`: network throttle, decrypt, decompress.
+/// Shared by the direct fetch (writes a tmp then renames) and the prefetch
+/// worker (writes `running/<seg>` in place so wal-fetch can observe its growth)
+async fn stream_object_into(
+    settings: &Settings,
+    storage: &DynStorage,
+    key: &str,
+    method: compression::Method,
+    out: &mut fs::File,
+) -> Result<()> {
+    let body = storage
+        .get(key)
+        .await
+        .with_context(|| format!("get {key}"))?;
+    let throttled = settings.throttle_network(body);
+    let decrypted = settings.decrypt(throttled);
+    let mut decoded = compression::decode(method, decrypted);
+    tokio::io::copy(&mut decoded, out).await?;
+    out.flush().await?;
+    out.sync_all().await?;
+    Ok(())
+}
+
+/// Download `name` straight into `out_path` for the prefetch worker — no tmp
+/// indirection, so the partial is visible at `running/<seg>` while it downloads
+/// and a concurrent wal-fetch can watch it grow (wal-g prefetchFile). Created
+/// exclusively: `Ok(false)` means another prefetcher already owns it, so leave
+/// it untouched (wal-g O_EXCL parity). Prefetch never targets history files, so
+/// the configured compression is always the preferred extension
+pub(super) async fn download_to_running(
+    settings: &Settings,
+    storage: &DynStorage,
+    name: &str,
+    out_path: &Path,
+) -> Result<bool> {
+    let (key, method) = match find_object(storage.as_ref(), name, settings.compression).await? {
+        Some(p) => p,
+        None => return Err(ArchiveNotFound(name.to_string()).into()),
+    };
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let mut out = match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(out_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("create {}", out_path.display())),
+    };
+    stream_object_into(settings, storage, &key, method, &mut out).await?;
+    Ok(true)
+}
+
 async fn find_object(
     storage: &dyn crate::storage::Storage,
     name: &str,
@@ -188,33 +243,65 @@ fn tmp_path(dst: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// When dst's parent looks like a pg_wal directory, check the wal-g prefetch
-/// area for a ready segment & promote via rename. Best-effort — any failure
-/// (or missing prefetch dir) falls through to the storage path
+/// Reuse an in-flight or completed prefetch instead of racing it with a fresh
+/// download, mirroring wal-g HandleWALFetch. When dst's parent looks like a
+/// pg_wal directory: promote a ready segment by rename; else, while a prefetch
+/// is mid-flight at `running/<seg>`, poll until it completes (promote) or stalls
+/// (~200 ms of no growth → presume dead, reclaim, fall back to a direct
+/// download). Returns true when `dst` was satisfied from prefetch, false to
+/// download. Any unexpected error or missing prefetch dir falls through
 async fn try_promote_prefetched(name: &str, dst: &Path) -> Result<bool> {
     let Some(parent) = dst.parent() else {
         return Ok(false);
     };
-    let staged = super::prefetch::prefetched_path(parent, name);
-    match fs::metadata(&staged).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
+    let ready = super::prefetch::prefetched_path(parent, name);
+    let running = super::prefetch::running_dir(parent).join(name);
+
+    let mut seen_size: i64 = -1;
+    let mut stalls = 0u32;
+    loop {
+        match fs::metadata(&ready).await {
+            Ok(_) => {
+                if let Some(p) = dst.parent() {
+                    fs::create_dir_all(p).await.ok();
+                }
+                fs::rename(&ready, dst).await.with_context(|| {
+                    format!(
+                        "promote prefetched {} -> {}",
+                        ready.display(),
+                        dst.display()
+                    )
+                })?;
+                tracing::info!(
+                    target = "wal_fetch",
+                    "promoted prefetched {name} -> {}",
+                    dst.display()
+                );
+                return Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("stat prefetched segment"),
+        }
+        // No ready file yet — is a prefetch downloading it right now?
+        match fs::metadata(&running).await {
+            Ok(m) => {
+                let size = m.len() as i64;
+                if size > seen_size {
+                    seen_size = size;
+                    stalls = 0;
+                } else {
+                    stalls += 1;
+                    if stalls >= PREFETCH_MAX_STALLS {
+                        // dead/too-slow prefetcher: reclaim and download ourselves
+                        let _ = fs::remove_file(&running).await;
+                        let _ = fs::remove_file(&ready).await;
+                        return Ok(false);
+                    }
+                }
+            }
+            // running absent (normal cold fetch) or unreadable: just download
+            Err(_) => return Ok(false),
+        }
+        tokio::time::sleep(PREFETCH_POLL_INTERVAL).await;
     }
-    if let Some(p) = dst.parent() {
-        fs::create_dir_all(p).await.ok();
-    }
-    fs::rename(&staged, dst).await.with_context(|| {
-        format!(
-            "promote prefetched {} -> {}",
-            staged.display(),
-            dst.display()
-        )
-    })?;
-    tracing::info!(
-        target = "wal_fetch",
-        "promoted prefetched {name} -> {}",
-        dst.display()
-    );
-    Ok(true)
 }

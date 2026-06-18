@@ -54,6 +54,7 @@ jobs:
           - cross_tool_encryption
           - cross_tool_retention
           - cross_tool_lzma
+          - cross_tool_delta
         include:
           - { pg: 18, test: full_backup, os: ubuntu-24.04 }
           - { pg: 18, test: backup_mark, os: ubuntu-24.04 }

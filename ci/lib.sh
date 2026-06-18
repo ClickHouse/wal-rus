@@ -211,6 +211,65 @@ cross_roundtrip() {
     pg_drop
 }
 
+# Cross-tool delta interop: $1 writes a full + a 1-step delta, $2 restores the
+# whole chain (parent + increment) and replays, dumps compared. Like
+# cross_roundtrip but adds a mutate-then-delta step gated on WALG_DELTA_MAX_STEPS;
+# both tools share the wi1 increment format & IncrementFrom chain discovery. The
+# archive_command keeps WAL flowing to the bucket so the writer's delta map can
+# be built; pg_switch_wal + sleep flushes the changed segment before the delta.
+# Leaves the cluster stopped + dropped.
+cross_delta_roundtrip() {
+    local writer="$1" reader="$2"
+    pg_initdb
+    pg_archive_on "$writer"
+    pg_start
+
+    pgbench -p "$PGPORT" -h "$PGHOST" -i -s 2 postgres >/dev/null
+    psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
+
+    # parent full (delta detection explicitly off)
+    export WALG_DELTA_MAX_STEPS=0
+    if [ "$writer" = "$WALRS_BIN" ]; then wal-rs backup-push; else walg backup-push "$PGDATA"; fi
+
+    # mutate, then close + archive the changed WAL before the delta
+    pgbench -p "$PGPORT" -h "$PGHOST" -t 2000 postgres >/dev/null
+    psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
+    psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
+    sleep 3
+    pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump1.sql"
+
+    # 1-step delta off the parent
+    export WALG_DELTA_MAX_STEPS=1
+    if [ "$writer" = "$WALRS_BIN" ]; then wal-rs backup-push; else walg backup-push "$PGDATA"; fi
+    psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
+    sleep 3
+    unset WALG_DELTA_MAX_STEPS
+
+    # the reader must see the delta as LATEST before restoring the chain
+    "$reader" backup-list | tee "$WORKROOT/delta-list.txt"
+    grep -E '_D_' "$WORKROOT/delta-list.txt" || { echo "no delta backup visible to reader"; exit 1; }
+
+    pg_drop
+    mkdir -p "$PGDATA"
+    chmod 700 "$PGDATA"
+    # reconstructs parent full + increment
+    "$reader" backup-fetch "$PGDATA" LATEST
+
+    pg_recovery_conf "$reader wal-fetch %f %p"
+    pg_start
+    local _i
+    for _i in $(seq 1 60); do
+        if psql -p "$PGPORT" -h "$PGHOST" -tAc 'SELECT pg_is_in_recovery()' postgres 2>/dev/null | grep -qx f; then
+            break
+        fi
+        sleep 1
+    done
+
+    pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump2.sql"
+    diff -I '^\\\(restrict\|unrestrict\) ' "$WORKROOT/dump1.sql" "$WORKROOT/dump2.sql"
+    pg_drop
+}
+
 cleanup() {
     pg_stop || true
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Cross-tool libsodium-encrypted bucket interop (full backups; delta is blocked
-# on the streamer rewrite). A 32-byte raw key (default transform = none) is read
-# by both tools from WALG_LIBSODIUM_KEY. Forward: wal-rs encrypts, wal-g
+# Cross-tool libsodium-encrypted bucket interop (full backups; delta interop is
+# covered by cross_tool_delta.sh). A 32-byte raw key (default transform = none)
+# is read by both tools from WALG_LIBSODIUM_KEY. Forward: wal-rs encrypts, wal-g
 # restores. Reverse: wal-g encrypts, wal-rs restores.
 set -euxo pipefail
 

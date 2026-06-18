@@ -4,18 +4,13 @@
 //! launcher script can target a specific cluster (PG 13–18). For trust-auth
 //! local Debian clusters, PGUSER=postgres and PGPASSWORD unset.
 //!
-//! # Phase C/C.2 delta-apply live exercise — intentionally absent
+//! # Delta-apply live exercise
 //!
-//! Delta backups depend on streamer-side emission of per-file wi1 / native
-//! INCREMENTAL payloads during BASE_BACKUP. That rewrite is the load-bearing
-//! open piece called out at the foot of PHASEC.md / PHASEC2.md / PHASEF.md;
-//! today `WALG_DELTA_MAX_STEPS>0` and `--delta-from-wal-summaries` both run
-//! the pre-flight eagerly then warn-and-fall-back-to-full, so the bucket
-//! never claims a delta it can't deliver. Until that lands there is no way
-//! to produce a delta-chain from a live PG that exercises a path beyond
-//! what `pg::backup::increment::tests` already covers with crafted fixtures.
-//! A live `delta_chain_against_live_pg` test belongs in the same pass that
-//! lands the streamer rewrite.
+//! `delta_chain_against_live_pg` drives a full → mutate → delta-push → restore
+//! round-trip on the live cluster, then checks the reconstructed relation file
+//! against a non-delta backup of the same state (and against the parent, to
+//! prove the increment actually applied). The cluster has no archive_command,
+//! so the test self-archives pg_wal into its bucket for the WAL-walk delta map.
 
 #![cfg(feature = "vm-test")]
 
@@ -422,6 +417,224 @@ async fn retain_full_one_against_live_pg() {
 }
 
 // ── Phase D carry: live-PG wal-receive exercise ───────────────────────────
+
+fn read_sentinel(
+    storage_dir: &std::path::Path,
+    name: &str,
+) -> pgwalrs::pg::backup::BackupSentinelDtoV2 {
+    let key = pgwalrs::pg::backup::sentinel_key(name);
+    serde_json::from_slice(&std::fs::read(storage_dir.join(&key)).unwrap()).unwrap()
+}
+
+/// Archive every complete (16 MiB) segment currently in `pg_wal` into the test
+/// bucket so the WAL-walk delta map can find the changed blocks — this cluster
+/// has no archive_command. The segment holding the delta's start LSN may still
+/// be partial/absent; the raw-WAL walk skips it and it carries no table writes.
+async fn archive_pg_wal(s: &Settings, store: &Arc<dyn Storage>, pg_wal: &std::path::Path) {
+    let seg_size = 16 * 1024 * 1024u64;
+    let mut segs: Vec<std::path::PathBuf> = std::fs::read_dir(pg_wal)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let named = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.len() == 24 && n.chars().all(|c| c.is_ascii_hexdigit()))
+                .unwrap_or(false);
+            named
+                && std::fs::metadata(p)
+                    .map(|m| m.len() == seg_size)
+                    .unwrap_or(false)
+        })
+        .collect();
+    segs.sort();
+    for seg in segs {
+        wal::push::handle(s, store.clone(), &seg)
+            .await
+            .unwrap_or_else(|e| panic!("archive {}: {e:#}", seg.display()));
+    }
+}
+
+/// Restore `name` (chain, for deltas) into `restore_dir`, remapping any user
+/// tablespaces into the sandbox so we never write to postgres-owned paths
+async fn restore_backup(
+    s: &Settings,
+    store: &Arc<dyn Storage>,
+    storage_dir: &std::path::Path,
+    name: &str,
+    restore_dir: std::path::PathBuf,
+) -> std::path::PathBuf {
+    let v2 = read_sentinel(storage_dir, name);
+    let mut args = backup::fetch::FetchArgs::default();
+    if let Some(spec) = v2.sentinel.tablespace_spec.as_ref() {
+        apply_tablespace_remap(spec, &restore_dir, &mut args);
+    }
+    backup::fetch::handle_with_args(s, store.clone(), name, &restore_dir, &args)
+        .await
+        .unwrap_or_else(|e| panic!("restore {name}: {e:#}"));
+    restore_dir
+}
+
+#[tokio::test]
+async fn delta_chain_against_live_pg() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    std::fs::create_dir_all(&storage_dir).unwrap();
+    let s = settings_for(storage_dir.to_str().unwrap());
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+
+    let pghost = std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let pgport = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
+    let pguser = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".into());
+    let pgdb = std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".into());
+    let psql = |sql: &str| -> String {
+        let out = std::process::Command::new("psql")
+            .args([
+                "-h", &pghost, "-p", &pgport, "-U", &pguser, "-d", &pgdb, "-Atqc", sql,
+            ])
+            .output()
+            .expect("invoke psql; install postgresql-client if missing");
+        assert!(
+            out.status.success(),
+            "psql `{sql}` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Dedicated table, autovacuum off so its heap stays byte-stable between the
+    // delta and the baseline-full backup taken right after it
+    let tbl = "walrs_delta_chain_test";
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+    psql(&format!(
+        "CREATE TABLE {tbl} (id int primary key, v text) WITH (autovacuum_enabled=false)"
+    ));
+    psql(&format!(
+        "INSERT INTO {tbl} SELECT g, repeat('a', 200) FROM generate_series(1, 2000) g"
+    ));
+    psql(&format!("SELECT count(*) FROM {tbl}")); // settle hint bits
+    psql("CHECKPOINT");
+
+    // (1) parent full backup
+    backup::push::handle(
+        &s,
+        store.clone(),
+        backup::push::PushArgs {
+            full: true,
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect("parent full backup");
+    let full_name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
+    let full_start_lsn = read_sentinel(&storage_dir, &full_name)
+        .sentinel
+        .backup_start_lsn;
+
+    // mutate so the delta carries changed + newly-extended blocks
+    psql(&format!(
+        "UPDATE {tbl} SET v = repeat('b', 200) WHERE id % 2 = 0"
+    ));
+    psql(&format!(
+        "INSERT INTO {tbl} SELECT g, repeat('c', 200) FROM generate_series(2001, 3000) g"
+    ));
+    psql(&format!("SELECT count(*) FROM {tbl}")); // settle hint bits on touched pages
+    psql("CHECKPOINT");
+
+    // self-archive WAL so the WAL-walk delta map sees the changed blocks
+    psql("SELECT pg_switch_wal()");
+    let data_dir = psql("SHOW data_directory");
+    archive_pg_wal(&s, &store, &std::path::Path::new(&data_dir).join("pg_wal")).await;
+
+    // (2) delta backup off the full (WALG_DELTA_MAX_STEPS=1)
+    let mut s_delta = s.clone();
+    s_delta.delta.max_steps = 1;
+    backup::push::handle(&s_delta, store.clone(), default_push_args())
+        .await
+        .expect("delta backup");
+    let delta_name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
+    assert_ne!(delta_name, full_name, "delta should be the new LATEST");
+    assert!(
+        delta_name.contains("_D_"),
+        "delta backup name should carry the _D_ suffix: {delta_name}"
+    );
+    let dv2 = read_sentinel(&storage_dir, &delta_name);
+    assert_eq!(
+        dv2.sentinel.increment_from.as_deref(),
+        Some(full_name.as_str()),
+        "delta IncrementFrom should point at the parent full"
+    );
+    assert_eq!(dv2.sentinel.increment_count, Some(1));
+    assert_eq!(
+        dv2.sentinel.increment_from_lsn, full_start_lsn,
+        "delta IncrementFromLSN should equal the parent's start LSN"
+    );
+
+    // (3) baseline non-delta backup of the same (quiesced) state, no writes since
+    backup::push::handle(
+        &s,
+        store.clone(),
+        backup::push::PushArgs {
+            full: true,
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect("baseline full backup");
+    let baseline_name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
+    assert!(
+        !baseline_name.contains("_D_"),
+        "baseline must be a full backup"
+    );
+
+    let relpath = psql(&format!("SELECT pg_relation_filepath('{tbl}')"));
+    assert!(!relpath.is_empty(), "pg_relation_filepath returned empty");
+
+    let dir_parent = restore_backup(
+        &s,
+        &store,
+        &storage_dir,
+        &full_name,
+        dir.path().join("r_parent"),
+    )
+    .await;
+    let dir_delta = restore_backup(
+        &s,
+        &store,
+        &storage_dir,
+        &delta_name,
+        dir.path().join("r_delta"),
+    )
+    .await;
+    let dir_baseline = restore_backup(
+        &s,
+        &store,
+        &storage_dir,
+        &baseline_name,
+        dir.path().join("r_baseline"),
+    )
+    .await;
+
+    let read_rel = |root: &std::path::Path| std::fs::read(root.join(&relpath)).unwrap();
+    let parent_rel = read_rel(&dir_parent);
+    let delta_rel = read_rel(&dir_delta);
+    let baseline_rel = read_rel(&dir_baseline);
+
+    // The reconstructed delta chain must match a non-delta backup of the same
+    // state byte-for-byte, and must differ from the parent (proving the
+    // increment carried the mutations rather than just copying the parent)
+    assert_eq!(
+        delta_rel, baseline_rel,
+        "delta-chain restore of {tbl} differs from a non-delta backup of the same state"
+    );
+    assert_ne!(
+        delta_rel, parent_rel,
+        "delta-chain restore of {tbl} matches the parent — no changes applied"
+    );
+
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+}
 
 #[tokio::test]
 async fn wal_receive_archives_segment_against_live_pg() {

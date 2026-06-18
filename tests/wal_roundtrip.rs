@@ -336,6 +336,80 @@ async fn wal_fetch_triggers_in_process_prefetch() {
 }
 
 #[tokio::test]
+async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
+    use pgwalrs::pg::wal::prefetch;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let pg_wal = dir.path().join("pg_wal");
+    std::fs::create_dir_all(&pg_wal).unwrap();
+    // storage intentionally left empty: a fallback download would 404
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
+
+    let seg = "000000010000000000000002";
+    let running = prefetch::running_dir(&pg_wal).join(seg);
+    std::fs::create_dir_all(running.parent().unwrap()).unwrap();
+    // an in-flight prefetch: running/<seg> present, not yet complete
+    std::fs::write(&running, b"").unwrap();
+
+    // background prefetcher completes shortly: publish ready, drop running
+    let ready = prefetch::prefetched_path(&pg_wal, seg);
+    let running_bg = running.clone();
+    let ready_bg = ready.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(&ready_bg, b"prefetched-bytes").unwrap();
+        let _ = std::fs::remove_file(&running_bg);
+    });
+
+    let dst = pg_wal.join(seg);
+    pgwalrs::pg::wal::fetch::handle(&s, store, seg, &dst, wal::fetch::Prefetch::Off)
+        .await
+        .expect("fetch should reuse the in-flight prefetch, not 404 on empty storage");
+    assert_eq!(std::fs::read(&dst).unwrap(), b"prefetched-bytes");
+    assert!(!ready.exists(), "ready file must be consumed by promotion");
+}
+
+#[tokio::test]
+async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
+    use pgwalrs::pg::wal::prefetch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let pg_wal = dir.path().join("pg_wal");
+    std::fs::create_dir_all(&pg_wal).unwrap();
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
+
+    // seed storage so the fallback download succeeds
+    let seg = "000000010000000000000002";
+    let stage_dir = dir.path().join("stage");
+    std::fs::create_dir_all(&stage_dir).unwrap();
+    let stage = stage_dir.join(seg);
+    std::fs::write(&stage, b"downloaded-bytes").unwrap();
+    pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
+        .await
+        .unwrap();
+
+    // a stalled prefetch: running/<seg> present but never grows or completes
+    let running = prefetch::running_dir(&pg_wal).join(seg);
+    std::fs::create_dir_all(running.parent().unwrap()).unwrap();
+    std::fs::write(&running, b"partial").unwrap();
+
+    let dst = pg_wal.join(seg);
+    pgwalrs::pg::wal::fetch::handle(&s, store, seg, &dst, wal::fetch::Prefetch::Off)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), b"downloaded-bytes");
+    assert!(
+        !running.exists(),
+        "stalled running file must be reclaimed on fallback"
+    );
+}
+
+#[tokio::test]
 async fn wal_show_groups_segments_and_detects_gaps() {
     use pgwalrs::pg::wal::show;
     use pgwalrs::storage::Storage;
