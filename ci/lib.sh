@@ -194,8 +194,7 @@ cross_roundtrip() {
     pg_drop
     mkdir -p "$PGDATA"
     chmod 700 "$PGDATA"
-    # arg order differs: wal-rs backup-fetch <name> <dst>, walg backup-fetch <dst> <name>
-    if [ "$reader" = "$WALRS_BIN" ]; then wal-rs backup-fetch LATEST "$PGDATA"; else walg backup-fetch "$PGDATA" LATEST; fi
+    "$reader" backup-fetch "$PGDATA" LATEST
 
     pg_recovery_conf "$reader wal-fetch %f %p"
     pg_start

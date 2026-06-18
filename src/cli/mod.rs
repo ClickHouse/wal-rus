@@ -93,12 +93,18 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Restore a base backup to a directory
+    /// Restore a base backup to a directory.
+    /// Select via positional `name` (or `LATEST`) or `--target-user-data <json>`
     BackupFetch {
-        /// Backup name, or LATEST
-        name: String,
         /// Destination directory (created if missing)
         dst: PathBuf,
+        /// Backup name, or LATEST
+        #[arg(conflicts_with = "target_user_data")]
+        name: Option<String>,
+        /// Select target backup by sentinel.UserData (JSON, deep-equal).
+        /// Falls back to WALG_FETCH_TARGET_USER_DATA
+        #[arg(long)]
+        target_user_data: Option<String>,
     },
     /// Take a streaming base backup via the replication BASE_BACKUP protocol
     ///
@@ -221,8 +227,14 @@ pub enum DeleteCli {
     /// Wipe basebackups + WAL. Refuses when any permanent backup exists unless `FORCE`
     Everything { args: Vec<String> },
     /// Delete a single backup and (default) its dependants;
-    /// `FIND_FULL <name>` deletes the whole increment chain
-    Target { args: Vec<String> },
+    /// `FIND_FULL <name>` deletes the whole increment chain.
+    /// Select via positional name or `--target-user-data <json>`
+    Target {
+        args: Vec<String>,
+        /// Select target backup by sentinel.UserData (JSON, deep-equal)
+        #[arg(long)]
+        target_user_data: Option<String>,
+    },
     /// Find oldest non-permanent backup; delete everything older.
     /// `ARCHIVES` / `BACKUPS` narrows the scope
     Garbage { args: Vec<String> },
@@ -331,10 +343,27 @@ impl Cli {
                 };
                 backup::list::handle(storage, format).await
             }
-            Cmd::BackupFetch { name, dst } => {
+            Cmd::BackupFetch {
+                dst,
+                name,
+                target_user_data,
+            } => {
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
-                backup::fetch::handle(&s, storage, &name, &dst).await
+                // flag wins, else WALG_FETCH_TARGET_USER_DATA (wal-g parity)
+                let target_user_data =
+                    target_user_data.or_else(|| std::env::var("WALG_FETCH_TARGET_USER_DATA").ok());
+                let resolved = match (name, target_user_data) {
+                    (Some(n), None) => n,
+                    (None, Some(ud)) => backup::show::resolve_by_user_data(&storage, &ud).await?,
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!("specify backup name OR --target-user-data, not both")
+                    }
+                    (None, None) => {
+                        anyhow::bail!("backup name or --target-user-data required")
+                    }
+                };
+                backup::fetch::handle(&s, storage, &resolved, &dst).await
             }
             Cmd::BackupPush {
                 pgdata,
@@ -422,8 +451,23 @@ impl Cli {
                         let force = backup::delete::parse_everything_force(&args)?;
                         backup::delete::DeleteOp::Everything { force }
                     }
-                    DeleteCli::Target { args } => {
-                        let (modifier, name) = backup::delete::parse_target_modifier(&args)?;
+                    DeleteCli::Target {
+                        args,
+                        target_user_data,
+                    } => {
+                        let (modifier, maybe_name) = backup::delete::parse_target_modifier(&args)?;
+                        let name = match (maybe_name, target_user_data) {
+                            (Some(n), None) => n,
+                            (None, Some(ud)) => {
+                                backup::show::resolve_by_user_data(&storage, &ud).await?
+                            }
+                            (Some(_), Some(_)) => {
+                                anyhow::bail!("specify backup name OR --target-user-data, not both")
+                            }
+                            (None, None) => {
+                                anyhow::bail!("backup name or --target-user-data required")
+                            }
+                        };
                         backup::delete::DeleteOp::Target { name, modifier }
                     }
                     DeleteCli::Garbage { args } => {

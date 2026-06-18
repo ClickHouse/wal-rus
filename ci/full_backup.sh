@@ -27,7 +27,7 @@ pg_drop
 
 mkdir -p "$PGDATA"
 chmod 700 "$PGDATA"
-wal-rs backup-fetch LATEST "$PGDATA"
+wal-rs backup-fetch "$PGDATA" LATEST
 
 pg_recovery_conf "$WALRS_BIN wal-fetch %f %p"
 pg_start

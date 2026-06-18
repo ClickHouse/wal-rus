@@ -91,6 +91,16 @@ async fn put_bytes(store: Arc<FsStorage>, key: &str, body: Vec<u8>) {
     store.put(key, r, Some(len)).await.unwrap();
 }
 
+/// Seed a sentinel-only backup at `lsn` carrying `user_data`; returns its name
+async fn seed_user_data(store: &Arc<FsStorage>, lsn: u64, user_data: serde_json::Value) -> String {
+    let name = format_backup_name(1, lsn, 16 * 1024 * 1024);
+    let mut sentinel = make_sentinel_v2("/var/lib/postgres/data");
+    sentinel.sentinel.user_data = Some(user_data);
+    let bytes = serde_json::to_vec(&sentinel).unwrap();
+    put_bytes(store.clone(), &sentinel_key(&name), bytes).await;
+    name
+}
+
 #[tokio::test]
 async fn list_finds_seeded_backup() {
     let dir = tempfile::tempdir().unwrap();
@@ -226,6 +236,48 @@ async fn fetch_resolves_latest() {
         .await
         .unwrap();
     assert_eq!(resolved, newer);
+}
+
+#[tokio::test]
+async fn resolve_by_user_data_selects_unique_match() {
+    use pgwalrs::pg::backup::show;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+
+    let a = seed_user_data(&store, 0x0300_0000, serde_json::json!({"label": "a"})).await;
+    seed_user_data(&store, 0x0400_0000, serde_json::json!({"label": "b"})).await;
+
+    let dyn_store = store as Arc<dyn Storage>;
+    assert_eq!(
+        show::resolve_by_user_data(&dyn_store, r#"{"label":"a"}"#)
+            .await
+            .unwrap(),
+        a
+    );
+    // no backup carries this value
+    assert!(
+        show::resolve_by_user_data(&dyn_store, r#"{"label":"z"}"#)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn resolve_by_user_data_errors_on_ambiguous_match() {
+    use pgwalrs::pg::backup::show;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+
+    let shared = serde_json::json!({"team": "infra"});
+    let a = seed_user_data(&store, 0x0300_0000, shared.clone()).await;
+    let b = seed_user_data(&store, 0x0400_0000, shared).await;
+
+    let dyn_store = store as Arc<dyn Storage>;
+    let err = show::resolve_by_user_data(&dyn_store, r#"{"team":"infra"}"#)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(&a) && err.contains(&b), "got: {err}");
 }
 
 #[tokio::test]

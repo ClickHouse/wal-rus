@@ -717,11 +717,14 @@ pub fn parse_modifier_args(args: &[String]) -> Result<(DeleteModifier, String)> 
     }
 }
 
-pub fn parse_target_modifier(args: &[String]) -> Result<(DeleteModifier, String)> {
+/// Name is optional: when absent the caller resolves it from `--target-user-data`
+pub fn parse_target_modifier(args: &[String]) -> Result<(DeleteModifier, Option<String>)> {
     match args {
-        [v] => Ok((DeleteModifier::None, v.clone())),
-        [m, v] if m == "FIND_FULL" => Ok((DeleteModifier::FindFull, v.clone())),
-        _ => bail!("expected `[FIND_FULL] <backup>`, got {args:?}"),
+        [] => Ok((DeleteModifier::None, None)),
+        [m] if m == "FIND_FULL" => Ok((DeleteModifier::FindFull, None)),
+        [v] => Ok((DeleteModifier::None, Some(v.clone()))),
+        [m, v] if m == "FIND_FULL" => Ok((DeleteModifier::FindFull, Some(v.clone()))),
+        _ => bail!("expected `[FIND_FULL] [backup]`, got {args:?}"),
     }
 }
 
@@ -825,6 +828,28 @@ mod tests {
             "wal_005/000000010000000000000005.zst",
             &t
         ));
+    }
+
+    #[test]
+    fn target_modifier_parses_optional_name() {
+        let p = |a: &[&str]| {
+            parse_target_modifier(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert!(matches!(p(&[]).unwrap(), (DeleteModifier::None, None)));
+        assert!(matches!(
+            p(&["FIND_FULL"]).unwrap(),
+            (DeleteModifier::FindFull, None)
+        ));
+        assert_eq!(
+            p(&["base_1"]).unwrap(),
+            (DeleteModifier::None, Some("base_1".into()))
+        );
+        assert_eq!(
+            p(&["FIND_FULL", "base_1"]).unwrap(),
+            (DeleteModifier::FindFull, Some("base_1".into()))
+        );
+        assert!(p(&["FIND_FULL", "base_1", "extra"]).is_err());
+        assert!(p(&["BOGUS", "base_1"]).is_err());
     }
 
     #[test]
