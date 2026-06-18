@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -168,6 +169,12 @@ pub enum Cmd {
     DaemonClient {
         #[arg(long)]
         socket: PathBuf,
+        /// Operation execution timeout (Go-style duration); 0 disables
+        #[arg(long, default_value = "60s", value_parser = crate::config::parse_duration)]
+        timeout: Duration,
+        /// Socket dial timeout (Go-style duration); 0 disables
+        #[arg(long = "connection-timeout", default_value = "5s", value_parser = crate::config::parse_duration)]
+        connection_timeout: Duration,
         #[command(subcommand)]
         op: DaemonOp,
     },
@@ -428,7 +435,12 @@ impl Cli {
                 let storage = s.build_storage()?;
                 crate::daemon::serve(&socket, s, storage).await
             }
-            Cmd::DaemonClient { socket, op } => crate::daemon::client::run(&socket, op).await,
+            Cmd::DaemonClient {
+                socket,
+                op,
+                timeout,
+                connection_timeout,
+            } => crate::daemon::client::run(&socket, op, timeout, connection_timeout).await,
         }
     }
 }
