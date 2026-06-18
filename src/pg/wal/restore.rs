@@ -8,13 +8,11 @@
 //! still be filling in the freshest segments
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::fs;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
+use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 use crate::pg::wal::show;
@@ -69,37 +67,36 @@ pub async fn handle(
         dst.display()
     );
 
-    let sem = Arc::new(Semaphore::new(settings.download_concurrency.max(1)));
-    let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
+    // missing/transient failures don't abort the batch (wal-receive may still
+    // be filling the freshest segments)
+    let mut tasks = BoundedTasks::new(
+        settings.download_concurrency,
+        "restore",
+        |(name, res): (String, Result<()>)| {
+            match res {
+                Ok(()) => tracing::info!(target = "wal_restore", "restored {name}"),
+                Err(e) => tracing::warn!(target = "wal_restore", "skip {name}: {e:#}"),
+            }
+            Ok(())
+        },
+    );
     for seg in missing {
         let name = seg.format();
         let dst_path = dst.join(&name);
         if fs::try_exists(&dst_path).await.unwrap_or(false) {
             continue;
         }
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .context("acquire restore permit")?;
         let st = storage.clone();
         let cfg = settings.clone();
-        let task_name = name.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            let r =
-                super::fetch::handle(&cfg, st, &task_name, &dst_path, super::fetch::Prefetch::Off)
-                    .await;
-            (task_name, r)
-        });
+        tasks
+            .spawn(async move {
+                let r =
+                    super::fetch::handle(&cfg, st, &name, &dst_path, super::fetch::Prefetch::Off)
+                        .await;
+                (name, r)
+            })
+            .await?;
     }
-
-    while let Some(joined) = tasks.join_next().await {
-        let (name, res) = joined.context("restore task join")?;
-        match res {
-            Ok(()) => tracing::info!(target = "wal_restore", "restored {name}"),
-            Err(e) => tracing::warn!(target = "wal_restore", "skip {name}: {e:#}"),
-        }
-    }
+    tasks.join().await?;
     Ok(())
 }

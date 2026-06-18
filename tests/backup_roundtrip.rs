@@ -12,8 +12,8 @@ use walross::pg::backup::increment::write_increment_header;
 use walross::pg::backup::list as list_mod;
 use walross::pg::backup::{
     BackupSentinelDto, BackupSentinelDtoV2, FileDescription, FilesMetadataDto,
-    METADATA_DATETIME_FORMAT, TablespaceSpec, files_metadata_key, format_backup_name, sentinel_key,
-    tar_part_key,
+    METADATA_DATETIME_FORMAT, PG_CONTROL_TARNAME, TablespaceSpec, files_metadata_key,
+    format_backup_name, sentinel_key, tar_part_key, tar_partitions_prefix,
 };
 use walross::storage::Storage;
 use walross::storage::fs::FsStorage;
@@ -145,6 +145,66 @@ async fn fetch_extracts_tar_part() {
     assert_eq!(
         std::fs::read(restore.join("global/pg_control")).unwrap(),
         payload_b
+    );
+}
+
+#[tokio::test]
+async fn fetch_multipart_concurrent_is_byte_clean() {
+    // Many data parts plus a pg_control part, fetched with
+    // download_concurrency>1. tar_streamer rotates at file boundaries, so
+    // parts are file-disjoint and must land byte-clean regardless of unpack
+    // order; pg_control (sorted last) applies after the data barrier
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let restore = dir.path().join("restore");
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+
+    let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&backup_name),
+        serde_json::to_vec(&make_sentinel_v2("/d")).unwrap(),
+    )
+    .await;
+
+    const PARTS: u32 = 8;
+    let mut expected: Vec<(String, Vec<u8>)> = Vec::new();
+    for n in 1..=PARTS {
+        let fname = format!("base/16384/{}", 16400 + n);
+        let body = vec![n as u8; 1024 * n as usize];
+        let tar = build_tar(&[(fname.as_str(), &body)]);
+        put_bytes(store.clone(), &tar_part_key(&backup_name, n, ""), tar).await;
+        expected.push((fname, body));
+    }
+
+    // pg_control part keyed under the partitions prefix; list_tar_parts sorts
+    // it last and the fetch unpacks it strictly after the data barrier
+    let pgc_body = vec![0x5Au8; 8192];
+    let pgc_tar = build_tar(&[("global/pg_control", &pgc_body)]);
+    let pgc_key = format!(
+        "{}/{}",
+        tar_partitions_prefix(&backup_name),
+        PG_CONTROL_TARNAME
+    );
+    put_bytes(store.clone(), &pgc_key, pgc_tar).await;
+
+    let mut s = test_settings();
+    s.download_concurrency = 4;
+
+    fetch_mod::handle(&s, store as Arc<dyn Storage>, &backup_name, &restore)
+        .await
+        .unwrap();
+
+    for (fname, body) in &expected {
+        assert_eq!(
+            &std::fs::read(restore.join(fname)).unwrap(),
+            body,
+            "{fname}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(restore.join("global/pg_control")).unwrap(),
+        pgc_body
     );
 }
 

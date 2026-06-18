@@ -594,7 +594,10 @@ mod tests {
             let body = serde_json::to_vec(&v2).unwrap();
             let len = body.len() as u64;
             let r: crate::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
-            storage.put(&sentinel_key(&name), r, Some(len)).await.unwrap();
+            storage
+                .put(&sentinel_key(&name), r, Some(len))
+                .await
+                .unwrap();
             configure_delta_parent(&storage, &delta, false)
                 .await
                 .unwrap()

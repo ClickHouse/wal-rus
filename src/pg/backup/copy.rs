@@ -10,13 +10,10 @@
 //! (`x-amz-copy-source` / GCS `rewriteTo`) when both handles sit on the same
 //! backend, falling back to piping `get` into `put` otherwise
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
+use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::backup::delete::{BackupRecord, collect_records};
 use crate::pg::backup::fetch::resolve_name;
@@ -81,35 +78,34 @@ pub async fn handle(
         }
     }
 
-    let concurrency = settings.upload_concurrency.max(1);
-    let sem = Arc::new(Semaphore::new(concurrency));
-    let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
+    let mut last_err: Option<anyhow::Error> = None;
+    // a failure is logged and remembered but doesn't abort the batch
+    // (best-effort sweep); the last error returns at the end
+    let mut tasks = BoundedTasks::new(
+        settings.upload_concurrency,
+        "copy",
+        |(key, res): (String, Result<()>)| {
+            match res {
+                Ok(()) => tracing::info!(target = "copy", "copied {key}"),
+                Err(e) => {
+                    tracing::warn!(target = "copy", "copy {key}: {e:#}");
+                    last_err = Some(e);
+                }
+            }
+            Ok(())
+        },
+    );
     for k in keys {
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .context("acquire copy permit")?;
         let src = src.clone();
         let dst = dst.clone();
-        let key = k.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            let r = copy_one(&src, &dst, &key).await;
-            (key, r)
-        });
+        tasks
+            .spawn(async move {
+                let r = copy_one(&src, &dst, &k).await;
+                (k, r)
+            })
+            .await?;
     }
-    let mut last_err: Option<anyhow::Error> = None;
-    while let Some(joined) = tasks.join_next().await {
-        let (key, res) = joined.context("copy task join")?;
-        match res {
-            Ok(()) => tracing::info!(target = "copy", "copied {key}"),
-            Err(e) => {
-                tracing::warn!(target = "copy", "copy {key}: {e:#}");
-                last_err = Some(e);
-            }
-        }
-    }
+    tasks.join().await?;
     if let Some(e) = last_err {
         return Err(e);
     }

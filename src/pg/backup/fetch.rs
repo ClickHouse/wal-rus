@@ -7,12 +7,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
+use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::backup::increment::apply_increment_in_place;
 use crate::pg::backup::{
@@ -83,6 +85,11 @@ pub async fn handle_with_args(
         );
     }
 
+    let download_concurrency = settings.download_concurrency.max(1);
+
+    // Chain steps stay sequential: a delta's increments apply in place onto
+    // the file the parent step wrote, so leaf-after-root ordering is a hard
+    // dependency. Concurrency is confined to one backup's data parts
     for (name, _) in &chain {
         let parts = list_tar_parts(&storage, name).await?;
         if parts.is_empty() {
@@ -93,16 +100,41 @@ pub async fn handle_with_args(
         }
         // Increment lookup: paged files that came down wi1/native-encoded
         // need apply_increment_in_place rather than overwrite. Pulled once
-        // per backup; small (~hundreds of KB even for big clusters)
-        let incremented = fetch_incremented_set(&storage, name).await?;
+        // per backup; small (~hundreds of KB even for big clusters). Arc'd so
+        // the per-part tasks share one copy instead of cloning the set
+        let incremented = Arc::new(fetch_incremented_set(&storage, name).await?);
         tracing::info!(
             target = "backup_fetch",
-            "found {} tar part(s) for {name} ({} incremented file(s))",
+            "found {} tar part(s) for {name} ({} incremented file(s), download_concurrency={download_concurrency})",
             parts.len(),
             incremented.len(),
         );
-        for key in &parts {
-            unpack_part(settings, &storage, key, dst, &incremented).await?;
+
+        // pg_control parts (sorted last by list_tar_parts) must apply strictly
+        // after every data part. Fan the data parts out under the download
+        // bound, barrier-join, then unpack pg_control. The chain stays
+        // sequential, so the leaf's pg_control remains the final write of the
+        // whole restore (crash mid-restore leaves no stale-but-complete one).
+        // Any part failure aborts the restore (a half-applied backup is unusable)
+        let (control, data): (Vec<String>, Vec<String>) =
+            parts.into_iter().partition(|k| k.contains("pg_control"));
+
+        let mut tasks = BoundedTasks::new(download_concurrency, "download", |r: Result<()>| r);
+        for key in data {
+            let settings = settings.clone();
+            let storage = storage.clone();
+            let dst = dst.to_path_buf();
+            let incremented = incremented.clone();
+            tasks
+                .spawn(
+                    async move { unpack_part(&settings, &storage, &key, &dst, incremented).await },
+                )
+                .await?;
+        }
+        tasks.join().await?;
+
+        for key in control {
+            unpack_part(settings, &storage, &key, dst, incremented.clone()).await?;
         }
     }
     Ok(())
@@ -259,7 +291,7 @@ async fn unpack_part(
     storage: &DynStorage,
     key: &str,
     dst: &Path,
-    incremented: &HashSet<String>,
+    incremented: Arc<HashSet<String>>,
 ) -> Result<()> {
     let method = method_from_key(key);
     let body = storage
@@ -270,7 +302,6 @@ async fn unpack_part(
     let decrypted = settings.decrypt(throttled);
     let decoded = compression::decode(method, decrypted);
     let dst: PathBuf = dst.to_path_buf();
-    let incremented = incremented.clone();
 
     let res: std::io::Result<()> = tokio::task::spawn_blocking(move || {
         let sync_r = SyncIoBridge::new(decoded);

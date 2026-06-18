@@ -14,13 +14,11 @@
 //! the fork target) and triggered from wal-fetch (see `fetch::trigger_prefetch`).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::fs;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
+use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::storage::DynStorage;
 
@@ -75,8 +73,18 @@ pub async fn handle(
     cleanup_stale(&pre, &run, seed_seg).await;
 
     let mut next = seed_seg.next(DEFAULT_WAL_SEG_SIZE);
-    let sem = Arc::new(Semaphore::new(settings.download_concurrency.max(1)));
-    let mut tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
+    // missing/transient errors don't fail the batch
+    let mut tasks = BoundedTasks::new(
+        settings.download_concurrency,
+        "prefetch",
+        |(name, res): (String, Result<()>)| {
+            match res {
+                Ok(()) => tracing::info!(target = "wal_prefetch", "prefetched {name}"),
+                Err(e) => tracing::warn!(target = "wal_prefetch", "skip {name}: {e:#}"),
+            }
+            Ok(())
+        },
+    );
 
     for _ in 0..count {
         let name = next.format();
@@ -93,30 +101,16 @@ pub async fn handle(
             tracing::debug!(target = "wal_prefetch", "{name} already staged, skipping");
             continue;
         }
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .context("acquire prefetch permit")?;
         let st = storage.clone();
         let cfg = settings.clone();
-        let ready_path = ready.clone();
-        let task_name = name.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            let r = fetch_one(&cfg, st, &task_name, &running, &ready_path).await;
-            (task_name, r)
-        });
+        tasks
+            .spawn(async move {
+                let r = fetch_one(&cfg, st, &name, &running, &ready).await;
+                (name, r)
+            })
+            .await?;
     }
-
-    while let Some(joined) = tasks.join_next().await {
-        let (name, res) = joined.context("prefetch task join")?;
-        match res {
-            Ok(()) => tracing::info!(target = "wal_prefetch", "prefetched {name}"),
-            // missing-segment + transient errors don't fail the whole batch
-            Err(e) => tracing::warn!(target = "wal_prefetch", "skip {name}: {e:#}"),
-        }
-    }
+    tasks.join().await?;
     Ok(())
 }
 
