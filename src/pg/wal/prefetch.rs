@@ -10,7 +10,7 @@
 //! `super::fetch::handle`); a successful prefetch turns a network round-trip
 //! into a local rename. Skipped on .history files (those re-resolve cheaply).
 //!
-//! Invoked two ways, mirroring wal-g: standalone (`walross wal-prefetch`, also
+//! Invoked two ways, mirroring wal-g: standalone (`wal-rs wal-prefetch`, also
 //! the fork target) and triggered from wal-fetch (see `fetch::trigger_prefetch`).
 
 use std::path::{Path, PathBuf};

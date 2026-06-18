@@ -1,9 +1,9 @@
 name: pg-compat
 
 # Integration tests adapted from wal-g's docker/pg_tests test scripts. Verifies
-# walross against a real PostgreSQL cluster on the fs storage backend, plus
+# wal-rs against a real PostgreSQL cluster on the fs storage backend, plus
 # bidirectional bucket interop with an installed wal-g binary (forward:
-# walross writes & wal-g reads, reverse: wal-g writes & walross reads).
+# wal-rs writes & wal-g reads, reverse: wal-g writes & wal-rs reads).
 
 on:
   push:
@@ -26,11 +26,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --bin walross
+      - run: cargo build --release --locked --bin wal-rs
       - uses: actions/upload-artifact@v7
         with:
-          name: walross-bin
-          path: target/release/walross
+          name: wal-rs-bin
+          path: target/release/wal-rs
           if-no-files-found: error
           retention-days: 7
 
@@ -63,12 +63,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Fetch walross binary
+      - name: Fetch wal-rs binary
         uses: actions/download-artifact@v8
         with:
-          name: walross-bin
+          name: wal-rs-bin
           path: bin
-      - run: chmod +x bin/walross && bin/walross --version
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
 
       - name: Install PostgreSQL ${{ matrix.pg }}
         uses: ./.github/actions/install-pg
@@ -89,7 +89,7 @@ jobs:
         env:
           PG_VERSION: ${{ matrix.pg }}
           PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
-          WALROSS_BIN: ${{ github.workspace }}/bin/walross
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
           WALG_BIN: /usr/local/bin/wal-g
         run: ci/${{ matrix.test }}.sh
 
@@ -99,8 +99,8 @@ jobs:
         with:
           name: logs-pg${{ matrix.pg }}-${{ matrix.test }}
           path: |
-            /tmp/walross-ci-*/**/*.log
-            /tmp/walross-ci-*/**/log/*
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -129,7 +129,7 @@ jobs:
           PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
           # Unused by the cargo tests (they call library functions directly),
           # but lib.sh requires it set; point at the build output.
-          WALROSS_BIN: ${{ github.workspace }}/target/debug/walross
+          WALRS_BIN: ${{ github.workspace }}/target/debug/wal-rs
         run: ci/vm_test_cluster.sh cargo test --features vm-test --locked
 
       - name: Collect PG logs on failure
@@ -138,8 +138,8 @@ jobs:
         with:
           name: logs-vmtest-pg${{ matrix.pg }}
           path: |
-            /tmp/walross-ci-*/**/*.log
-            /tmp/walross-ci-*/**/log/*
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -157,12 +157,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Fetch walross binary
+      - name: Fetch wal-rs binary
         uses: actions/download-artifact@v8
         with:
-          name: walross-bin
+          name: wal-rs-bin
           path: bin
-      - run: chmod +x bin/walross && bin/walross --version
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
 
       - name: Install PostgreSQL 16
         uses: ./.github/actions/install-pg
@@ -184,16 +184,16 @@ jobs:
             curl -fsS "http://127.0.0.1:4443/storage/v1/b?project=test" >/dev/null 2>&1 && break; sleep 1
           done
           AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://walross
+            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://wal-rs
           curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
-            -H 'Content-Type: application/json' -d '{"name":"walross"}'
+            -H 'Content-Type: application/json' -d '{"name":"wal-rs"}'
 
       - name: Run ${{ matrix.test }} against ${{ matrix.backend }}
         env:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
-          WALROSS_BIN: ${{ github.workspace }}/bin/walross
-          WALROSS_STORAGE_BACKEND: ${{ matrix.backend }}
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
+          WALRS_STORAGE_BACKEND: ${{ matrix.backend }}
           MINIO_ENDPOINT: http://127.0.0.1:9000
           FAKE_GCS_ENDPOINT: http://127.0.0.1:4443
         run: ci/${{ matrix.test }}.sh
@@ -204,8 +204,8 @@ jobs:
         with:
           name: logs-storage-${{ matrix.backend }}-${{ matrix.test }}
           path: |
-            /tmp/walross-ci-*/**/*.log
-            /tmp/walross-ci-*/**/log/*
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -221,12 +221,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Fetch walross binary
+      - name: Fetch wal-rs binary
         uses: actions/download-artifact@v8
         with:
-          name: walross-bin
+          name: wal-rs-bin
           path: bin
-      - run: chmod +x bin/walross && bin/walross --version
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
 
       - name: Install PostgreSQL 16
         uses: ./.github/actions/install-pg
@@ -237,7 +237,7 @@ jobs:
         env:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
-          WALROSS_BIN: ${{ github.workspace }}/bin/walross
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
         run: ci/${{ matrix.test }}.sh
 
       - name: Collect logs on failure
@@ -246,8 +246,8 @@ jobs:
         with:
           name: logs-tlsscram-${{ matrix.test }}
           path: |
-            /tmp/walross-ci-*/**/*.log
-            /tmp/walross-ci-*/**/log/*
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -263,12 +263,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Fetch walross binary
+      - name: Fetch wal-rs binary
         uses: actions/download-artifact@v8
         with:
-          name: walross-bin
+          name: wal-rs-bin
           path: bin
-      - run: chmod +x bin/walross && bin/walross --version
+      - run: chmod +x bin/wal-rs && bin/wal-rs --version
 
       - name: Install PostgreSQL 16
         uses: ./.github/actions/install-pg
@@ -279,7 +279,7 @@ jobs:
         env:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
-          WALROSS_BIN: ${{ github.workspace }}/bin/walross
+          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
           WALG_COMPRESSION_METHOD: ${{ matrix.codec }}
         run: ci/full_backup.sh
 
@@ -289,8 +289,8 @@ jobs:
         with:
           name: logs-codec-${{ matrix.codec }}
           path: |
-            /tmp/walross-ci-*/**/*.log
-            /tmp/walross-ci-*/**/log/*
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -330,7 +330,7 @@ jobs:
           PG_BIN: /usr/lib/postgresql/17/bin
           # Unused by the cargo tests (they call library functions directly),
           # but lib.sh requires it set; point at the build output.
-          WALROSS_BIN: ${{ github.workspace }}/target/debug/walross
+          WALRS_BIN: ${{ github.workspace }}/target/debug/wal-rs
         run: |
           cargo llvm-cov clean
           ci/vm_test_cluster.sh \
@@ -382,7 +382,7 @@ jobs:
         with:
           name: logs-coverage
           path: |
-            /tmp/walross-ci-*/**/*.log
-            /tmp/walross-ci-*/**/log/*
+            /tmp/wal-rs-ci-*/**/*.log
+            /tmp/wal-rs-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14

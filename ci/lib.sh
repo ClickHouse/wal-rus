@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Shared helpers for walross CI tests. Sourced by ci/*.sh.
+# Shared helpers for wal-rs CI tests. Sourced by ci/*.sh.
 #
 # Adapted from wal-g's docker/pg_tests/scripts/tests/test_functions/. Differs
 # in that PG runs under the runner user (no `postgres` OS account, no docker
-# isolation), and storage defaults to fs (WALG_FILE_PREFIX) since walross's S3
+# isolation), and storage defaults to fs (WALG_FILE_PREFIX) since wal-rs's S3
 # matrix isn't on this path yet.
 
 set -euo pipefail
 
 : "${PG_BIN:?PG_BIN must point at the postgresql bindir, e.g. /usr/lib/postgresql/16/bin}"
-: "${WALROSS_BIN:?WALROSS_BIN must point at the walross binary}"
+: "${WALRS_BIN:?WALRS_BIN must point at the wal-rs binary}"
 
 export PATH="$PG_BIN:$PATH"
 
 # Per-test scratch dir; kept on failure for log upload
-WORKROOT=$(mktemp -d -t walross-ci-XXXXXX)
+WORKROOT=$(mktemp -d -t wal-rs-ci-XXXXXX)
 export PGDATA="$WORKROOT/pgdata"
 export PGHOST="$WORKROOT/run"
 export PGUSER="$(id -un)"
@@ -26,12 +26,12 @@ export WALG_COMPRESSION_METHOD="${WALG_COMPRESSION_METHOD:-zstd}"
 
 mkdir -p "$PGHOST"
 
-# Configure the storage backend from WALROSS_STORAGE_BACKEND (default fs). Exports
-# the WALG_* vars the walross binary reads, plus WALG_ARCHIVE_ENV: the `KEY=VAL`
+# Configure the storage backend from WALRS_STORAGE_BACKEND (default fs). Exports
+# the WALG_* vars the wal-rs binary reads, plus WALG_ARCHIVE_ENV: the `KEY=VAL`
 # prefix pg_archive_on inlines so the archive_command subprocess targets the
 # same backend. s3 points at MinIO (path-style), gcs at fake-gcs-server.
 storage_init() {
-    local backend="${WALROSS_STORAGE_BACKEND:-fs}"
+    local backend="${WALRS_STORAGE_BACKEND:-fs}"
     case "$backend" in
     fs)
         export WALG_FILE_PREFIX="$WORKROOT/storage"
@@ -43,7 +43,7 @@ storage_init() {
         ;;
     s3)
         : "${MINIO_ENDPOINT:?set MINIO_ENDPOINT, e.g. http://127.0.0.1:9000}"
-        local bucket="${WALROSS_S3_BUCKET:-walross}"
+        local bucket="${WALRS_S3_BUCKET:-wal-rs}"
         export WALG_S3_PREFIX="s3://$bucket/$(basename "$WORKROOT")"
         export AWS_ENDPOINT_URL="$MINIO_ENDPOINT"
         export WALG_S3_FORCE_PATH_STYLE=true
@@ -54,13 +54,13 @@ storage_init() {
         ;;
     gcs)
         : "${FAKE_GCS_ENDPOINT:?set FAKE_GCS_ENDPOINT, e.g. http://127.0.0.1:4443}"
-        local bucket="${WALROSS_GS_BUCKET:-walross}"
+        local bucket="${WALRS_GS_BUCKET:-wal-rs}"
         export WALG_GS_PREFIX="gs://$bucket/$(basename "$WORKROOT")"
         export WALG_GS_ENDPOINT="$FAKE_GCS_ENDPOINT"
         WALG_ARCHIVE_ENV="WALG_GS_PREFIX=$WALG_GS_PREFIX WALG_GS_ENDPOINT=$WALG_GS_ENDPOINT"
         ;;
     *)
-        echo "unknown WALROSS_STORAGE_BACKEND=$backend" >&2
+        echo "unknown WALRS_STORAGE_BACKEND=$backend" >&2
         exit 1
         ;;
     esac
@@ -127,7 +127,7 @@ pg_hba_replication() {
 }
 
 # Listen on TCP loopback in addition to the unix socket. Required for the
-# TLS + SCRAM lanes: walross skips TLS on unix sockets (mirrors libpq), and the
+# TLS + SCRAM lanes: wal-rs skips TLS on unix sockets (mirrors libpq), and the
 # handshake tests connect with PGHOST=127.0.0.1.
 pg_listen_tcp() {
     cat >>"$PGDATA/postgresql.conf" <<EOF
@@ -149,7 +149,7 @@ pg_drop() {
 }
 
 # PG 12+ uses recovery.signal + postgresql.conf; older versions use
-# recovery.conf. walross supports PG 13+ so the signal-file branch is the only
+# recovery.conf. wal-rs supports PG 13+ so the signal-file branch is the only
 # one currently exercised, but keep the older branch for forward-compat.
 pg_recovery_conf() {
     local restore_cmd=$1
@@ -164,8 +164,8 @@ pg_recovery_conf() {
 # Re-export so child processes inherit a clean env. Avoid hard-coding
 # WALG_FILE_PREFIX into archive_command in some tests since wal-g's
 # `wal-push` reads it from the environment, not the args.
-walross() {
-    "$WALROSS_BIN" "$@"
+wal-rs() {
+    "$WALRS_BIN" "$@"
 }
 
 walg() {
@@ -187,15 +187,15 @@ cross_roundtrip() {
     psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
     pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump1.sql"
 
-    if [ "$writer" = "$WALROSS_BIN" ]; then walross backup-push; else walg backup-push "$PGDATA"; fi
+    if [ "$writer" = "$WALRS_BIN" ]; then wal-rs backup-push; else walg backup-push "$PGDATA"; fi
     psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
     sleep 3
 
     pg_drop
     mkdir -p "$PGDATA"
     chmod 700 "$PGDATA"
-    # arg order differs: walross backup-fetch <name> <dst>, walg backup-fetch <dst> <name>
-    if [ "$reader" = "$WALROSS_BIN" ]; then walross backup-fetch LATEST "$PGDATA"; else walg backup-fetch "$PGDATA" LATEST; fi
+    # arg order differs: wal-rs backup-fetch <name> <dst>, walg backup-fetch <dst> <name>
+    if [ "$reader" = "$WALRS_BIN" ]; then wal-rs backup-fetch LATEST "$PGDATA"; else walg backup-fetch "$PGDATA" LATEST; fi
 
     pg_recovery_conf "$reader wal-fetch %f %p"
     pg_start
@@ -221,13 +221,13 @@ trap cleanup EXIT
 # would need API deletes, so it's an explicit error there (the storage-lane
 # scripts use a fresh per-run prefix instead of resetting mid-run).
 bucket_reset() {
-    case "${WALROSS_STORAGE_BACKEND:-fs}" in
+    case "${WALRS_STORAGE_BACKEND:-fs}" in
     fs)
         rm -rf "$WALG_FILE_PREFIX"
         mkdir -p "$WALG_FILE_PREFIX"
         ;;
     *)
-        echo "bucket_reset unsupported for WALROSS_STORAGE_BACKEND=${WALROSS_STORAGE_BACKEND}" >&2
+        echo "bucket_reset unsupported for WALRS_STORAGE_BACKEND=${WALRS_STORAGE_BACKEND}" >&2
         return 1
         ;;
     esac

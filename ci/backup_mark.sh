@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Adapted from wal-g docker/pg_tests/scripts/tests/backup_mark_permanent_test.sh
-# and backup_mark_impermanent_test.sh. walross doesn't yet implement delete, so
+# and backup_mark_impermanent_test.sh. wal-rs doesn't yet implement delete, so
 # this verifies only the sentinel mutation (IsPermanent toggle) rather than
 # delete-retention interaction.
 
@@ -10,25 +10,25 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
 pg_initdb
-pg_archive_on "$WALROSS_BIN"
+pg_archive_on "$WALRS_BIN"
 pg_start
 
 pgbench -p "$PGPORT" -h "$PGHOST" -i -s 1 postgres
 psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
 
-walross backup-push
-walross backup-list
+wal-rs backup-push
+wal-rs backup-list
 
 permanent_of() {
     # is_permanent is exposed as snake_case in backup-list --json
-    walross backup-list --json \
+    wal-rs backup-list --json \
         | python3 -c 'import sys,json; b=json.load(sys.stdin)[0]; print("true" if b["is_permanent"] else "false")'
 }
 
 initial=$(permanent_of)
-walross backup-mark LATEST
+wal-rs backup-mark LATEST
 marked=$(permanent_of)
-walross backup-mark LATEST --impermanent
+wal-rs backup-mark LATEST --impermanent
 unmarked=$(permanent_of)
 
 [ "$initial"  = "false" ] || { echo "expected initial=false, got $initial";  exit 1; }

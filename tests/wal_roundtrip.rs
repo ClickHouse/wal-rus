@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use walross::compression::Method;
-use walross::config::{Settings, StorageSettings};
-use walross::pg::wal;
-use walross::storage::fs::FsStorage;
+use pgwalrs::compression::Method;
+use pgwalrs::config::{Settings, StorageSettings};
+use pgwalrs::pg::wal;
+use pgwalrs::storage::fs::FsStorage;
 
 fn pseudo_wal_segment(seed: u8) -> Vec<u8> {
     // 16MB to match default wal_segsize
@@ -26,7 +26,7 @@ fn settings_for(path: &str, method: Method) -> Settings {
         upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
-        retry: walross::retry::RetryPolicy::default(),
+        retry: pgwalrs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
@@ -199,7 +199,7 @@ async fn history_file_idempotent_overwrite_allowed() {
 
 #[tokio::test]
 async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
-    use walross::pg::wal::prefetch;
+    use pgwalrs::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -214,7 +214,7 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
     for hex in ["000000010000000000000002", "000000010000000000000003"] {
         let stage = stage_dir.join(hex);
         std::fs::write(&stage, hex.as_bytes()).unwrap();
-        walross::pg::wal::push::handle(&s, store.clone(), &stage)
+        pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
             .await
             .unwrap();
     }
@@ -230,7 +230,7 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
 
     // Now wal-fetch should promote the staged segment via rename
     let dst = pg_wal.join("000000010000000000000002");
-    walross::pg::wal::fetch::handle(
+    pgwalrs::pg::wal::fetch::handle(
         &s,
         store,
         "000000010000000000000002",
@@ -248,7 +248,7 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
 
 #[tokio::test]
 async fn prefetch_cleans_stale_already_replayed_segments() {
-    use walross::pg::wal::prefetch;
+    use pgwalrs::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -263,7 +263,7 @@ async fn prefetch_cleans_stale_already_replayed_segments() {
     let six = "000000010000000000000006";
     let stage = stage_dir.join(six);
     std::fs::write(&stage, six.as_bytes()).unwrap();
-    walross::pg::wal::push::handle(&s, store.clone(), &stage)
+    pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
         .await
         .unwrap();
 
@@ -288,8 +288,8 @@ async fn prefetch_cleans_stale_already_replayed_segments() {
 
 #[tokio::test]
 async fn wal_fetch_triggers_in_process_prefetch() {
+    use pgwalrs::pg::wal::prefetch;
     use std::time::Duration;
-    use walross::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -304,7 +304,7 @@ async fn wal_fetch_triggers_in_process_prefetch() {
     for hex in ["000000010000000000000001", "000000010000000000000002"] {
         let stage = stage_dir.join(hex);
         std::fs::write(&stage, hex.as_bytes()).unwrap();
-        walross::pg::wal::push::handle(&s, store.clone(), &stage)
+        pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
             .await
             .unwrap();
     }
@@ -336,8 +336,8 @@ async fn wal_fetch_triggers_in_process_prefetch() {
 
 #[tokio::test]
 async fn wal_show_groups_segments_and_detects_gaps() {
-    use walross::pg::wal::show;
-    use walross::storage::Storage;
+    use pgwalrs::pg::wal::show;
+    use pgwalrs::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -355,7 +355,7 @@ async fn wal_show_groups_segments_and_detects_gaps() {
     ] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        walross::pg::wal::push::handle(&s, store.clone(), &p)
+        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
@@ -373,8 +373,8 @@ async fn wal_show_groups_segments_and_detects_gaps() {
 
 #[tokio::test]
 async fn wal_restore_fills_gap_into_local_dir() {
-    use walross::pg::wal::restore;
-    use walross::storage::Storage;
+    use pgwalrs::pg::wal::restore;
+    use pgwalrs::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -394,7 +394,7 @@ async fn wal_restore_fills_gap_into_local_dir() {
     ] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        walross::pg::wal::push::handle(&s, store.clone(), &p)
+        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
@@ -418,7 +418,7 @@ async fn wal_restore_fills_gap_into_local_dir() {
     for hex in ["000000010000000000000002", "000000010000000000000003"] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        walross::pg::wal::push::handle(&s, store.clone(), &p)
+        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
@@ -436,9 +436,9 @@ async fn wal_restore_fills_gap_into_local_dir() {
 
 #[tokio::test]
 async fn wal_verify_integrity_detects_gap_after_backup() {
-    use walross::pg::backup::{format_backup_name, sentinel_key};
-    use walross::pg::wal::verify;
-    use walross::storage::Storage;
+    use pgwalrs::pg::backup::{format_backup_name, sentinel_key};
+    use pgwalrs::pg::wal::verify;
+    use pgwalrs::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -455,15 +455,15 @@ async fn wal_verify_integrity_detects_gap_after_backup() {
     ] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        walross::pg::wal::push::handle(&s, store.clone(), &p)
+        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
     // Build a synthetic sentinel that pins the backup at seg-1's LSN
     let seg_size: u64 = 16 * 1024 * 1024;
     let backup_name = format_backup_name(1, seg_size, seg_size);
-    let v2 = walross::pg::backup::BackupSentinelDtoV2 {
-        sentinel: walross::pg::backup::BackupSentinelDto {
+    let v2 = pgwalrs::pg::backup::BackupSentinelDtoV2 {
+        sentinel: pgwalrs::pg::backup::BackupSentinelDto {
             backup_start_lsn: Some(seg_size),
             increment_from_lsn: None,
             increment_from: None,
@@ -485,14 +485,14 @@ async fn wal_verify_integrity_detects_gap_after_backup() {
         version: 2,
         start_time: chrono::Utc::now(),
         finish_time: chrono::Utc::now(),
-        date_fmt: walross::pg::backup::METADATA_DATETIME_FORMAT.into(),
+        date_fmt: pgwalrs::pg::backup::METADATA_DATETIME_FORMAT.into(),
         hostname: "h".into(),
         data_dir: "/d".into(),
         is_permanent: false,
     };
     let bytes = serde_json::to_vec(&v2).unwrap();
     let len = bytes.len() as u64;
-    let r: walross::compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+    let r: pgwalrs::compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
     store
         .put(&sentinel_key(&backup_name), r, Some(len))
         .await
@@ -540,8 +540,8 @@ async fn fetch_falls_back_to_uncompressed_when_zstd_missing() {
 }
 
 fn encrypted_settings(path: &str, method: Method) -> Settings {
+    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
     use std::sync::Arc;
-    use walross::crypto::libsodium::LibsodiumCrypter;
     let mut k = [0u8; 32];
     for (i, b) in k.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(13).wrapping_add(7);
@@ -587,8 +587,8 @@ async fn push_fetch_libsodium_encrypted_roundtrip() {
 
 #[tokio::test]
 async fn fetch_with_wrong_key_fails() {
+    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
     use std::sync::Arc;
-    use walross::crypto::libsodium::LibsodiumCrypter;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");

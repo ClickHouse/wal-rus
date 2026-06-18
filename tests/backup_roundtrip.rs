@@ -4,19 +4,19 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use walross::compression::Method;
-use walross::config::{DeltaSettings, Settings, StorageSettings};
-use walross::pg::backup::delta as delta_mod;
-use walross::pg::backup::fetch as fetch_mod;
-use walross::pg::backup::increment::write_increment_header;
-use walross::pg::backup::list as list_mod;
-use walross::pg::backup::{
+use pgwalrs::compression::Method;
+use pgwalrs::config::{DeltaSettings, Settings, StorageSettings};
+use pgwalrs::pg::backup::delta as delta_mod;
+use pgwalrs::pg::backup::fetch as fetch_mod;
+use pgwalrs::pg::backup::increment::write_increment_header;
+use pgwalrs::pg::backup::list as list_mod;
+use pgwalrs::pg::backup::{
     BackupSentinelDto, BackupSentinelDtoV2, FileDescription, FilesMetadataDto,
     METADATA_DATETIME_FORMAT, PG_CONTROL_TARNAME, TablespaceSpec, files_metadata_key,
     format_backup_name, sentinel_key, tar_part_key, tar_partitions_prefix,
 };
-use walross::storage::Storage;
-use walross::storage::fs::FsStorage;
+use pgwalrs::storage::Storage;
+use pgwalrs::storage::fs::FsStorage;
 
 fn test_settings() -> Settings {
     Settings {
@@ -29,7 +29,7 @@ fn test_settings() -> Settings {
         upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
-        retry: walross::retry::RetryPolicy::default(),
+        retry: pgwalrs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
@@ -87,7 +87,7 @@ fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
 
 async fn put_bytes(store: Arc<FsStorage>, key: &str, body: Vec<u8>) {
     let len = body.len() as u64;
-    let r: walross::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
+    let r: pgwalrs::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
     store.put(key, r, Some(len)).await.unwrap();
 }
 
@@ -322,7 +322,7 @@ async fn fetch_recreates_tablespace_symlinks() {
 
 #[tokio::test]
 async fn show_round_trip_and_mark_flips_permanent() {
-    use walross::pg::backup::show as show_mod;
+    use pgwalrs::pg::backup::show as show_mod;
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsStorage::new(dir.path()).unwrap());
@@ -466,10 +466,10 @@ async fn delta_parent_falls_back_when_max_steps_reached() {
 async fn fetch_decrypts_libsodium_tar_part() {
     use async_compression::Level;
     use async_compression::tokio::bufread::ZstdEncoder;
+    use pgwalrs::crypto::Crypter as _;
+    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
     use tokio::io::AsyncReadExt;
     use tokio::io::BufReader;
-    use walross::crypto::Crypter as _;
-    use walross::crypto::libsodium::LibsodiumCrypter;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -507,7 +507,7 @@ async fn fetch_decrypts_libsodium_tar_part() {
     let mut encoder = ZstdEncoder::with_quality(buffered, Level::Precise(3));
     let mut compressed = Vec::new();
     encoder.read_to_end(&mut compressed).await.unwrap();
-    let plain: walross::compression::AsyncReader = Box::pin(std::io::Cursor::new(compressed));
+    let plain: pgwalrs::compression::AsyncReader = Box::pin(std::io::Cursor::new(compressed));
     let mut encrypted_reader = crypter.encrypt_reader(plain);
     let mut encrypted = Vec::new();
     encrypted_reader.read_to_end(&mut encrypted).await.unwrap();

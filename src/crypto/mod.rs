@@ -11,7 +11,7 @@
 //! # OpenPGP intentionally not supported
 //!
 //! wal-g supports both libsodium (XChaCha20-Poly1305 secretstream) and OpenPGP
-//! (`WALG_PGP_KEY` / `_PATH` / `_PASSPHRASE`). walross ships libsodium only,
+//! (`WALG_PGP_KEY` / `_PATH` / `_PASSPHRASE`). wal-rs ships libsodium only,
 //! by design:
 //!
 //! - The pure-Rust OpenPGP options (`pgp` aka rPGP) pull a heavy dependency
@@ -28,7 +28,7 @@
 //!   doesn't need.
 //!
 //! A user with a wal-g bucket that's *already* encrypted with OpenPGP must
-//! re-encrypt to libsodium before switching to walross (or stay on wal-g).
+//! re-encrypt to libsodium before switching to wal-rs (or stay on wal-g).
 //! `WALG_PGP_*` env vars are detected and produce a hard error directing the
 //! user here rather than silently writing plaintext — see [`forbid_pgp_env`]
 
@@ -72,7 +72,7 @@ pub fn forbid_pgp_env() -> Result<()> {
         .collect();
     if !set.is_empty() {
         bail!(
-            "OpenPGP encryption is not supported by walross ({set:?} set). \
+            "OpenPGP encryption is not supported by wal-rs ({set:?} set). \
              Use WALG_LIBSODIUM_KEY / _KEY_PATH instead, or run wal-g for the \
              PGP-encrypted bucket. See src/crypto/mod.rs for rationale."
         );

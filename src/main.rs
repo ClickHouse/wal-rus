@@ -3,9 +3,9 @@ use std::process::ExitCode;
 use clap::Parser;
 
 fn main() -> ExitCode {
-    walross::log::init();
+    pgwalrs::log::init();
 
-    let cli = walross::cli::Cli::parse();
+    let cli = pgwalrs::cli::Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -15,7 +15,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: walross::cli::Cli) -> anyhow::Result<()> {
+fn run(cli: pgwalrs::cli::Cli) -> anyhow::Result<()> {
     let threads = cli.worker_threads()?;
     // current_thread when 1: no worker threads, single glibc malloc arena
     // (see docs/DESIGN.md Runtime)

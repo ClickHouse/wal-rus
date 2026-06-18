@@ -17,7 +17,7 @@ no-overcommit hosts (streaming I/O, no full-segment buffering).
 `wal-receive`, `backup-push`, `backup-fetch`, `backup-list`, `backup-show`,
 `backup-mark`, `delete`, `copy`, `daemon`, `daemon-client`
 
-Configuration follows wal-g env vars (`WALG_*`, `PG*`). See `walross --help` per
+Configuration follows wal-g env vars (`WALG_*`, `PG*`). See `wal-rs --help` per
 subcommand.
 
 ## Docs

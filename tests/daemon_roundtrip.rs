@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use tokio::net::UnixStream;
 
-use walross::cli::DaemonOp;
-use walross::compression::Method;
-use walross::config::{Settings, StorageSettings};
-use walross::daemon::protocol::{MessageType, read_message, write_message};
-use walross::storage::fs::FsStorage;
+use pgwalrs::cli::DaemonOp;
+use pgwalrs::compression::Method;
+use pgwalrs::config::{Settings, StorageSettings};
+use pgwalrs::daemon::protocol::{MessageType, read_message, write_message};
+use pgwalrs::storage::fs::FsStorage;
 
 fn fs_settings(storage_dir: &std::path::Path) -> Settings {
     Settings {
@@ -23,7 +23,7 @@ fn fs_settings(storage_dir: &std::path::Path) -> Settings {
         upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
-        retry: walross::retry::RetryPolicy::default(),
+        retry: pgwalrs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
@@ -49,7 +49,7 @@ async fn daemon_check_and_wal_roundtrip() {
     let restore = dir.path().join("restore");
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::create_dir_all(&restore).unwrap();
-    let socket = dir.path().join("walross.sock");
+    let socket = dir.path().join("wal-rs.sock");
 
     let segment = "000000010000000000000001";
     let src = stage.join(segment);
@@ -60,7 +60,7 @@ async fn daemon_check_and_wal_roundtrip() {
 
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
-        let _ = walross::daemon::serve(&socket_for_server, s, store).await;
+        let _ = pgwalrs::daemon::serve(&socket_for_server, s, store).await;
     });
 
     wait_for_socket(&socket).await;
@@ -68,11 +68,11 @@ async fn daemon_check_and_wal_roundtrip() {
     let op_to = Duration::from_secs(60);
     let conn_to = Duration::from_secs(5);
 
-    walross::daemon::client::run(&socket, DaemonOp::Check, op_to, conn_to)
+    pgwalrs::daemon::client::run(&socket, DaemonOp::Check, op_to, conn_to)
         .await
         .unwrap();
 
-    walross::daemon::client::run(
+    pgwalrs::daemon::client::run(
         &socket,
         DaemonOp::WalPush {
             wal_filepath: src.clone(),
@@ -84,7 +84,7 @@ async fn daemon_check_and_wal_roundtrip() {
     .unwrap();
 
     let dst: PathBuf = restore.join(segment);
-    walross::daemon::client::run(
+    pgwalrs::daemon::client::run(
         &socket,
         DaemonOp::WalFetch {
             name: segment.into(),
@@ -108,13 +108,13 @@ async fn daemon_check_and_wal_roundtrip() {
 async fn daemon_closes_connection_on_handler_error() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
-    let socket = dir.path().join("walross.sock");
+    let socket = dir.path().join("wal-rs.sock");
 
     let s = fs_settings(&storage_dir);
     let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
-        let _ = walross::daemon::serve(&socket_for_server, s, store).await;
+        let _ = pgwalrs::daemon::serve(&socket_for_server, s, store).await;
     });
     wait_for_socket(&socket).await;
 
@@ -153,7 +153,7 @@ async fn client_operation_timeout_fires() {
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
 
-    let err = walross::daemon::client::run(
+    let err = pgwalrs::daemon::client::run(
         &socket,
         DaemonOp::Check,
         Duration::from_millis(100),

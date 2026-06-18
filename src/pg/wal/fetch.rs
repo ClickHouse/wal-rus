@@ -1,7 +1,7 @@
 //! wal-fetch: download WAL segment from storage, decompress, write to dst path
 //!
 //! Try configured compression first, fall back to other extensions to support
-//! buckets written by mixed-config wal-g/walross invocations
+//! buckets written by mixed-config wal-g/wal-rs invocations
 
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,7 @@ const CANDIDATE_EXTS: &[&str] = &["zst", "br", "lz4", "lzma", ""];
 pub enum Prefetch {
     /// No prefetch: internal fetches (wal-restore, the prefetch worker itself)
     Off,
-    /// Fork a detached `walross wal-prefetch` child so prefetch outlives this
+    /// Fork a detached `wal-rs wal-prefetch` child so prefetch outlives this
     /// short-lived process (CLI restore_command path; wal-g RegularPrefetcher)
     Fork,
     /// Run prefetch as a background task in this long-lived process
@@ -131,7 +131,7 @@ fn trigger_prefetch(
     }
 }
 
-/// Spawn a detached `walross wal-prefetch <name> <pg_wal>` child. It inherits
+/// Spawn a detached `wal-rs wal-prefetch <name> <pg_wal>` child. It inherits
 /// env (storage creds, WALG_*) and is never waited on; once the parent exits,
 /// init reaps it (wal-g RegularPrefetcher via exec.Command + cmd.Start)
 fn fork_prefetch(name: &str, pg_wal: &Path) {

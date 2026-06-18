@@ -119,7 +119,7 @@ delegates to `WebPkiServerVerifier`, suppressing only
 
 Client certificate auth (mutual TLS): set `PGSSLCERT` and `PGSSLKEY` to a
 PEM cert chain and unencrypted private key (PKCS#8 / PKCS#1 / SEC1) and
-walross presents them in every TLS mode. Both must be set together;
+wal-rs presents them in every TLS mode. Both must be set together;
 encrypted keys (`PGSSLPASSWORD`) and libpq's `~/.postgresql/postgresql.{crt,key}`
 default location aren't honored, matching the env-only `PGSSLROOTCERT` handling.
 

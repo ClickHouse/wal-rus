@@ -1,4 +1,4 @@
-//! Round-trip test: wire walross's walsender server to
+//! Round-trip test: wire wal-rs's walsender server to
 //! its own `ReplicationConn` client side via a real TCP socket.
 //!
 //! Validates the wire shapes a PG18 walreceiver needs:
@@ -15,16 +15,16 @@
 use std::time::Duration;
 
 use fallible_iterator::FallibleIterator;
-use postgres_protocol::message::backend::Message;
-use tokio::net::TcpListener;
-use walross::pg::replication::conn::{PgConfig, ReplicationConn};
-use walross::pg::replication::server::{
+use pgwalrs::pg::replication::conn::{PgConfig, ReplicationConn};
+use pgwalrs::pg::replication::server::{
     Identity, WalSenderConn, decode_standby_status, handshake_and_await_start,
 };
-use walross::pg::replication::stream::{
+use pgwalrs::pg::replication::stream::{
     Frame, build_status_update, decode_frame, encode_keepalive_frame, encode_wal_data_frame,
 };
-use walross::pg::replication::tls::SslMode;
+use pgwalrs::pg::replication::tls::SslMode;
+use postgres_protocol::message::backend::Message;
+use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn protocol_roundtrip_through_tcp() {
@@ -73,7 +73,7 @@ async fn protocol_roundtrip_through_tcp() {
         user: "u".into(),
         password: None,
         database: "u".into(),
-        application_name: "walross-server-test".into(),
+        application_name: "wal-rs-server-test".into(),
         sslmode: SslMode::Disable,
     };
     let mut client = ReplicationConn::connect(&cfg)

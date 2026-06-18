@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Adapted from wal-g docker/pg_tests/scripts/tests/daemon_test.sh +
-# daemon_client_test.sh. walross's daemon currently exposes Check / WalPush /
+# daemon_client_test.sh. wal-rs's daemon currently exposes Check / WalPush /
 # WalFetch over the wal-g binary wire protocol.
 #
 # Coverage: bare wire CHECK over nc (verifies binary protocol byte for byte),
@@ -23,7 +23,7 @@ WAL=$(ls "$PGDATA/pg_wal" | grep -E '^[0-9A-F]{24}$' | head -n1)
 [ -n "$WAL" ] || { echo "no WAL segment found"; exit 1; }
 
 SOCKET="$WORKROOT/wal-daemon.sock"
-walross daemon --socket "$SOCKET" >"$WORKROOT/daemon.log" 2>&1 &
+wal-rs daemon --socket "$SOCKET" >"$WORKROOT/daemon.log" 2>&1 &
 DAEMON_PID=$!
 trap 'kill $DAEMON_PID 2>/dev/null || true; cleanup' EXIT
 
@@ -42,17 +42,17 @@ case "$RESP" in
 esac
 
 # CLI client paths
-walross daemon-client --socket "$SOCKET" check
-walross daemon-client --socket "$SOCKET" wal-push "$PGDATA/pg_wal/$WAL"
+wal-rs daemon-client --socket "$SOCKET" check
+wal-rs daemon-client --socket "$SOCKET" wal-push "$PGDATA/pg_wal/$WAL"
 
 # Verify the push actually landed by fetching via direct CLI (not daemon).
 DST="$WORKROOT/fetched_wal"
-walross wal-fetch "$WAL" "$DST"
+wal-rs wal-fetch "$WAL" "$DST"
 test -s "$DST" || { echo "wal-fetch produced empty file"; exit 1; }
 
 # And via the daemon-client fetch path
 DST2="$WORKROOT/fetched_wal_via_daemon"
-walross daemon-client --socket "$SOCKET" wal-fetch "$WAL" "$DST2"
+wal-rs daemon-client --socket "$SOCKET" wal-fetch "$WAL" "$DST2"
 test -s "$DST2" || { echo "daemon-client wal-fetch produced empty file"; exit 1; }
 
 cmp "$DST" "$DST2"

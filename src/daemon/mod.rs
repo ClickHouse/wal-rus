@@ -101,7 +101,7 @@ fn spawn_sigusr1_listener() {
 /// Resolve a daemon WAL path the way wal-g's getFullPath does. PG's
 /// archive_command passes `%f` (bare segment name) and restore_command `%p`
 /// (`pg_wal/RECOVERYXLOG`, relative to the data dir); both resolve under
-/// PGDATA. walross's own client sends absolute paths, honored as-is. Without
+/// PGDATA. wal-rs's own client sends absolute paths, honored as-is. Without
 /// PGDATA, relative args stay cwd-relative (pre-PGDATA behavior)
 fn resolve_pgdata_path(arg: &str, pgdata: Option<&Path>, under_pg_wal: bool) -> PathBuf {
     let p = Path::new(arg);
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn absolute_arg_wins_over_pgdata() {
-        // walross's own client sends absolute paths
+        // wal-rs's own client sends absolute paths
         let base = Path::new("/var/lib/pg/data");
         let abs = "/mnt/wal/000000010000000000000001";
         assert_eq!(resolve_pgdata_path(abs, Some(base), true), Path::new(abs));

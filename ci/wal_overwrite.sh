@@ -21,28 +21,28 @@ mkdir -p "$PGDATA/pg_wal"
 export WALG_PREVENT_WAL_OVERWRITE=false
 
 echo test > "$PGDATA/pg_wal/test_file.history"
-walross wal-push "$PGDATA/pg_wal/test_file.history"
+wal-rs wal-push "$PGDATA/pg_wal/test_file.history"
 # Re-push identical content — must succeed
-walross wal-push "$PGDATA/pg_wal/test_file.history"
+wal-rs wal-push "$PGDATA/pg_wal/test_file.history"
 
 echo test1 > "$PGDATA/pg_wal/test_file.history"
-if walross wal-push "$PGDATA/pg_wal/test_file.history"; then
+if wal-rs wal-push "$PGDATA/pg_wal/test_file.history"; then
     echo "ERROR: divergent .history push succeeded with overwrite=false"
     exit 1
 fi
 
 # Case 2: WALG_PREVENT_WAL_OVERWRITE=true — regular WAL names also compare.
-# Use a plausible-looking WAL segment name (24 hex chars) since walross rejects
+# Use a plausible-looking WAL segment name (24 hex chars) since wal-rs rejects
 # anything that isn't a wal segment or .history.
 export WALG_PREVENT_WAL_OVERWRITE=true
 SEG="$PGDATA/pg_wal/000000010000000000000099"
 dd if=/dev/zero bs=1 count=16 of="$SEG" status=none
-walross wal-push "$SEG"
+wal-rs wal-push "$SEG"
 # identical re-push
-walross wal-push "$SEG"
+wal-rs wal-push "$SEG"
 
 dd if=/dev/urandom bs=1 count=16 of="$SEG" status=none
-if walross wal-push "$SEG"; then
+if wal-rs wal-push "$SEG"; then
     echo "ERROR: divergent WAL push succeeded with overwrite=true"
     exit 1
 fi

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Forward bucket interop: walross writes the backup, wal-g reads it.
+# Forward bucket interop: wal-rs writes the backup, wal-g reads it.
 # Adapted from scripts/vm-cross-tool.sh; mirrors wal-g's
 # pg_wale_compatibility_test pattern of "different tool restores, identical
 # PG boots".
@@ -10,20 +10,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
 pg_initdb
-pg_archive_on "$WALROSS_BIN"
+pg_archive_on "$WALRS_BIN"
 pg_start
 
 pgbench -p "$PGPORT" -h "$PGHOST" -i -s 1 postgres
 psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
 pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump1.sql"
 
-walross backup-push
+wal-rs backup-push
 psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
 sleep 3
 
-# wal-g must see the backup written by walross
+# wal-g must see the backup written by wal-rs
 walg backup-list | tee "$WORKROOT/walg-list.txt"
-grep -E '^base_' "$WORKROOT/walg-list.txt" || { echo "wal-g cannot see walross backup"; exit 1; }
+grep -E '^base_' "$WORKROOT/walg-list.txt" || { echo "wal-g cannot see wal-rs backup"; exit 1; }
 
 pg_drop
 

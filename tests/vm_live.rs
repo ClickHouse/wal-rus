@@ -21,12 +21,12 @@
 
 use std::sync::Arc;
 
-use walross::compression::Method;
-use walross::config::{Settings, StorageSettings};
-use walross::pg::backup;
-use walross::pg::wal;
-use walross::storage::Storage;
-use walross::storage::fs::FsStorage;
+use pgwalrs::compression::Method;
+use pgwalrs::config::{Settings, StorageSettings};
+use pgwalrs::pg::backup;
+use pgwalrs::pg::wal;
+use pgwalrs::storage::Storage;
+use pgwalrs::storage::fs::FsStorage;
 
 fn settings_for(path: &str) -> Settings {
     Settings {
@@ -37,7 +37,7 @@ fn settings_for(path: &str) -> Settings {
         upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
-        retry: walross::retry::RetryPolicy::default(),
+        retry: pgwalrs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
         delta: Default::default(),
@@ -118,9 +118,9 @@ async fn backup_push_fetch_against_live_pg() {
     // If the cluster has user tablespaces, redirect them into the temp dir so
     // we don't try to write to /var/lib/postgresql which is postgres-owned
     let resolved = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
-    let sentinel_key = walross::pg::backup::sentinel_key(&resolved);
+    let sentinel_key = pgwalrs::pg::backup::sentinel_key(&resolved);
     let sentinel_bytes = std::fs::read(storage_dir.join(&sentinel_key)).unwrap();
-    let v2_pre: walross::pg::backup::BackupSentinelDtoV2 =
+    let v2_pre: pgwalrs::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes).unwrap();
     let mut fetch_args = backup::fetch::FetchArgs::default();
     if let Some(spec) = v2_pre.sentinel.tablespace_spec.as_ref() {
@@ -158,7 +158,7 @@ async fn backup_push_fetch_against_live_pg() {
         }
     }
     let fm_path = fm_path.expect("files_metadata.json missing from backup");
-    let fm: walross::pg::backup::FilesMetadataDto =
+    let fm: pgwalrs::pg::backup::FilesMetadataDto =
         serde_json::from_slice(&std::fs::read(&fm_path).unwrap()).expect("parse files_metadata");
     assert!(
         fm.files.contains_key("PG_VERSION") || fm.files.values().count() > 0,
@@ -177,7 +177,7 @@ async fn backup_push_fetch_against_live_pg() {
             break;
         }
     }
-    let v2: walross::pg::backup::BackupSentinelDtoV2 =
+    let v2: pgwalrs::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes.unwrap()).unwrap();
     assert!(
         v2.sentinel.compressed_size > 0,
@@ -232,7 +232,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
         }
     }
     let sentinel_path = sentinel_path.expect("sentinel missing");
-    let v2: walross::pg::backup::BackupSentinelDtoV2 =
+    let v2: pgwalrs::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
     let spec = match v2.sentinel.tablespace_spec.clone() {
         Some(s) if !s.is_empty() => s,
@@ -273,7 +273,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
 // ── Phase F carry: encrypted live-PG backup roundtrip ─────────────────────
 
 fn encrypted_settings_for(path: &str) -> Settings {
-    use walross::crypto::libsodium::LibsodiumCrypter;
+    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
     let mut k = [0u8; 32];
     for (i, b) in k.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(7).wrapping_add(11);
@@ -298,7 +298,7 @@ fn default_push_args() -> backup::push::PushArgs {
 }
 
 fn apply_tablespace_remap(
-    spec: &walross::pg::backup::TablespaceSpec,
+    spec: &pgwalrs::pg::backup::TablespaceSpec,
     restore: &std::path::Path,
     args: &mut backup::fetch::FetchArgs,
 ) {
@@ -313,7 +313,7 @@ fn apply_tablespace_remap(
 
 #[tokio::test]
 async fn encrypted_backup_push_fetch_against_live_pg() {
-    use walross::crypto::libsodium::LibsodiumCrypter;
+    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -348,8 +348,8 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
     // Right-key fetch decrypts cleanly + PG_VERSION readable
     let resolved = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
     let sentinel_bytes =
-        std::fs::read(storage_dir.join(walross::pg::backup::sentinel_key(&resolved))).unwrap();
-    let v2: walross::pg::backup::BackupSentinelDtoV2 =
+        std::fs::read(storage_dir.join(pgwalrs::pg::backup::sentinel_key(&resolved))).unwrap();
+    let v2: pgwalrs::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes).unwrap();
     let mut fetch_args = backup::fetch::FetchArgs::default();
     if let Some(spec) = v2.sentinel.tablespace_spec.as_ref() {
@@ -381,7 +381,7 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
 
 #[tokio::test]
 async fn retain_full_one_against_live_pg() {
-    use walross::pg::backup::delete::{DeleteModifier, DeleteOp};
+    use pgwalrs::pg::backup::delete::{DeleteModifier, DeleteOp};
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -407,7 +407,7 @@ async fn retain_full_one_against_live_pg() {
         modifier: DeleteModifier::Full,
         after: None,
     };
-    walross::pg::backup::delete::handle(store.clone(), op, true)
+    pgwalrs::pg::backup::delete::handle(store.clone(), op, true)
         .await
         .expect("delete retain FULL 1");
 
@@ -472,7 +472,7 @@ async fn wal_receive_archives_segment_against_live_pg() {
         // transactional=true: commit flushes the record so the walsender
         // streams it promptly. 3-arg form is compatible with PG 13+ (the
         // `flush` arg only exists on PG 16+)
-        psql("SELECT pg_logical_emit_message(true, 'walross', repeat('x', 8 * 1024 * 1024))");
+        psql("SELECT pg_logical_emit_message(true, 'wal-rs', repeat('x', 8 * 1024 * 1024))");
         psql("SELECT pg_switch_wal()");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

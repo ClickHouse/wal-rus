@@ -2,7 +2,7 @@
 //!
 //! `NOTIFY_SOCKET` / `WATCHDOG_USEC` are exported by systemd for
 //! `Type=notify` units and absent otherwise, so every entry point here
-//! no-ops when walross is not run under systemd. Mirrors wal-g's
+//! no-ops when wal-rs is not run under systemd. Mirrors wal-g's
 //! SendSdNotify, sized down to readiness + watchdog keep-alive
 
 use std::ffi::OsStr;

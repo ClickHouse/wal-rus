@@ -47,7 +47,7 @@ impl PgConfig {
             user,
             password,
             database,
-            application_name: "walross".into(),
+            application_name: "wal-rs".into(),
             sslmode,
         })
     }
@@ -378,12 +378,12 @@ mod tests {
         // <host>/.s.PGSQL.<port>. With a bogus directory, connect must fail
         // with the unix-prefixed context (proves dispatch, no TCP attempt)
         let cfg = PgConfig {
-            host: "/nonexistent/walross-unix-test".into(),
+            host: "/nonexistent/wal-rs-unix-test".into(),
             port: 5432,
             user: "u".into(),
             password: None,
             database: "u".into(),
-            application_name: "walross-test".into(),
+            application_name: "wal-rs-test".into(),
             sslmode: SslMode::Prefer,
         };
         let err = ReplicationConn::connect(&cfg).await.err().unwrap();
