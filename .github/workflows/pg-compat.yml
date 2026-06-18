@@ -91,7 +91,7 @@ jobs:
           PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
           WALROSS_BIN: ${{ github.workspace }}/bin/walross
           WALG_BIN: /usr/local/bin/wal-g
-        run: scripts/ci/${{ matrix.test }}.sh
+        run: ci/${{ matrix.test }}.sh
 
       - name: Collect PG logs on failure
         if: failure()
@@ -130,7 +130,7 @@ jobs:
           # Unused by the cargo tests (they call library functions directly),
           # but lib.sh requires it set; point at the build output.
           WALROSS_BIN: ${{ github.workspace }}/target/debug/walross
-        run: scripts/ci/vm_test_cluster.sh cargo test --features vm-test --locked
+        run: ci/vm_test_cluster.sh cargo test --features vm-test --locked
 
       - name: Collect PG logs on failure
         if: failure()
@@ -196,7 +196,7 @@ jobs:
           WALROSS_STORAGE_BACKEND: ${{ matrix.backend }}
           MINIO_ENDPOINT: http://127.0.0.1:9000
           FAKE_GCS_ENDPOINT: http://127.0.0.1:4443
-        run: scripts/ci/${{ matrix.test }}.sh
+        run: ci/${{ matrix.test }}.sh
 
       - name: Collect logs on failure
         if: failure()
@@ -217,7 +217,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test: [tls_replication, scram_auth]
+        test: [tls_replication, scram_auth, client_cert]
     steps:
       - uses: actions/checkout@v6
 
@@ -238,7 +238,7 @@ jobs:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
           WALROSS_BIN: ${{ github.workspace }}/bin/walross
-        run: scripts/ci/${{ matrix.test }}.sh
+        run: ci/${{ matrix.test }}.sh
 
       - name: Collect logs on failure
         if: failure()
@@ -281,7 +281,7 @@ jobs:
           PG_BIN: /usr/lib/postgresql/16/bin
           WALROSS_BIN: ${{ github.workspace }}/bin/walross
           WALG_COMPRESSION_METHOD: ${{ matrix.codec }}
-        run: scripts/ci/full_backup.sh
+        run: ci/full_backup.sh
 
       - name: Collect logs on failure
         if: failure()
@@ -333,7 +333,7 @@ jobs:
           WALROSS_BIN: ${{ github.workspace }}/target/debug/walross
         run: |
           cargo llvm-cov clean
-          scripts/ci/vm_test_cluster.sh \
+          ci/vm_test_cluster.sh \
             cargo llvm-cov --no-report --features vm-test --locked -- --nocapture
 
       - name: Coverage summary (job log)

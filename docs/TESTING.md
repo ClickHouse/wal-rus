@@ -24,14 +24,15 @@ live clusters, treat them as load-bearing regressions.
   `cargo clippy --all-targets --locked -- -D warnings`,
   `cargo test --locked`
 - `.github/workflows/pg-compat.yml`: release binary driving
-  `scripts/ci/*.sh` across lanes:
+  `ci/*.sh` across lanes:
   - `pg`: PG 13-17 (jammy) + 18 (noble) × full backup + replay,
     backup-mark, backup-show, WAL overwrite, daemon, and cross-tool
     forward / reverse / encryption / retention / lzma against a pinned
     wal-g (`fs` backend)
   - `pg-storage`: s3 + gcs full-backup and copy against MinIO and
     fake-gcs-server emulators
-  - `pg-tls-scram`: live TLS handshake + SCRAM-SHA-256 auth over TCP
+  - `pg-tls-scram`: live TLS handshake, SCRAM-SHA-256 auth, and client
+    certificate auth (mutual TLS via `PGSSLCERT`/`PGSSLKEY`) over TCP
   - `pg-codec`: brotli / lz4 / lzma / gzip push→fetch→replay
   - `pg-vm-test`: the `vm-test` live-PG suite (below)
   - `coverage`: `cargo llvm-cov` over the vm-test suite
@@ -48,9 +49,9 @@ PGHOST=... PGPORT=... WALG_FILE_PREFIX=/tmp/x \
   cargo test --release --features vm-test
 ```
 
-`scripts/ci/vm_test_cluster.sh` boots a throwaway replication-enabled
+`ci/vm_test_cluster.sh` boots a throwaway replication-enabled
 trust cluster, exports its `PG*` env, and runs the passed command
-(`scripts/ci/vm_test_cluster.sh cargo test --features vm-test`); the
+(`ci/vm_test_cluster.sh cargo test --features vm-test`); the
 `pg-vm-test` and `coverage` lanes drive it in CI. Useful cluster spread
 when pointing at a hand-built host: PG 13 through 18 covering both
 BASE_BACKUP wire forms, at least one cluster with user tablespaces, one

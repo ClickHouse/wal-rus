@@ -60,4 +60,17 @@ grep -qiE 'certificate|tls|handshake|verif' "$WORKROOT/wrong.err" \
 echo "== require without a root: must succeed (no verification) =="
 PGSSLMODE=require walross backup-push
 
+# pgx semantics: require validates the chain once a root is configured (libpq
+# would not). Correct root succeeds; wrong root must fail closed.
+echo "== require with correct root: must succeed (now verifies chain) =="
+PGSSLMODE=require PGSSLROOTCERT="$CERTS/ca.crt" walross backup-push
+
+echo "== require with WRONG root: must fail closed =="
+if PGSSLMODE=require PGSSLROOTCERT="$CERTS/wrong.crt" walross backup-push 2>"$WORKROOT/require_wrong.err"; then
+    echo "FAIL: require accepted an untrusted server cert"
+    exit 1
+fi
+grep -qiE 'certificate|tls|handshake|verif' "$WORKROOT/require_wrong.err" \
+    || { echo "FAIL: expected a TLS/cert error, got:"; cat "$WORKROOT/require_wrong.err"; exit 1; }
+
 echo "tls_replication OK"

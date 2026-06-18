@@ -2,7 +2,7 @@
 # Boot a replication-enabled trust cluster and run the passed command with the
 # cluster's PG* env exported. Drives the pg-vm-test CI lane:
 #
-#   scripts/ci/vm_test_cluster.sh cargo test --features vm-test --locked
+#   ci/vm_test_cluster.sh cargo test --features vm-test --locked
 #
 # tests/vm_live.rs connects over the unix socket (PGHOST), trust auth, no TLS.
 # lib.sh's EXIT trap stops the cluster; we don't exec so the trap still fires.

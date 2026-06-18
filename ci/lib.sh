@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared helpers for walross CI tests. Sourced by scripts/ci/*.sh.
+# Shared helpers for walross CI tests. Sourced by ci/*.sh.
 #
 # Adapted from wal-g's docker/pg_tests/scripts/tests/test_functions/. Differs
 # in that PG runs under the runner user (no `postgres` OS account, no docker
