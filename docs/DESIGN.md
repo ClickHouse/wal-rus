@@ -43,9 +43,9 @@ async fn get(&self, key: &str) -> Result<AsyncReader>;
 `AsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>`. Compression and
 encryption are also `AsyncReader`s, so push pipelines as
 `File → compress → encrypt → storage.put` without materializing
-anything. `size_hint` lets s3 pick single-PUT vs multipart; disabled
-whenever a crypter is set since ciphertext overhead would make the hint
-lie.
+anything. `size_hint` lets s3 pick single-PUT vs multipart, left unset
+under compression/encryption since variable-length output makes the
+hint lie, then the unknown-size path takes over (see S3).
 
 Pipeline order matches wal-g: push `raw → compress → encrypt → storage`,
 fetch inverse. Sentinel / metadata JSON bypass compress+encrypt entirely
@@ -56,11 +56,13 @@ an encrypted bucket without the key.
 
 Hand-rolled SigV4 instead of `aws-sdk-rust` (multi-MB dependency
 footprint) or `object_store` (arrow deps, abstracts away streaming
-control). UNSIGNED-PAYLOAD over HTTPS streams request bodies without
-hashing up front; relies on TLS for body integrity. Multipart at 8 MB
-parts, single PUT under 32 MB, abort on permanent failure, per-part
-retry on transient (SigV4 signs the body hash, same body → same
-signature → safe replay). Listing via list-type=2 continuation tokens.
+control). UNSIGNED-PAYLOAD over HTTPS streams bodies without hashing up
+front, TLS covers integrity. Multipart parts buffer in memory so a
+transient retry replays identical bytes, the safety net since
+UNSIGNED-PAYLOAD leaves the signature off the body. Unknown-size bodies
+buffer up to the single-PUT cap and skip multipart's
+create/upload/complete trio when they fit, so a compressed 16 MiB
+segment lands in one PUT.
 
 ### GCS
 
@@ -71,13 +73,13 @@ implemented (see PLAN.md).
 
 ### Retry classification
 
-`StorageError::Http { status, body }` + `Transport` give `is_transient()`
-a clean predicate: 408/425/429/5xx, transport errors, curated io kinds.
-Reads retried unconditionally on transient; put only retried when
-`size_hint` ≤ 8 MB by buffering the body once (sentinels, manifests,
-history files), streaming uploads rely on the per-part retry inside s3
-multipart. `fs` backend skips the wrapper, no transient classes worth
-wrapping.
+`StorageError::Http { status, body }` + `Transport` let `is_transient()`
+classify retryable failures. Reads retry unconditionally on transient.
+The `RetryingStorage` wrapper retries small bounded-size `put`s
+(sentinels, manifests, history files) by buffering the body once;
+larger or unknown-size streams pass through to S3's own in-place retry,
+which replays its per-PUT / per-part buffer. `fs` skips the wrapper, no
+transient classes worth wrapping.
 
 ## Compression
 
@@ -118,22 +120,18 @@ delegates to `WebPkiServerVerifier`, suppressing only
 ## Tar streamer
 
 One `spawn_blocking` task per archive bridges async→sync via
-`SyncIoBridge`, re-tars with tablespace path remap
-(`pg_tblspc/<oid>/…`), rotates parts at `WALG_TAR_SIZE_THRESHOLD`
-(1 GiB default, single oversize entry gets its own part), tees
-`global/pg_control` into `pg_control.tar.<ext>` uploaded last, collects
-per-file metadata. `append_data` auto-emits GNU LongLink for paths
-> 100 chars; pax extended headers resolve on read.
+`SyncIoBridge`, re-tars with tablespace path remap, rotates parts at
+`WALG_TAR_SIZE_THRESHOLD`, tees `global/pg_control` into its own part
+uploaded last, collects per-file metadata.
 
 `backup-fetch` extracts manually rather than via `Archive::unpack`: the
 tar crate's canonicalize guard refuses writes through `pg_tblspc/<oid>`
 symlinks, which legitimate PG restores require. `..`-traversal still
-blocked; only file/dir/symlink entry types restored. Tablespace
-symlinks created before extraction so the first entry under
-`pg_tblspc/<oid>/` can't materialize a real directory there.
+blocked. Tablespace symlinks created before extraction so the first
+entry under `pg_tblspc/<oid>/` can't materialize a real directory there.
 
 Uploads drain through a `JoinSet` bounded by
-`Semaphore(WALG_UPLOAD_CONCURRENCY)`; JoinSet over `FuturesUnordered`
+`Semaphore(WALG_UPLOAD_CONCURRENCY)`, JoinSet over `FuturesUnordered`
 so the bail path aborts in-flight tasks instead of detaching them.
 
 ## Delta backups
@@ -147,10 +145,9 @@ Two per-file payload formats, magic-dispatched on apply:
 `IncrementBodyReader` streams header + dirty pages with one BLCKSZ
 scratch page, no file-sized buffer regardless of dirty density (naive
 buffering worst case: 1 GiB resident per concurrent paged file). Three
-outcomes per paged file: incremented (≥1 dirty block in range), skipped
-(unchanged, entry omitted, metadata record kept), passthrough
-(non-paged paths, files < BLCKSZ). Dirty blocks past EOF filtered,
-apply-side `read_exact` would underflow otherwise.
+outcomes per paged file: incremented, skipped (entry omitted, metadata
+record kept), passthrough. Dirty blocks past EOF filtered, apply-side
+`read_exact` would underflow otherwise.
 
 Map build fails closed: on any WAL-walk error, warn + fall back to full
 *and* leave `increment_from` unset. The sentinel never claims a delta
@@ -207,6 +204,15 @@ Byte-compatible with wal-g's Unix-socket protocol
 tool's daemon-client unchanged. Implemented ops: Check, WalPush,
 WalFetch.
 
+PG's archiver is serial, so a standing `Uploader`
+(`src/daemon/uploader.rs`) keeps a look-ahead pool saturated across
+invocations. Foreground `WalPush(N)` acks only once `N` is durable
+(no early ack), but `N+1..` pre-upload concurrently
+(`lookahead = WALG_UPLOAD_CONCURRENCY - 1`, serial and byte-identical
+at 1). Replaces wal-g's per-invocation `BgUploader` + on-disk marker
+dir with an in-memory inflight/done map deduping foreground pushes
+against look-ahead. See PLAN.md.
+
 ## wal-receive
 
 START_REPLICATION CopyBoth consumer. Segments pre-extended to seg_size
@@ -221,6 +227,7 @@ server-requested-reply keepalives.
 
 Recurring theme: prefer hand-rolling small fixed formats over pulling
 crates. No `regex` (summary filenames + tablespace prefixes are trivial
-decodes), no roaring, no aws-sdk, no quick-xml (string-extraction over
-S3 list XML, revisit if AWS changes tag layout). Single crypto stack on
-aws-lc-rs (rustls provider + GCS RS256), no transitive ring.
+decodes), no roaring, no aws-sdk. `quick-xml` parses S3 list + multipart
+responses (pull-parser does charset decode + entity unescape, replacing
+earlier hand-rolled string extraction). Single crypto stack on aws-lc-rs
+(rustls provider + GCS RS256), no transitive ring.

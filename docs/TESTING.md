@@ -21,31 +21,43 @@ live clusters, treat them as load-bearing regressions.
 ## CI
 
 - `.github/workflows/ci.yml`: `cargo fmt --check`,
-  `cargo clippy --all-targets -- -D warnings`, `cargo test --locked`
-- `.github/workflows/pg-compat.yml`: release binary × PG version matrix
-  × `scripts/ci/*.sh` (full backup + replay, backup-mark, backup-show,
-  WAL overwrite semantics, daemon, cross-tool forward/reverse against a
-  pinned wal-g). `fs` backend, cluster runs as the runner user,
-  failure logs uploaded as artifacts
+  `cargo clippy --all-targets --locked -- -D warnings`,
+  `cargo test --locked`
+- `.github/workflows/pg-compat.yml`: release binary driving
+  `scripts/ci/*.sh` across lanes:
+  - `pg`: PG 13-17 (jammy) + 18 (noble) × full backup + replay,
+    backup-mark, backup-show, WAL overwrite, daemon, and cross-tool
+    forward / reverse / encryption / retention / lzma against a pinned
+    wal-g (`fs` backend)
+  - `pg-storage`: s3 + gcs full-backup and copy against MinIO and
+    fake-gcs-server emulators
+  - `pg-tls-scram`: live TLS handshake + SCRAM-SHA-256 auth over TCP
+  - `pg-codec`: brotli / lz4 / lzma / gzip push→fetch→replay
+  - `pg-vm-test`: the `vm-test` live-PG suite (below)
+  - `coverage`: `cargo llvm-cov` over the vm-test suite
+
+  Clusters run as the runner user; failure logs upload as artifacts.
 
 ## Live-cluster tests (`vm-test` feature)
 
 `tests/vm_live.rs` is `#[cfg(feature = "vm-test")]` gated and hits a
-real PG cluster:
+real PG cluster over its unix socket (trust auth, no TLS):
 
 ```
 PGHOST=... PGPORT=... WALG_FILE_PREFIX=/tmp/x \
   cargo test --release --features vm-test
 ```
 
-`scripts/vm-deploy.sh` wraps rsync + remote build + per-cluster test
-runs against a test host (`VM_HOST` / `VM_KEY` / `VM_DEST` env);
-`scripts/vm-cross-tool.sh` runs the bidirectional wal-g roundtrip
-there. Useful cluster spread: PG 13 through 18 covering both
+`scripts/ci/vm_test_cluster.sh` boots a throwaway replication-enabled
+trust cluster, exports its `PG*` env, and runs the passed command
+(`scripts/ci/vm_test_cluster.sh cargo test --features vm-test`); the
+`pg-vm-test` and `coverage` lanes drive it in CI. Useful cluster spread
+when pointing at a hand-built host: PG 13 through 18 covering both
 BASE_BACKUP wire forms, at least one cluster with user tablespaces, one
 reachable only via Unix socket + peer auth.
 
-For s3/gcs without real buckets: MinIO
-(`AWS_ENDPOINT=http://localhost:9000`, `AWS_S3_FORCE_PATH_STYLE=true`)
-and `fsouza/fake-gcs-server` (`STORAGE_EMULATOR_HOST`, anonymous mode,
-JWT path skipped).
+For s3/gcs without real buckets the `pg-storage` lane runs MinIO
+(`AWS_ENDPOINT_URL=http://localhost:9000`,
+`WALG_S3_FORCE_PATH_STYLE=true`) and `fsouza/fake-gcs-server`
+(`WALG_GS_ENDPOINT` / `STORAGE_EMULATOR_HOST`, anonymous mode, JWT path
+skipped); the same emulators work locally.

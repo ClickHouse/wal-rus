@@ -23,12 +23,10 @@ the bump PR, not master).
   sentinel `IncrementFrom`, format detected per-file by magic byte, no
   sentinel format flag (wal-g convention)
 - `wi1` increment format and PG17 native INCREMENTAL format
-  (magic `0xd3ae1f0d`); native layout verified against postgres source
-  (`src/common/blkreftable.c`, `src/backend/backup/basebackup.c`,
-  `src/bin/pg_combinebackup/reconstruct.c`): header order
-  magic / num_blocks / truncation_block_length / blocks / pad-to-BLCKSZ
-  when num_blocks > 0, CRC32C-Castagnoli with trailing CRC bytes
-  excluded from the running CRC
+  (magic `0xd3ae1f0d`); native layout verified field-by-field against
+  postgres source (`src/common/blkreftable.c`,
+  `src/backend/backup/basebackup.c`,
+  `src/bin/pg_combinebackup/reconstruct.c`)
 - libsodium framing: 24-byte secretstream header, 8 KiB plaintext
   chunks, 17-byte per-chunk overhead, explicit FINAL chunk on close;
   a wire-format pin test fails on any drift
@@ -63,5 +61,6 @@ the bump PR, not master).
   tombstone in metadata, restore leaves the parent's copy; matches
   wal-g
 - lzma: async-compression emits LZMA1-alone via xz2, wal-g uses
-  ulikunitz/xz/lzma LZMA1-alone; believed identical, not yet
-  cross-validated against a wal-g-written bucket
+  ulikunitz/xz/lzma LZMA1-alone; cross-validated bidirectionally by the
+  `cross_tool_lzma` lane (walross-written bucket restored by wal-g and
+  the reverse)
