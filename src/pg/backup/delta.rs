@@ -6,7 +6,8 @@
 //! `delta_file.go` so bucket-resident delta files are bidirectionally
 //! readable
 //!
-//! On-disk delta file format (wal-g `delta_005/<seg>_delta`):
+//! On-disk delta file format (wal-g `wal_005/<group>_delta`, same folder as
+//! WAL segments):
 //! 1. List of `BlockLocation` tuples (LE u32×4 = 16 bytes), all-zero
 //!    sentinel terminates
 //! 2. `WalParser` state: u32 length + N bytes of `current_record_data`
@@ -21,8 +22,9 @@
 //! RelFileNode. Block numbers in the delta map are global (segment id ×
 //! `BLOCKS_IN_REL_FILE` + intra-segment offset)
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use thiserror::Error;
@@ -30,6 +32,9 @@ use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
 use crate::pg::backup::fetch::fetch_sentinel;
+use crate::pg::backup::wal_delta::{
+    WAL_FILES_IN_DELTA, delta_group_name, delta_group_no, delta_storage_key, seg_name_from_global,
+};
 use crate::pg::backup::{BackupSentinelDtoV2, increment, name_from_sentinel_key};
 use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
 use crate::pg::walparser::{
@@ -146,6 +151,12 @@ impl DeltaFile {
         write_locations_to(&mut w, &self.locations)?;
         self.wal_parser.save(&mut w)?;
         Ok(())
+    }
+
+    /// Serialized byte length, for `Vec::with_capacity`. Must track `save`:
+    /// 16-byte tuples + 16-byte terminal sentinel + u32 parser len + parser data
+    pub fn serialized_len(&self) -> usize {
+        self.locations.len() * 16 + 16 + 4 + self.wal_parser.current_record_data().len()
     }
 
     pub fn load<R: Read>(mut r: R) -> Result<Self, DeltaError> {
@@ -275,6 +286,11 @@ pub struct PrevBackupInfo {
     /// Increment format of the parent when it is itself a delta; `None` for a
     /// full parent. A new delta must match this (chains can't mix wi1 & native)
     pub parent_increment_format: Option<increment::Format>,
+    /// Paths present in the increment-base backup (its `files_metadata.json`
+    /// `Files` keys, skipped entries included). wal-g only increments files
+    /// that `wasInBase`; a relation created after the parent has no base file
+    /// to apply onto, so it must ship in full. Empty if metadata is missing
+    pub parent_files: Arc<HashSet<String>>,
 }
 
 /// Configure delta vs full at the start of backup-push. Mirrors wal-g's
@@ -351,6 +367,8 @@ pub async fn configure_delta_parent(
     .with_context(|| format!("parse timeline from {effective_name}"))?
     .timeline;
 
+    let parent_files = Arc::new(load_parent_file_set(storage, &effective_name).await);
+
     let info = PrevBackupInfo {
         name: effective_name,
         start_lsn: effective_v2
@@ -375,8 +393,29 @@ pub async fn configure_delta_parent(
             .increment_from
             .as_ref()
             .map(|_| effective_v2.sentinel.increment_format),
+        parent_files,
     };
     Ok(Some(info))
+}
+
+/// Load the `Files` key set from a parent backup's `files_metadata.json`.
+/// Tolerant: a missing or unreadable sidecar yields an empty set, which
+/// degrades the delta to shipping all paged files in full (safe, matches
+/// wal-g's behaviour when the base file list is unavailable)
+async fn load_parent_file_set(storage: &DynStorage, name: &str) -> HashSet<String> {
+    use crate::pg::backup::{FilesMetadataDto, files_metadata_key, load_json};
+    let key = files_metadata_key(name);
+    match load_json::<FilesMetadataDto>(storage, &key, 1 << 16).await {
+        Ok(m) => m.files.into_keys().collect(),
+        Err(e) => {
+            tracing::warn!(
+                target = "backup_push",
+                "parent {name} files_metadata unavailable ({e:#}); \
+                 delta will ship paged files in full",
+            );
+            HashSet::new()
+        }
+    }
 }
 
 fn name_only(_v2: &BackupSentinelDtoV2) -> String {
@@ -453,10 +492,133 @@ async fn find_by_user_data(
 
 // ─── WAL → delta map (walk segments between two LSNs) ───────────────────────
 
-/// Walk the WAL segments [start_lsn, end_lsn) on `timeline`, parse each,
-/// & aggregate the referenced block locations into a delta map.
-/// Segments are fetched from the `wal_005/` prefix (wal-rs layout)
+/// Build the delta map for blocks changed in `[start_lsn, end_lsn)` on
+/// `timeline`. Reads `<group>_delta` sidecars for the complete 16-segment
+/// groups (O(touched relations)) and parses only the trailing partial group's
+/// raw WAL. Mirrors wal-g `getDeltaMap`.
+///
+/// Falls back to a full raw-WAL walk if any sidecar is missing — wal-g hard
+/// errors here, but the fallback keeps buckets archived without
+/// `WALG_USE_WAL_DELTA` working unchanged
 pub async fn build_delta_map_from_wal(
+    settings: &crate::config::Settings,
+    storage: &DynStorage,
+    timeline: u32,
+    start_lsn: u64,
+    end_lsn: u64,
+    compression: compression::Method,
+) -> Result<PagedFileDeltaMap> {
+    if end_lsn <= start_lsn {
+        return Ok(PagedFileDeltaMap::new());
+    }
+    match build_delta_map_from_sidecars(
+        settings,
+        storage,
+        timeline,
+        start_lsn,
+        end_lsn,
+        compression,
+    )
+    .await
+    {
+        Ok(delta) => Ok(delta),
+        Err(e) => {
+            tracing::warn!(
+                target = "backup_push",
+                "delta sidecars unusable ({e:#}); re-parsing raw WAL [{start_lsn:X}, {end_lsn:X})",
+            );
+            build_delta_map_from_wal_full(
+                settings,
+                storage,
+                timeline,
+                start_lsn,
+                end_lsn,
+                compression,
+            )
+            .await
+        }
+    }
+}
+
+/// Sidecar-driven build: delta files for whole groups + a raw-WAL walk of the
+/// final partial group, seeded from the last sidecar's parser state so records
+/// crossing the group boundary stitch correctly. Any missing sidecar errors so
+/// the caller can fall back
+async fn build_delta_map_from_sidecars(
+    settings: &crate::config::Settings,
+    storage: &DynStorage,
+    timeline: u32,
+    start_lsn: u64,
+    end_lsn: u64,
+    compression: compression::Method,
+) -> Result<PagedFileDeltaMap> {
+    let seg_size = DEFAULT_WAL_SEG_SIZE;
+    let n = WAL_FILES_IN_DELTA;
+    let first_used_delta = delta_group_no(lsn_to_seg(start_lsn, seg_size));
+    let first_not_used_delta = delta_group_no(lsn_to_seg(end_lsn, seg_size));
+    if first_not_used_delta < n {
+        anyhow::bail!("range [{start_lsn:X}, {end_lsn:X}) has no complete delta group ahead of it");
+    }
+    let last_complete_group = first_not_used_delta - n;
+
+    let mut delta = PagedFileDeltaMap::new();
+    // Complete groups strictly before the last
+    let mut g = first_used_delta;
+    while g < last_complete_group {
+        let name = delta_group_name(timeline, g, seg_size);
+        let df = get_delta_file(settings, storage, &name, compression)
+            .await
+            .with_context(|| format!("delta sidecar {name}"))?;
+        delta.add_locations(df.locations);
+        g += n;
+    }
+    // Last complete group: its locations + parser seed for the tail walk
+    let last_name = delta_group_name(timeline, last_complete_group, seg_size);
+    let last_df = get_delta_file(settings, storage, &last_name, compression)
+        .await
+        .with_context(|| format!("delta sidecar {last_name}"))?;
+    delta.add_locations(last_df.locations);
+    let mut parser = last_df.wal_parser;
+
+    // Trailing partial group: raw WAL from the group start up to end_lsn
+    let tail_first = first_not_used_delta;
+    let tail_last = lsn_to_seg(end_lsn.saturating_sub(1), seg_size);
+    for s in tail_first..=tail_last {
+        let name = seg_name_from_global(timeline, s, seg_size).format();
+        let locations = fetch_and_parse_segment(settings, storage, &name, compression, &mut parser)
+            .await
+            .with_context(|| format!("tail wal segment {name}"))?;
+        delta.add_locations(locations);
+    }
+    Ok(delta)
+}
+
+/// Fetch + decode a `<group>_delta` sidecar from `wal_005/` into a `DeltaFile`
+async fn get_delta_file(
+    settings: &crate::config::Settings,
+    storage: &DynStorage,
+    group_name: &str,
+    compression: compression::Method,
+) -> Result<DeltaFile> {
+    use tokio::io::AsyncReadExt;
+    let key = delta_storage_key(group_name, compression);
+    let r = storage
+        .get(&key)
+        .await
+        .with_context(|| format!("get {key}"))?;
+    let decrypted = settings.decrypt(r);
+    let mut decoded = compression::decode(compression, decrypted);
+    let mut buf = Vec::new();
+    decoded
+        .read_to_end(&mut buf)
+        .await
+        .with_context(|| format!("read {key}"))?;
+    DeltaFile::load(buf.as_slice()).with_context(|| format!("decode {key}"))
+}
+
+/// Full raw-WAL walk of `[start_lsn, end_lsn)`: parse every segment. Fallback
+/// when sidecars are absent; O(WAL volume). Bad segments are skipped (logged)
+async fn build_delta_map_from_wal_full(
     settings: &crate::config::Settings,
     storage: &DynStorage,
     timeline: u32,
@@ -473,12 +635,7 @@ pub async fn build_delta_map_from_wal(
     let first_seg = lsn_to_seg(start_lsn, seg_size);
     let last_seg = lsn_to_seg(end_lsn.saturating_sub(1), seg_size);
     for seg in first_seg..=last_seg {
-        let name = SegmentName {
-            timeline,
-            log_id: (seg >> 32) as u32,
-            seg_no: seg as u32,
-        }
-        .format();
+        let name = seg_name_from_global(timeline, seg, seg_size).format();
         let locations =
             match fetch_and_parse_segment(settings, storage, &name, compression, &mut parser).await
             {

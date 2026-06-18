@@ -180,8 +180,38 @@ async fn fetch_incremented_set(storage: &DynStorage, name: &str) -> Result<HashS
     Ok(meta
         .files
         .into_iter()
-        .filter_map(|(k, v)| if v.is_incremented { Some(k) } else { None })
+        .filter_map(|(k, v)| {
+            // wal-g records files_metadata keys with a leading `/`
+            // (`GetFileRelPath`), but extraction keys off the leading-slash-
+            // stripped tar path. Normalize identically so the lookup hits;
+            // otherwise wal-g increments are written out as their raw wi1
+            // bytes, corrupting the file (garbage page header)
+            v.is_incremented.then(|| {
+                strip_to_relative(Path::new(&k))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        })
         .collect())
+}
+
+/// Reduce a tar-entry / metadata path to its safe relative form, dropping
+/// absolute-root, drive-prefix, `.` and `..` components. Both the extraction
+/// path and the incremented-file lookup must agree on this, since wal-g and
+/// wal-rs disagree on the leading slash
+fn strip_to_relative(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut rel = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(..)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => {}
+            Component::Normal(s) => rel.push(s),
+        }
+    }
+    rel
 }
 
 pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
@@ -325,20 +355,12 @@ fn unpack_manual<R: std::io::Read>(
     incremented: &HashSet<String>,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    use std::path::Component;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         // Skip absolute / parent-dir traversals
-        let mut rel = PathBuf::new();
-        for c in path.components() {
-            match c {
-                Component::Prefix(..) | Component::RootDir | Component::CurDir => continue,
-                Component::ParentDir => continue,
-                Component::Normal(p) => rel.push(p),
-            }
-        }
+        let rel = strip_to_relative(&path);
         if rel.as_os_str().is_empty() {
             continue;
         }

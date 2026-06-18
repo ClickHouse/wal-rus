@@ -21,6 +21,10 @@ pub struct Settings {
     pub upload_queue: usize,
     pub download_concurrency: usize,
     pub prevent_wal_overwrite: bool,
+    /// `WALG_USE_WAL_DELTA`: record `<group>_delta` sidecars during wal-push so
+    /// delta backups read changed-block sets per 16-segment group instead of
+    /// re-parsing every segment. Off by default, matching wal-g
+    pub use_wal_delta: bool,
     pub retry: RetryPolicy,
     /// WALG_NETWORK_RATE_LIMIT in bytes/sec, 0 = unthrottled
     pub network_rate_limit: u64,
@@ -68,6 +72,7 @@ impl Settings {
         let upload_queue = parse_env_int("WALG_UPLOAD_QUEUE", 2)?.max(1) as usize;
         let download_concurrency = download_concurrency_from_env()?;
         let prevent_wal_overwrite = parse_env_bool("WALG_PREVENT_WAL_OVERWRITE", false)?;
+        let use_wal_delta = parse_env_bool("WALG_USE_WAL_DELTA", false)?;
         let retry = RetryPolicy::from_env();
         let network_rate_limit = parse_env_int("WALG_NETWORK_RATE_LIMIT", 0)?.max(0) as u64;
         let disk_rate_limit = parse_env_int("WALG_DISK_RATE_LIMIT", 0)?.max(0) as u64;
@@ -81,6 +86,7 @@ impl Settings {
             upload_queue,
             download_concurrency,
             prevent_wal_overwrite,
+            use_wal_delta,
             retry,
             network_rate_limit,
             disk_rate_limit,

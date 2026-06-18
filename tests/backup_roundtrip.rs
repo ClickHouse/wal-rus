@@ -29,6 +29,7 @@ fn test_settings() -> Settings {
         upload_queue: 1,
         download_concurrency: 1,
         prevent_wal_overwrite: false,
+        use_wal_delta: false,
         retry: pgwalrs::retry::RetryPolicy::default(),
         network_rate_limit: 0,
         disk_rate_limit: 0,
@@ -701,6 +702,108 @@ async fn fetch_applies_delta_chain_wi1() {
         restored[3 * BLCKSZ + 4..].iter().all(|&b| b == 0xCC),
         "block 3 should carry the delta contents"
     );
+}
+
+#[tokio::test]
+async fn fetch_applies_delta_chain_walg_leading_slash() {
+    // wal-g records tar names & files_metadata keys with a leading `/`
+    // (GetFileRelPath: "/" + relpath). The incremented-file lookup must
+    // normalize both sides identically, else the wi1 increment is written
+    // out verbatim (raw "wi1" bytes) corrupting page 0. Regression for
+    // cross_tool_delta reverse interop
+    const BLCKSZ: usize = 8192;
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let restore = dir.path().join("restore");
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+
+    let mut s = test_settings();
+    s.compression = Method::None;
+
+    let full_name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
+    let mut full_body = vec![0xAAu8; 2 * BLCKSZ];
+    for b in 0u32..2 {
+        let off = (b as usize) * BLCKSZ;
+        full_body[off..off + 4].copy_from_slice(&b.to_le_bytes());
+    }
+    // Tar entry names get the leading slash stripped by extraction either
+    // way; the bug is the files_metadata key below keeping its leading slash
+    let full_tar = build_tar(&[("base/16384/16400", &full_body)]);
+    let full_sentinel = make_sentinel_v2("/d");
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&full_name),
+        serde_json::to_vec(&full_sentinel).unwrap(),
+    )
+    .await;
+    put_bytes(store.clone(), &tar_part_key(&full_name, 1, ""), full_tar).await;
+    put_bytes(
+        store.clone(),
+        &files_metadata_key(&full_name),
+        serde_json::to_vec(&FilesMetadataDto::default()).unwrap(),
+    )
+    .await;
+
+    // Delta rewrites block 1 with a 0xBB marker
+    let mut block1 = vec![0xBBu8; BLCKSZ];
+    block1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    let mut increment = Vec::new();
+    write_increment_header(&mut increment, (2 * BLCKSZ) as u64, &[1]).unwrap();
+    increment.extend_from_slice(&block1);
+
+    let delta_name = format!(
+        "{}_D_{}",
+        format_backup_name(1, 0x0200_0000, 16 * 1024 * 1024),
+        full_name.strip_prefix("base_").unwrap(),
+    );
+    let mut delta_sentinel = make_sentinel_v2("/d");
+    delta_sentinel.sentinel.increment_from = Some(full_name.clone());
+    delta_sentinel.sentinel.increment_from_lsn = Some(0x0100_0000);
+    delta_sentinel.sentinel.increment_full_name = Some(full_name.clone());
+    delta_sentinel.sentinel.increment_count = Some(1);
+    delta_sentinel.sentinel.backup_start_lsn = Some(0x0200_0000);
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&delta_name),
+        serde_json::to_vec(&delta_sentinel).unwrap(),
+    )
+    .await;
+    let delta_tar = build_tar(&[("base/16384/16400", &increment)]);
+    put_bytes(store.clone(), &tar_part_key(&delta_name, 1, ""), delta_tar).await;
+    // files_metadata key carries the leading slash, as wal-g writes it
+    let mut delta_meta = FilesMetadataDto::default();
+    delta_meta.files.insert(
+        "/base/16384/16400".into(),
+        FileDescription {
+            is_incremented: true,
+            is_skipped: false,
+            mtime: Utc::now(),
+            updates_count: 0,
+        },
+    );
+    put_bytes(
+        store.clone(),
+        &files_metadata_key(&delta_name),
+        serde_json::to_vec(&delta_meta).unwrap(),
+    )
+    .await;
+
+    fetch_mod::handle(&s, store as Arc<dyn Storage>, &delta_name, &restore)
+        .await
+        .unwrap();
+
+    let restored = std::fs::read(restore.join("base/16384/16400")).unwrap();
+    assert_eq!(
+        restored.len(),
+        2 * BLCKSZ,
+        "increment must apply, not write raw wi1 bytes"
+    );
+    // block 0 untouched: full backup's 0xAA, NOT the "wi1" magic
+    assert_eq!(&restored[0..4], &0u32.to_le_bytes());
+    assert!(restored[4..BLCKSZ].iter().all(|&b| b == 0xAA));
+    // block 1: delta's 0xBB
+    assert_eq!(&restored[BLCKSZ..BLCKSZ + 4], &1u32.to_le_bytes());
+    assert!(restored[BLCKSZ + 4..].iter().all(|&b| b == 0xBB));
 }
 
 #[tokio::test]

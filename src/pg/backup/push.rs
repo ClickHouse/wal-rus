@@ -250,6 +250,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                                 delta_context = Some(DeltaContext {
                                     map: Arc::new(map),
                                     format: increment_format,
+                                    parent_files: p.parent_files.clone(),
                                 });
                             }
                             Err(e) => {
@@ -282,6 +283,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                                 delta_context = Some(DeltaContext {
                                     map: Arc::new(map),
                                     format: increment_format,
+                                    parent_files: p.parent_files.clone(),
                                 });
                             }
                             Err(e) => {

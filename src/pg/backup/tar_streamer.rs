@@ -15,7 +15,7 @@
 //! per-part output flows over an mpsc of `Bytes` that the caller reads as
 //! an `AsyncRead` (see `ChannelReader`)
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -66,6 +66,9 @@ pub struct StreamerOpts {
 pub struct DeltaContext {
     pub map: Arc<PagedFileDeltaMap>,
     pub format: IncrementFormat,
+    /// Paths present in the increment-base backup. Files absent here are new
+    /// since the parent and must ship in full, not as increments
+    pub parent_files: Arc<HashSet<String>>,
 }
 
 impl Default for StreamerOpts {
@@ -303,6 +306,13 @@ fn classify_for_delta(ctx: &Option<DeltaContext>, path: &str, entry_size: u64) -
         return DeltaClass::Passthrough;
     };
     if !delta_mod::is_paged_path(path) {
+        return DeltaClass::Passthrough;
+    }
+    // wal-g only increments files that were in the increment-base backup
+    // (`wasInBase`). A relation (or rel-file segment) created after the parent
+    // has no base file to apply onto, so it ships in full — otherwise restore
+    // fails with "incremented file should always exist"
+    if !ctx.parent_files.contains(path) {
         return DeltaClass::Passthrough;
     }
     // Files smaller than one block can't be page-incrementally encoded;
@@ -842,6 +852,12 @@ mod tests {
 
     // ─── delta mode ─────────────────────────────────────────────────────────
 
+    /// Parent-backup file set for delta tests: the paths the increment base
+    /// is pretended to contain, so eligible files clear the `wasInBase` gate
+    fn parent_set(paths: &[&str]) -> Arc<HashSet<String>> {
+        Arc::new(paths.iter().map(|p| p.to_string()).collect())
+    }
+
     fn build_paged_tar(name: &str, n_blocks: u32, fill: u8) -> Vec<u8> {
         let size = n_blocks as usize * PG_PAGE_SIZE as usize;
         let mut body = vec![fill; size];
@@ -876,6 +892,7 @@ mod tests {
                 delta_context: Some(DeltaContext {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
+                    parent_files: parent_set(&[rel_path]),
                 }),
                 ..Default::default()
             },
@@ -928,6 +945,7 @@ mod tests {
                 delta_context: Some(DeltaContext {
                     map: Arc::new(map),
                     format: IncrementFormat::Native,
+                    parent_files: parent_set(&[rel_path]),
                 }),
                 ..Default::default()
             },
@@ -974,6 +992,7 @@ mod tests {
                 delta_context: Some(DeltaContext {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
+                    parent_files: parent_set(&[rel_path]),
                 }),
                 ..Default::default()
             },
@@ -1015,6 +1034,7 @@ mod tests {
                 delta_context: Some(DeltaContext {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
+                    parent_files: parent_set(&[rel_path]),
                 }),
                 ..Default::default()
             },
@@ -1028,6 +1048,55 @@ mod tests {
 
         let listed = list_entries(&parts[0].1);
         assert_eq!(listed, vec![("PG_VERSION".into(), 2)]);
+    }
+
+    #[tokio::test]
+    async fn delta_ships_new_file_in_full_not_incremented() {
+        // Relation created after the parent: its pages are in the delta map,
+        // but it was NOT in the increment base. wal-g would have no base file
+        // to apply onto ("incremented file should always exist"), so it must
+        // ship in full. Regression for cross_tool_delta forward interop
+        let rel_path = "base/16384/16405";
+        let input = build_paged_tar(rel_path, 4, 0xAB);
+
+        let rel = crate::pg::walparser::RelFileNode {
+            spc_node: delta_mod::DEFAULT_SPC_NODE,
+            db_node: 16384,
+            rel_node: 16405,
+        };
+        let mut map = PagedFileDeltaMap::new();
+        map.add_location(crate::pg::walparser::BlockLocation { rel, block_no: 0 });
+        map.add_location(crate::pg::walparser::BlockLocation { rel, block_no: 2 });
+
+        let (rx, h) = start(
+            std::io::Cursor::new(input),
+            StreamerOpts {
+                max_tar_size: 10 * 1024 * 1024,
+                delta_context: Some(DeltaContext {
+                    map: Arc::new(map),
+                    format: IncrementFormat::Wi1,
+                    // parent did NOT contain this file
+                    parent_files: parent_set(&["base/16384/99999"]),
+                }),
+                ..Default::default()
+            },
+        );
+        let parts = collect_parts(rx).await;
+        let res = h.await.unwrap().unwrap();
+
+        let meta = res.files.get(rel_path).expect("file metadata");
+        assert!(!meta.is_incremented, "new file must not be incremented");
+        assert!(!meta.is_skipped, "new file must not be skipped");
+
+        // Full body present: 4 whole blocks, no wi1 magic
+        let listed = list_entries(&parts[0].1);
+        assert_eq!(listed, vec![(rel_path.into(), 4 * PG_PAGE_SIZE)]);
+        let mut a = tar::Archive::new(parts[0].1.as_slice());
+        let mut entry = a.entries().unwrap().next().unwrap().unwrap();
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).unwrap();
+        assert_eq!(body.len() as u64, 4 * PG_PAGE_SIZE);
+        assert_ne!(&body[..3], &increment::INCREMENT_MAGIC[..3]);
     }
 
     #[tokio::test]
@@ -1050,6 +1119,7 @@ mod tests {
                 delta_context: Some(DeltaContext {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
+                    parent_files: parent_set(&[rel_path]),
                 }),
                 ..Default::default()
             },

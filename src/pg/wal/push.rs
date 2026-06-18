@@ -12,6 +12,7 @@ use crate::pg;
 use crate::storage::DynStorage;
 
 use super::segment::{is_history_filename, is_wal_filename};
+use crate::pg::backup::wal_delta;
 
 pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -> Result<()> {
     let name = src_path
@@ -50,6 +51,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -
                 target = "wal_push",
                 "{key} already archived with identical bytes; skipping upload"
             );
+            maybe_record_delta(settings, &storage, src_path, &name).await;
             promote_ready_to_done(src_path, &name).await;
             return Ok(());
         }
@@ -88,8 +90,29 @@ pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -
         size
     );
 
+    maybe_record_delta(settings, &storage, src_path, &name).await;
     promote_ready_to_done(src_path, &name).await;
     Ok(())
+}
+
+/// Record this segment into its delta sidecar when `WALG_USE_WAL_DELTA` is set.
+/// Best-effort: only real WAL segments are recorded, and any failure is logged
+/// rather than propagated — a delta-recording error must not fail the archive
+async fn maybe_record_delta(
+    settings: &Settings,
+    storage: &DynStorage,
+    src_path: &Path,
+    name: &str,
+) {
+    if !settings.use_wal_delta || !is_wal_filename(name) {
+        return;
+    }
+    if let Err(e) = wal_delta::record_segment(settings, storage, src_path, name).await {
+        tracing::warn!(
+            target = "wal_push",
+            "delta recording for {name} failed: {e:#}"
+        );
+    }
 }
 
 /// Compare existing object's decoded bytes against a local file. Returns true

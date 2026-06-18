@@ -63,6 +63,16 @@ impl WalParser {
         self.set_current_record_data(Vec::new());
     }
 
+    /// Seed a parser with the leftover head of a record that continues past
+    /// where parsing stopped (wal-g `LoadWalParserFromCurrentRecordHead`).
+    /// Used to resume cross-segment stitching from a delta sidecar's stored
+    /// head. `page_magic` repopulates from the first page parsed afterward
+    pub fn from_current_record_head(head: Vec<u8>) -> Self {
+        let mut p = Self::new();
+        p.set_current_record_data(head);
+        p
+    }
+
     fn set_current_record_data(&mut self, data: Vec<u8>) {
         self.has_current_record_beginning = !data.is_empty();
         self.current_record_data = data;

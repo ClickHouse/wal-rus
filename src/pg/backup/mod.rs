@@ -17,6 +17,7 @@ pub mod list;
 pub mod push;
 pub mod show;
 pub mod tar_streamer;
+pub mod wal_delta;
 
 pub const SENTINEL_SUFFIX: &str = "_backup_stop_sentinel.json";
 pub const METADATA_FILENAME: &str = "metadata.json";

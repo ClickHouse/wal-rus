@@ -227,12 +227,12 @@ pub async fn integrity_for_backup(
     let Some(&end) = segs.iter().next_back() else {
         return Ok(Vec::new());
     };
-    let start_seg_no = (backup_start_lsn / DEFAULT_WAL_SEG_SIZE) as u32;
-    let xlog_segs_per_xlog_id = (0x1_0000_0000u64 / DEFAULT_WAL_SEG_SIZE) as u32;
+    let start_seg_no = backup_start_lsn / DEFAULT_WAL_SEG_SIZE;
+    let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / DEFAULT_WAL_SEG_SIZE;
     let start = SegmentName {
         timeline,
-        log_id: start_seg_no / xlog_segs_per_xlog_id,
-        seg_no: start_seg_no % xlog_segs_per_xlog_id,
+        log_id: (start_seg_no / xlog_segs_per_xlog_id) as u32,
+        seg_no: (start_seg_no % xlog_segs_per_xlog_id) as u32,
     };
     let mut gaps = Vec::new();
     let mut cursor = start;
