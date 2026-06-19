@@ -18,13 +18,13 @@ env:
   # break the cross-tool gate. Release artifacts live at
   # https://github.com/wal-g/wal-g/releases
   WALG_VERSION: v3.0.8
-  WALG_ASSET: wal-g-pg-22.04-amd64
+  WALG_ASSET: wal-g-pg-24.04-amd64
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --bin wal-rs
@@ -35,11 +35,44 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Instrumented build of the same binary, under cargo-llvm-cov's rustc wrapper
+  # so running it emits .profraw. The shell ci/*.sh lanes (below) run this binary
+  # instead of the release one on their coverage cells; coverage-merge folds the
+  # profraw into the line number. Built once and shared so the lanes stay cheap
+  # and every lane's profraw maps to the one object coverage-merge exports.
+  cov-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct from the vm-test-pg17 job's cache: that build is
+          # --features vm-test, this is the plain binary, so the dep sets differ.
+          key: coverage-bin
+      - name: Build instrumented binary
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo build --bin wal-rs --locked
+          # show-env picks the target dir; stage under the name the lanes expect.
+          mkdir -p cov-out
+          cp "${CARGO_LLVM_COV_TARGET_DIR:-target}/debug/wal-rs" cov-out/wal-rs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wal-rs-cov
+          path: cov-out/wal-rs
+          if-no-files-found: error
+          retention-days: 7
+
   pg:
-    needs: build
-    # PG 13-17 on jammy; PG 18 single-tool cells on noble (PGDG packages for
-    # jammy lagged 18). Cross-tool stays 13-17 — pinned wal-g v3.0.8 predates 18.
-    runs-on: ${{ matrix.os || 'ubuntu-22.04' }}
+    needs: [build, cov-build]
+    # PG 18 runs single-tool cells only: pinned wal-g v3.0.8 predates 18, so the
+    # cross-tool gate stays 13-17.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -57,20 +90,38 @@ jobs:
           - cross_tool_lzma
           - cross_tool_delta
         include:
-          - { pg: 18, test: full_backup, os: ubuntu-24.04 }
-          - { pg: 18, test: backup_mark, os: ubuntu-24.04 }
-          - { pg: 18, test: backup_show, os: ubuntu-24.04 }
-          - { pg: 18, test: wal_overwrite, os: ubuntu-24.04 }
-          - { pg: 18, test: daemon, os: ubuntu-24.04 }
+          - { pg: 18, test: full_backup }
+          - { pg: 18, test: backup_mark }
+          - { pg: 18, test: backup_show }
+          - { pg: 18, test: wal_overwrite }
+          - { pg: 18, test: daemon }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Fetch wal-rs binary
+      # PG17 cells run the instrumented binary so ci/*.sh coverage counts (folded
+      # by coverage-merge); other versions run the release binary, keeping the
+      # cross-version functional gate on the shipped build. Both unpack to bin/
+      # so the run step is identical.
+      - name: Fetch release wal-rs
+        if: matrix.pg != 17
         uses: actions/download-artifact@v8
         with:
           name: wal-rs-bin
           path: bin
-      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+      - name: Fetch instrumented wal-rs
+        if: matrix.pg == 17
+        uses: actions/download-artifact@v8
+        with:
+          name: wal-rs-cov
+          path: bin
+      - name: Prepare binary + coverage env
+        run: |
+          chmod +x bin/wal-rs && bin/wal-rs --version
+          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          if [ "${{ matrix.pg }}" = 17 ]; then
+            mkdir -p "$RUNNER_TEMP/prof"
+            echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/pg-${{ matrix.test }}-%p-%16m.profraw" >>"$GITHUB_ENV"
+          fi
 
       - name: Install PostgreSQL ${{ matrix.pg }}
         uses: ./.github/actions/install-pg
@@ -91,9 +142,19 @@ jobs:
         env:
           PG_VERSION: ${{ matrix.pg }}
           PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
-          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
           WALG_BIN: /usr/local/bin/wal-g
         run: ci/${{ matrix.test }}.sh
+
+      - name: Upload coverage profraw
+        if: matrix.pg == 17
+        uses: actions/upload-artifact@v7
+        with:
+          name: cov-profraw-pg-${{ matrix.test }}
+          # daemon's server process is SIGTERM-killed so flushes no profraw; its
+          # client calls and every other lane still do. ignore = tolerate none.
+          path: ${{ runner.temp }}/prof/*.profraw
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Collect PG logs on failure
         if: failure()
@@ -108,15 +169,16 @@ jobs:
 
   # Run the live-PG suite (tests/vm_live.rs, gated on the vm-test feature)
   # against a real PGDG cluster. Previously VM-only; this brings backup-push,
-  # wal-receive, encryption & retention live exercises into GitHub CI.
+  # wal-receive, encryption & retention live exercises into GitHub CI. Covers
+  # 13-16 and 18; 17 is the vm-test-pg17 job (instrumented, same suite).
   pg-vm-test:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        pg: [13, 14, 15, 16, 17]
+        pg: [13, 14, 15, 16, 18]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -149,22 +211,29 @@ jobs:
   # fsouza/fake-gcs-server (GCS) so the hand-rolled S3/GCS clients get exercised
   # against real APIs (SigV4 path-style, multipart, listing, server-side copy).
   pg-storage:
-    needs: build
-    runs-on: ubuntu-22.04
+    needs: cov-build
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         backend: [s3, gcs]
         test: [full_backup, storage_copy]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Fetch wal-rs binary
+      # Instrumented binary: storage_copy is the only live cover for server-side
+      # copy_within, and s3.rs/gcs.rs run live only here (vm-test is file:// only).
+      - name: Fetch instrumented wal-rs
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-bin
+          name: wal-rs-cov
           path: bin
-      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+      - name: Prepare binary + coverage env
+        run: |
+          chmod +x bin/wal-rs && bin/wal-rs --version
+          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/prof"
+          echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/storage-${{ matrix.backend }}-${{ matrix.test }}-%p-%16m.profraw" >>"$GITHUB_ENV"
 
       - name: Install PostgreSQL 16
         uses: ./.github/actions/install-pg
@@ -194,11 +263,18 @@ jobs:
         env:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
-          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
           WALRS_STORAGE_BACKEND: ${{ matrix.backend }}
           MINIO_ENDPOINT: http://127.0.0.1:9000
           FAKE_GCS_ENDPOINT: http://127.0.0.1:4443
         run: ci/${{ matrix.test }}.sh
+
+      - name: Upload coverage profraw
+        uses: actions/upload-artifact@v7
+        with:
+          name: cov-profraw-storage-${{ matrix.backend }}-${{ matrix.test }}
+          path: ${{ runner.temp }}/prof/*.profraw
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Collect logs on failure
         if: failure()
@@ -214,21 +290,29 @@ jobs:
   # TLS + SCRAM live handshakes. Auth/TLS code is PG-version-independent, so one
   # version suffices. These need TCP (TLS is skipped on unix sockets).
   pg-tls-scram:
-    needs: build
-    runs-on: ubuntu-22.04
+    needs: cov-build
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         test: [tls_replication, scram_auth, client_cert]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Fetch wal-rs binary
+      # Instrumented binary: the server-side TLS/client-cert handshakes here are
+      # the only live cover for that code (vm-test runs over unix sockets, which
+      # skip TLS).
+      - name: Fetch instrumented wal-rs
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-bin
+          name: wal-rs-cov
           path: bin
-      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+      - name: Prepare binary + coverage env
+        run: |
+          chmod +x bin/wal-rs && bin/wal-rs --version
+          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/prof"
+          echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/tlsscram-${{ matrix.test }}-%p-%16m.profraw" >>"$GITHUB_ENV"
 
       - name: Install PostgreSQL 16
         uses: ./.github/actions/install-pg
@@ -239,8 +323,15 @@ jobs:
         env:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
-          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
         run: ci/${{ matrix.test }}.sh
+
+      - name: Upload coverage profraw
+        uses: actions/upload-artifact@v7
+        with:
+          name: cov-profraw-tlsscram-${{ matrix.test }}
+          path: ${{ runner.temp }}/prof/*.profraw
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Collect logs on failure
         if: failure()
@@ -256,21 +347,26 @@ jobs:
   # Non-zstd codecs end-to-end (push → fetch → WAL replay). zstd is already the
   # default exercised by the main `pg` matrix; this covers the rest on one PG.
   pg-codec:
-    needs: build
-    runs-on: ubuntu-22.04
+    needs: cov-build
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         codec: [brotli, lz4, lzma, gzip]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Fetch wal-rs binary
+      - name: Fetch instrumented wal-rs
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-bin
+          name: wal-rs-cov
           path: bin
-      - run: chmod +x bin/wal-rs && bin/wal-rs --version
+      - name: Prepare binary + coverage env
+        run: |
+          chmod +x bin/wal-rs && bin/wal-rs --version
+          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/prof"
+          echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/codec-${{ matrix.codec }}-%p-%16m.profraw" >>"$GITHUB_ENV"
 
       - name: Install PostgreSQL 16
         uses: ./.github/actions/install-pg
@@ -281,9 +377,16 @@ jobs:
         env:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
-          WALRS_BIN: ${{ github.workspace }}/bin/wal-rs
           WALG_COMPRESSION_METHOD: ${{ matrix.codec }}
         run: ci/full_backup.sh
+
+      - name: Upload coverage profraw
+        uses: actions/upload-artifact@v7
+        with:
+          name: cov-profraw-codec-${{ matrix.codec }}
+          path: ${{ runner.temp }}/prof/*.profraw
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Collect logs on failure
         if: failure()
@@ -296,17 +399,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # Line-coverage baseline. Instruments the vm-test suite (tests/vm_live.rs)
-  # against a real PG 17 cluster under cargo-llvm-cov so PG-dependent library
-  # code is exercised, not just the unit tests. One major is enough for a
-  # baseline; the pg matrix proves cross-version behaviour separately. Uploads
-  # lcov.info + HTML; summary lands in the job log; fails on any 0%-coverage
+  # PG17 vm-test lane + line-coverage baseline. Runs the vm-test suite
+  # (tests/vm_live.rs) against a real PG 17 cluster under cargo-llvm-cov: the
+  # instrumented run is the functional pg17 vm-test gate (pg-vm-test covers
+  # 13-16) and emits the coverage baseline, exercising PG-dependent library
+  # code, not just unit tests. Uploads lcov.info (merged HTML is rendered by
+  # coverage-merge); summary lands in the job log; fails on any 0%-coverage
   # source file.
-  coverage:
-    runs-on: ubuntu-22.04
+  vm-test-pg17:
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           # cargo-llvm-cov needs llvm-profdata + llvm-cov from this component.
@@ -317,7 +421,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Instrumented builds differ from the other jobs'; isolate the cache.
-          key: coverage
+          key: vm-test-pg17
 
       - name: Install PostgreSQL 17
         uses: ./.github/actions/install-pg
@@ -325,7 +429,7 @@ jobs:
           pg-version: 17
 
       # Single instrumented pass (--no-report); the report steps re-read the
-      # cached profdata to emit summary + lcov + html.
+      # cached profdata to emit summary + lcov.
       - name: Run instrumented vm-test suite (cargo llvm-cov)
         env:
           PG_VERSION: 17
@@ -344,16 +448,11 @@ jobs:
       - name: Coverage lcov.info
         run: cargo llvm-cov report --lcov --output-path lcov.info
 
-      - name: Coverage HTML
-        run: cargo llvm-cov report --html
-
-      - name: Upload coverage artifacts
+      - name: Upload vm-test lcov
         uses: actions/upload-artifact@v7
         with:
-          name: coverage
-          path: |
-            lcov.info
-            target/llvm-cov/html
+          name: coverage-vmtest
+          path: lcov.info
           if-no-files-found: error
           retention-days: 30
 
@@ -382,9 +481,95 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: logs-coverage
+          name: logs-vm-test-pg17
           path: |
             /tmp/wal-rs-ci-*/**/*.log
             /tmp/wal-rs-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
+
+  # Restate the line number with the shell ci/*.sh lanes folded in. Each
+  # instrumented lane uploaded .profraw from the one cov-build binary; merge them
+  # against that exact object (raw llvm-cov export reproduces cargo-llvm-cov's
+  # filtering) and sum per-line hits with the vm-test lcov. Runs even if a lane
+  # failed so the number is always produced; the hard 0%-file gate stays in the
+  # vm-test-pg17 job (vm-test lcov), so a partial merge here can't false-fail it.
+  # genhtml renders the merged lcov into the HTML report in the artifact.
+  coverage-merge:
+    needs: [vm-test-pg17, cov-build, pg, pg-storage, pg-codec, pg-tls-scram]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-profdata + llvm-cov for the shell-lane profraw merge/export.
+          components: llvm-tools-preview
+      - name: Fetch vm-test coverage
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-vmtest
+          path: vmtest
+      - name: Fetch instrumented binary
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: wal-rs-cov
+          path: cov
+      - name: Fetch shell-lane profraw
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cov-profraw-*
+          path: profraw
+          merge-multiple: true
+      - name: Merge coverage
+        run: |
+          set -euo pipefail
+          llvmbin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
+          inputs=()
+          if [ -f vmtest/lcov.info ]; then inputs+=(vmtest/lcov.info); else echo "::warning::no vm-test lcov"; fi
+          mkdir -p profraw
+          find profraw -name '*.profraw' -type f >profraw.list || true
+          if [ -f cov/wal-rs ] && [ -s profraw.list ]; then
+            # failure-mode=all: a SIGTERM-killed lane (daemon) may leave a partial
+            # profraw; tolerate individual bad files, fail only if all are bad.
+            "$llvmbin/llvm-profdata" merge -sparse --failure-mode=all -f profraw.list -o shell.profdata
+            "$llvmbin/llvm-cov" export --instr-profile shell.profdata --object cov/wal-rs \
+              --ignore-filename-regex '(/\.cargo/registry/|/rustc/|library/std/)' \
+              --format lcov >shell.lcov
+            inputs+=(shell.lcov)
+            echo "shell-lane profraw merged: $(wc -l <profraw.list) file(s)"
+          else
+            echo "::warning::no shell-lane profraw; merged number is vm-test only"
+          fi
+          [ ${#inputs[@]} -gt 0 ] || { echo "::error::no coverage inputs"; exit 1; }
+          awk -f ci/lcov_merge.awk "${inputs[@]}" >merged.lcov
+      - name: Coverage summary
+        run: |
+          awk -F: '/^LH:/{h+=$2} /^LF:/{f+=$2} END{if(f>0) printf "merged line coverage: %d/%d = %.2f%%\n",h,f,100*h/f}' merged.lcov
+          # Report (do not fail on) 0%-coverage files; the hard gate is the
+          # vm-test-pg17 job. A file here can only be 0% if no stream hit it.
+          awk '
+            /^SF:/{f=substr($0,4)} /^LF:/{lf=substr($0,4)+0}
+            /^LH:/{ if(substr($0,4)+0==0 && lf>0){ i=index(f,"/src/"); if(i)f=substr(f,i+1); print "  0%:",f } }
+          ' merged.lcov
+      - name: Install genhtml
+        run: sudo apt-get update && sudo apt-get install -y lcov
+      - name: Coverage HTML (merged)
+        run: |
+          # lcov 2.x (noble) genhtml is strict; ignore render-only mapping
+          # complaints from llvm-cov data. Extend list if CI flags more.
+          genhtml merged.lcov --output-directory html \
+            --prefix "$GITHUB_WORKSPACE" --title 'wal-rs merged coverage' \
+            --legend --quiet --ignore-errors inconsistent,unmapped
+      - name: Upload merged coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-merged
+          path: |
+            merged.lcov
+            html
+          if-no-files-found: error
+          retention-days: 30
