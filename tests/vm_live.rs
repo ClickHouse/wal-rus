@@ -438,9 +438,19 @@ async fn archive_pg_wal(s: &Settings, store: &Arc<dyn Storage>, pg_wal: &std::pa
         .collect();
     segs.sort();
     for seg in segs {
-        wal::push::handle(s, store.clone(), &seg)
-            .await
-            .unwrap_or_else(|e| panic!("archive {}: {e:#}", seg.display()));
+        let Err(e) = wal::push::handle(s, store.clone(), &seg).await else {
+            continue;
+        };
+        // vm-tests share one cluster, so PG recycles/removes pre-redo WAL
+        // concurrently: a segment enumerated above can vanish before push stats
+        // it. Tolerate that race, fail loudly on anything else
+        let vanished = e.chain().any(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        });
+        if !vanished {
+            panic!("archive {}: {e:#}", seg.display());
+        }
     }
 }
 
@@ -1003,7 +1013,18 @@ async fn delta_from_summaries_against_live_pg() {
         .await
         .expect("delta-from-summaries backup");
         let name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
-        if name.contains("_D_") {
+        // Fallback-to-full keeps the `_D_` name (built from the parent before
+        // the delta map is attempted) but writes a FULL sentinel, so a real
+        // delta is detected by sentinel linkage, not the name. PG18's summarizer
+        // wakeup lags freshly-written WAL more than PG17, losing the coverage
+        // race for the fast-checkpoint backup-start LSN more often; a persistent
+        // miss exhausts the retries and the post-loop guard skips (the on-disk
+        // summary format is identical across versions).
+        if read_sentinel(&storage_dir, &name)
+            .sentinel
+            .increment_from
+            .is_some()
+        {
             delta_name = Some(name);
             break;
         }
