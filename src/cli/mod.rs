@@ -287,6 +287,9 @@ impl Cli {
     }
 
     pub async fn run(self) -> Result<()> {
+        // WALG_PG_WAL_SIZE applies to every command's segment math (wal-g sets
+        // its WalSegmentSize global in the same pre-run hook)
+        wal::segment::configure_from_env()?;
         match self.cmd {
             Cmd::WalPush { wal_filepath } => {
                 let s = Settings::from_env()?;

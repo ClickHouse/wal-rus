@@ -36,7 +36,7 @@ use crate::pg::backup::wal_delta::{
     WAL_FILES_IN_DELTA, delta_group_name, delta_group_no, delta_storage_key, seg_name_from_global,
 };
 use crate::pg::backup::{BackupSentinelDtoV2, increment, name_from_sentinel_key};
-use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
+use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::walparser::{
     BlockLocation, ParsePageError, RelFileNode, WalParser, extract_locations_from_wal_file,
     read_locations_from, write_locations_to,
@@ -552,7 +552,7 @@ async fn build_delta_map_from_sidecars(
     end_lsn: u64,
     compression: compression::Method,
 ) -> Result<PagedFileDeltaMap> {
-    let seg_size = DEFAULT_WAL_SEG_SIZE;
+    let seg_size = wal_segment_size();
     let n = WAL_FILES_IN_DELTA;
     let first_used_delta = delta_group_no(lsn_to_seg(start_lsn, seg_size));
     let first_not_used_delta = delta_group_no(lsn_to_seg(end_lsn, seg_size));
@@ -626,7 +626,7 @@ async fn build_delta_map_from_wal_full(
     end_lsn: u64,
     compression: compression::Method,
 ) -> Result<PagedFileDeltaMap> {
-    let seg_size = DEFAULT_WAL_SEG_SIZE;
+    let seg_size = wal_segment_size();
     let mut delta = PagedFileDeltaMap::new();
     let mut parser = WalParser::new();
     if end_lsn <= start_lsn {
@@ -695,6 +695,7 @@ async fn fetch_and_parse_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
     #[tokio::test]
     async fn delta_parent_carries_increment_format() {

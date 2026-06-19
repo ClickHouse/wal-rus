@@ -15,7 +15,7 @@ use tokio::io::AsyncReadExt;
 use crate::pg::WAL_FOLDER;
 use crate::pg::backup::list as backup_list;
 use crate::pg::backup::{format_pg_lsn, parse_timeline_from_backup_name};
-use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
+use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::wal::segment_file::classify_segment_name;
 use crate::storage::DynStorage;
 
@@ -129,12 +129,13 @@ fn summarize_timeline(
             status: TimelineStatus::Lost,
         };
     }
+    let seg_size = wal_segment_size();
     let first = *segs.iter().next().unwrap();
     let last = *segs.iter().next_back().unwrap();
     let mut gaps = Vec::new();
     let mut cursor = first;
     while cursor != last {
-        let nxt = cursor.next(DEFAULT_WAL_SEG_SIZE);
+        let nxt = cursor.next(seg_size);
         if !segs.contains(&nxt) {
             // Find next present segment after `cursor`
             let mut probe = nxt;
@@ -144,7 +145,7 @@ fn summarize_timeline(
                 if probe == last {
                     break;
                 }
-                probe = probe.next(DEFAULT_WAL_SEG_SIZE);
+                probe = probe.next(seg_size);
             }
             gaps.push(GapInfo {
                 from: cursor.format(),
@@ -227,8 +228,9 @@ pub async fn integrity_for_backup(
     let Some(&end) = segs.iter().next_back() else {
         return Ok(Vec::new());
     };
-    let start_seg_no = backup_start_lsn / DEFAULT_WAL_SEG_SIZE;
-    let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / DEFAULT_WAL_SEG_SIZE;
+    let seg_size = wal_segment_size();
+    let start_seg_no = backup_start_lsn / seg_size;
+    let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / seg_size;
     let start = SegmentName {
         timeline,
         log_id: (start_seg_no / xlog_segs_per_xlog_id) as u32,
@@ -242,7 +244,7 @@ pub async fn integrity_for_backup(
             let mut missing: u64 = 0;
             while !segs.contains(&probe) && probe != end {
                 missing += 1;
-                probe = probe.next(DEFAULT_WAL_SEG_SIZE);
+                probe = probe.next(seg_size);
             }
             gaps.push(GapInfo {
                 from: cursor.format(),
@@ -257,7 +259,7 @@ pub async fn integrity_for_backup(
         if cursor == end {
             break;
         }
-        cursor = cursor.next(DEFAULT_WAL_SEG_SIZE);
+        cursor = cursor.next(seg_size);
     }
     Ok(gaps)
 }

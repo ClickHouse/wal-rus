@@ -75,7 +75,16 @@ impl ReplicationConn {
         }
     }
 
+    /// Replication-mode connection (`replication=true`); the streaming path
     pub async fn connect(cfg: &PgConfig) -> Result<Self> {
+        Self::connect_with(cfg, true).await
+    }
+
+    /// Connect with or without the `replication` startup parameter. A normal
+    /// (non-replication) connection is needed to read `wal_segment_size` and
+    /// `pg_replication_slots`, which physical replication mode forbids — wal-g
+    /// opens the same kind of side connection in `getCurrentWalInfo`
+    pub async fn connect_with(cfg: &PgConfig, replication: bool) -> Result<Self> {
         let (socket, tls): (Box<dyn SocketStream>, bool) = if cfg.host.starts_with('/') {
             let path = format!("{}/.s.PGSQL.{}", cfg.host.trim_end_matches('/'), cfg.port);
             let sock = UnixStream::connect(&path)
@@ -107,13 +116,18 @@ impl ReplicationConn {
             tls,
         };
 
-        let params: &[(&str, &str)] = &[
+        let params: [(&str, &str); _] = [
             ("user", cfg.user.as_str()),
             ("database", cfg.database.as_str()),
             ("application_name", cfg.application_name.as_str()),
-            ("replication", "true"),
             ("client_encoding", "UTF8"),
+            ("replication", "true"),
         ];
+        let params = if replication {
+            &params[..]
+        } else {
+            &params[..4]
+        };
         frontend::startup_message(params.iter().copied(), &mut conn.tx)?;
         conn.flush().await?;
 
@@ -123,16 +137,16 @@ impl ReplicationConn {
         let ver = conn
             .server_param("server_version")
             .ok_or_else(|| anyhow!("server did not send server_version"))?;
-        conn.server_version_num = parse_server_version(&ver)
+        conn.server_version_num = parse_server_version(ver)
             .ok_or_else(|| anyhow!("cannot parse server_version: {ver}"))?;
         Ok(conn)
     }
 
-    pub fn server_param(&self, name: &str) -> Option<String> {
+    pub fn server_param(&self, name: &str) -> Option<&str> {
         self.server_params
             .iter()
             .find(|(k, _)| k == name)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| &v[..])
     }
 
     pub async fn send_query(&mut self, q: &str) -> Result<()> {
@@ -147,6 +161,93 @@ impl ReplicationConn {
             .map_err(|e| anyhow::anyhow!("copy-data frame: {e}"))?;
         msg.write(&mut self.tx);
         self.flush().await
+    }
+
+    /// Run a simple query, collecting every `DataRow` as text columns. For the
+    /// small metadata queries wal-receive issues (`wal_segment_size`, slot
+    /// info) over a non-replication connection. NULL columns map to `None`
+    pub async fn query_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        self.send_query(sql).await?;
+        let mut rows = Vec::new();
+        loop {
+            match self.recv_message().await? {
+                Message::DataRow(row) => rows.push(data_row_text(&row)?),
+                Message::ReadyForQuery(_) => break,
+                Message::ErrorResponse(e) => bail!("query `{sql}`: {}", error_message(&e)),
+                _ => {}
+            }
+        }
+        Ok(rows)
+    }
+
+    /// `CREATE_REPLICATION_SLOT <name> PHYSICAL`. A pre-existing slot
+    /// (`duplicate_object`, 42710) is treated as success so a restart after a
+    /// crash between the existence check and creation is idempotent
+    pub async fn create_physical_replication_slot(&mut self, name: &str) -> Result<()> {
+        self.send_query(&format!("CREATE_REPLICATION_SLOT {name} PHYSICAL"))
+            .await?;
+        loop {
+            match self.recv_message().await? {
+                Message::ReadyForQuery(_) => return Ok(()),
+                Message::ErrorResponse(e) => {
+                    if error_code(&e) == "42710" {
+                        // already exists; drain the trailing ReadyForQuery
+                        self.await_ready_for_query().await?;
+                        return Ok(());
+                    }
+                    bail!("CREATE_REPLICATION_SLOT {name}: {}", error_message(&e));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `TIMELINE_HISTORY <tli>` -> (history filename, file contents). Returns
+    /// `Ok(None)` when the server has no history file for the timeline
+    /// (`undefined_file`, 58P01), mirroring wal-g's `getStartTimeline` guard
+    pub async fn timeline_history(&mut self, timeline: u32) -> Result<Option<(String, Vec<u8>)>> {
+        self.send_query(&format!("TIMELINE_HISTORY {timeline}"))
+            .await?;
+        let mut out = None;
+        loop {
+            match self.recv_message().await? {
+                Message::DataRow(row) => {
+                    let cols = data_row_bytes(&row)?;
+                    let name = cols
+                        .first()
+                        .and_then(|c| c.as_ref())
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .unwrap_or_else(|| format!("{timeline:08X}.history"));
+                    let content = cols.get(1).and_then(|c| c.clone()).unwrap_or_default();
+                    out = Some((name, content));
+                }
+                Message::ReadyForQuery(_) => break,
+                Message::ErrorResponse(e) => {
+                    if error_code(&e) == "58P01" {
+                        self.await_ready_for_query().await?;
+                        return Ok(None);
+                    }
+                    bail!("TIMELINE_HISTORY {timeline}: {}", error_message(&e));
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Send a client `CopyDone` ('c') and drain the server's
+    /// `CommandComplete`/`ReadyForQuery` so the connection returns to simple-
+    /// query mode (used after a server `CopyDone` ends a replication stream)
+    pub async fn end_copy(&mut self) -> Result<()> {
+        frontend::copy_done(&mut self.tx);
+        self.flush().await?;
+        loop {
+            match self.recv_message().await? {
+                Message::ReadyForQuery(_) => return Ok(()),
+                Message::ErrorResponse(e) => bail!("end copy: {}", error_message(&e)),
+                _ => {}
+            }
+        }
     }
 
     pub async fn recv_message(&mut self) -> Result<Message> {
@@ -320,6 +421,45 @@ pub fn error_message(body: &postgres_protocol::message::backend::ErrorResponseBo
         }
     }
     format!("{sev} {code}: {msg}")
+}
+
+/// SQLSTATE ('C' field) of an error response, empty when absent
+pub fn error_code(body: &postgres_protocol::message::backend::ErrorResponseBody) -> String {
+    use fallible_iterator::FallibleIterator as _;
+    let mut fields = body.fields();
+    while let Ok(Some(f)) = fields.next() {
+        if f.type_() == b'C' {
+            return String::from_utf8_lossy(f.value_bytes()).into_owned();
+        }
+    }
+    String::new()
+}
+
+/// Decode a `DataRow`'s columns to owned byte vectors, preserving NULLs
+fn data_row_bytes(
+    row: &postgres_protocol::message::backend::DataRowBody,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    use fallible_iterator::FallibleIterator as _;
+    let buf = row.buffer_bytes();
+    let mut ranges = row.ranges();
+    let mut out = Vec::new();
+    while let Some(range) = ranges.next()? {
+        out.push(range.map(|r| buf[r].to_vec()));
+    }
+    Ok(out)
+}
+
+/// Decode a `DataRow`'s columns to UTF-8 strings, preserving NULLs
+fn data_row_text(
+    row: &postgres_protocol::message::backend::DataRowBody,
+) -> Result<Vec<Option<String>>> {
+    data_row_bytes(row)?
+        .into_iter()
+        .map(|c| {
+            c.map(|b| String::from_utf8(b).context("non-utf8 column"))
+                .transpose()
+        })
+        .collect()
 }
 
 pub fn message_kind(m: &Message) -> &'static str {

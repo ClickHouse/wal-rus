@@ -209,12 +209,17 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
     let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
-    // Seed storage with segments 2 + 3 (we'll prefetch starting from 1, count=2)
+    // Seed storage with segments 2 + 3 (we'll prefetch starting from 1, count=2).
+    // Full-size segments with valid WAL magic so fetch's prefetch validation
+    // (exact segment size + magic) promotes them rather than re-downloading
     let stage_dir = dir.path().join("stage");
     std::fs::create_dir_all(&stage_dir).unwrap();
-    for hex in ["000000010000000000000002", "000000010000000000000003"] {
+    for (i, hex) in ["000000010000000000000002", "000000010000000000000003"]
+        .into_iter()
+        .enumerate()
+    {
         let stage = stage_dir.join(hex);
-        std::fs::write(&stage, hex.as_bytes()).unwrap();
+        std::fs::write(&stage, pseudo_wal_segment((i + 2) as u8)).unwrap();
         pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
             .await
             .unwrap();
@@ -349,26 +354,31 @@ async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     let seg = "000000010000000000000002";
+    // full-size segment with valid magic so promotion accepts it once staged
+    let segment = pseudo_wal_segment(2);
     let running = prefetch::running_dir(&pg_wal).join(seg);
     std::fs::create_dir_all(running.parent().unwrap()).unwrap();
     // an in-flight prefetch: running/<seg> present, not yet complete
     std::fs::write(&running, b"").unwrap();
 
-    // background prefetcher completes shortly: publish ready, drop running
+    // background prefetcher completes shortly. Write into running/ then rename
+    // to ready/ (the real prefetcher's atomic publish), so a watcher never stats
+    // a half-written ready file and rejects it on the exact-size check
     let ready = prefetch::prefetched_path(&pg_wal, seg);
     let running_bg = running.clone();
     let ready_bg = ready.clone();
+    let segment_bg = segment.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        std::fs::write(&ready_bg, b"prefetched-bytes").unwrap();
-        let _ = std::fs::remove_file(&running_bg);
+        std::fs::write(&running_bg, &segment_bg).unwrap();
+        std::fs::rename(&running_bg, &ready_bg).unwrap();
     });
 
     let dst = pg_wal.join(seg);
     pgwalrs::pg::wal::fetch::handle(&s, store, seg, &dst, wal::fetch::Prefetch::Off)
         .await
         .expect("fetch should reuse the in-flight prefetch, not 404 on empty storage");
-    assert_eq!(std::fs::read(&dst).unwrap(), b"prefetched-bytes");
+    assert_eq!(std::fs::read(&dst).unwrap(), segment);
     assert!(!ready.exists(), "ready file must be consumed by promotion");
 }
 

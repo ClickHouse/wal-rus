@@ -14,7 +14,7 @@ use tokio::fs;
 
 use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
-use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
+use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::wal::show;
 use crate::storage::DynStorage;
 
@@ -28,6 +28,7 @@ pub async fn handle(
         .await
         .with_context(|| format!("create_dir_all {}", dst.display()))?;
 
+    let seg_size = wal_segment_size();
     let timelines = show::collect(storage.clone()).await?;
     let mut missing: Vec<SegmentName> = Vec::new();
     for t in &timelines {
@@ -43,7 +44,7 @@ pub async fn handle(
             let Ok(from) = SegmentName::parse(&g.from) else {
                 continue;
             };
-            let mut probe = from.next(DEFAULT_WAL_SEG_SIZE);
+            let mut probe = from.next(seg_size);
             // Walk while we have not yet caught up to `to`
             let to_seg = SegmentName::parse(&g.to).ok();
             for _ in 0..g.missing {
@@ -51,7 +52,7 @@ pub async fn handle(
                     break;
                 }
                 missing.push(probe);
-                probe = probe.next(DEFAULT_WAL_SEG_SIZE);
+                probe = probe.next(seg_size);
             }
         }
     }

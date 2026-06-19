@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::compression;
 use crate::config::Settings;
@@ -237,6 +237,27 @@ async fn find_object(
     Ok(None)
 }
 
+/// wal-g `checkWALFileMagic`: the first four bytes of a WAL segment, read as a
+/// little-endian u32, carry the XLOG page magic (`xlp_magic` in the low half).
+/// Every released magic is >= 0xD061, so a smaller value flags a corrupt or
+/// truncated cached segment. A lower-bound heuristic, not a version-exact check
+async fn check_wal_file_magic(path: &Path) -> Result<()> {
+    let mut f = fs::File::open(path)
+        .await
+        .with_context(|| format!("open {} for magic check", path.display()))?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)
+        .await
+        .with_context(|| format!("read magic from {}", path.display()))?;
+    if u32::from_le_bytes(magic) < 0xD061 {
+        anyhow::bail!(
+            "WAL file magic 0x{:X} is invalid",
+            u32::from_le_bytes(magic)
+        );
+    }
+    Ok(())
+}
+
 fn tmp_path(dst: &Path) -> PathBuf {
     let mut s = dst.as_os_str().to_owned();
     s.push(format!(".tmp.{}", std::process::id()));
@@ -261,7 +282,20 @@ async fn try_promote_prefetched(name: &str, dst: &Path) -> Result<bool> {
     let mut stalls = 0u32;
     loop {
         match fs::metadata(&ready).await {
-            Ok(_) => {
+            Ok(meta) => {
+                // wal-g validates a ready cache entry before trusting it: exact
+                // segment size, then WAL magic after the rename. Either failure
+                // falls back to a fresh storage download rather than promoting a
+                // corrupt or truncated segment into pg_wal
+                let seg_size = super::segment::wal_segment_size();
+                if meta.len() != seg_size {
+                    tracing::warn!(
+                        target = "wal_fetch",
+                        "prefetched {name} has wrong size {} (want {seg_size}); re-fetching",
+                        meta.len()
+                    );
+                    return Ok(false);
+                }
                 if let Some(p) = dst.parent() {
                     fs::create_dir_all(p).await.ok();
                 }
@@ -272,6 +306,14 @@ async fn try_promote_prefetched(name: &str, dst: &Path) -> Result<bool> {
                         dst.display()
                     )
                 })?;
+                if let Err(e) = check_wal_file_magic(dst).await {
+                    tracing::warn!(
+                        target = "wal_fetch",
+                        "prefetched {name} failed validation: {e:#}; re-fetching"
+                    );
+                    let _ = fs::remove_file(dst).await;
+                    return Ok(false);
+                }
                 tracing::info!(
                     target = "wal_fetch",
                     "promoted prefetched {name} -> {}",
@@ -299,9 +341,96 @@ async fn try_promote_prefetched(name: &str, dst: &Path) -> Result<bool> {
                     }
                 }
             }
-            // running absent (normal cold fetch) or unreadable: just download
-            Err(_) => return Ok(false),
+            // running absent: either a cold fetch (no prefetch in flight) or a
+            // prefetcher that just published by renaming running -> ready. We
+            // sample ready and running non-atomically, so re-check ready before
+            // falling back to a download, else a prefetch completing in this
+            // window forces a redundant download
+            Err(_) => {
+                if fs::metadata(&ready).await.is_ok() {
+                    continue;
+                }
+                return Ok(false);
+            }
         }
         tokio::time::sleep(PREFETCH_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // First 4 bytes LE: 0xD10D (PG14 page magic) clears the >= 0xD061 floor
+    const VALID_MAGIC: [u8; 4] = [0x0D, 0xD1, 0x00, 0x00];
+
+    #[tokio::test]
+    async fn magic_check_accepts_and_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good");
+        fs::write(&good, VALID_MAGIC).await.unwrap();
+        assert!(check_wal_file_magic(&good).await.is_ok());
+
+        let bad = dir.path().join("bad");
+        fs::write(&bad, [0u8; 4]).await.unwrap();
+        assert!(check_wal_file_magic(&bad).await.is_err());
+
+        // truncated (< 4 bytes) is rejected, not silently accepted
+        let short = dir.path().join("short");
+        fs::write(&short, [0x0Du8]).await.unwrap();
+        assert!(check_wal_file_magic(&short).await.is_err());
+    }
+
+    /// `<pg_wal>/<seg>` plus its prefetch staging path for a ready file
+    fn layout(pg_wal: &Path, name: &str) -> (PathBuf, PathBuf) {
+        (
+            pg_wal.join(name),
+            super::super::prefetch::prefetched_path(pg_wal, name),
+        )
+    }
+
+    #[tokio::test]
+    async fn wrong_size_ready_falls_back_without_promoting() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "000000010000000000000005";
+        let (dst, ready) = layout(dir.path(), name);
+        fs::create_dir_all(ready.parent().unwrap()).await.unwrap();
+        // a single page, not a full segment
+        fs::write(&ready, vec![0u8; 8192]).await.unwrap();
+
+        assert!(!try_promote_prefetched(name, &dst).await.unwrap());
+        assert!(!fs::try_exists(&dst).await.unwrap(), "must not promote");
+    }
+
+    #[tokio::test]
+    async fn full_size_promotes_or_rejects_on_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = super::super::segment::wal_segment_size() as usize;
+
+        // valid magic + correct size -> promoted by rename
+        let ok_name = "000000010000000000000007";
+        let (ok_dst, ok_ready) = layout(dir.path(), ok_name);
+        fs::create_dir_all(ok_ready.parent().unwrap())
+            .await
+            .unwrap();
+        let mut seg = vec![0u8; seg_size];
+        seg[..4].copy_from_slice(&VALID_MAGIC);
+        fs::write(&ok_ready, &seg).await.unwrap();
+        assert!(try_promote_prefetched(ok_name, &ok_dst).await.unwrap());
+        assert_eq!(
+            fs::metadata(&ok_dst).await.unwrap().len() as usize,
+            seg_size
+        );
+        assert!(!fs::try_exists(&ok_ready).await.unwrap(), "ready consumed");
+
+        // bad magic + correct size -> dst removed, fall back to download
+        let bad_name = "000000010000000000000008";
+        let (bad_dst, bad_ready) = layout(dir.path(), bad_name);
+        fs::write(&bad_ready, vec![0u8; seg_size]).await.unwrap();
+        assert!(!try_promote_prefetched(bad_name, &bad_dst).await.unwrap());
+        assert!(
+            !fs::try_exists(&bad_dst).await.unwrap(),
+            "bad segment removed"
+        );
     }
 }

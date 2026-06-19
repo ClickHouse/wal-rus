@@ -30,7 +30,7 @@ use crate::compression;
 use crate::config::Settings;
 use crate::pg::WAL_FOLDER;
 use crate::pg::backup::delta::DeltaFile;
-use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
+use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::walparser::{
     BlockLocation, WAL_PAGE_SIZE, WalParser, XLP_PAGE_MAGIC_PG14, extract_block_locations,
     parse_record_from_bytes,
@@ -421,7 +421,7 @@ pub async fn record_segment(
         .await
         .context("join segment parse")??;
 
-    let seg_size = DEFAULT_WAL_SEG_SIZE;
+    let seg_size = wal_segment_size();
     let global = seg_global_no(&seg, seg_size);
     let group_no = delta_group_no(global);
     let pos = (global % WAL_FILES_IN_DELTA) as usize;
@@ -466,6 +466,7 @@ pub async fn record_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
     #[test]
     fn global_segno_round_trips_through_name() {

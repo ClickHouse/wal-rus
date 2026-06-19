@@ -6,10 +6,54 @@
 //!
 //! Reference: postgresql src/include/access/xlog_internal.h
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use thiserror::Error;
 
 pub const DEFAULT_WAL_SEG_SIZE: u64 = 16 * 1024 * 1024;
 pub const SEGMENT_NAME_LEN: usize = 24;
+
+/// Process-wide WAL segment size. Defaults to 16 MiB; overridden at startup by
+/// `WALG_PG_WAL_SIZE` (see [`configure_from_env`]) and, for wal-receive, by the
+/// `wal_segment_size` read from the live server. Mirrors wal-g's mutable
+/// `WalSegmentSize` global so every segment-number/LSN computation honors a
+/// non-default `initdb --wal-segsize`
+static WAL_SEGMENT_SIZE: AtomicU64 = AtomicU64::new(DEFAULT_WAL_SEG_SIZE);
+
+/// Current configured WAL segment size in bytes
+pub fn wal_segment_size() -> u64 {
+    WAL_SEGMENT_SIZE.load(Ordering::Relaxed)
+}
+
+/// Set the process-wide segment size. `bytes` must be a power of two
+pub fn set_wal_segment_size(bytes: u64) {
+    debug_assert!(bytes > 0 && bytes.is_power_of_two());
+    WAL_SEGMENT_SIZE.store(bytes, Ordering::Relaxed);
+}
+
+/// Apply `WALG_PG_WAL_SIZE` (segment size in MiB) to the process-wide segment
+/// size. No-op when unset, matching wal-g's `viper.IsSet` gate. PG requires the
+/// segment size to be a power of two in 1..=1024 MiB (`initdb --wal-segsize`)
+pub fn configure_from_env() -> anyhow::Result<()> {
+    let Some(v) = std::env::var_os("WALG_PG_WAL_SIZE") else {
+        return Ok(());
+    };
+    let mb: u64 = v
+        .to_string_lossy()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("WALG_PG_WAL_SIZE must be an integer count of MiB"))?;
+    set_wal_segment_size(seg_size_from_mb(mb)?);
+    Ok(())
+}
+
+/// Validate a segment size given in MiB and convert to bytes. PG requires a
+/// power of two in 1..=1024 MiB
+fn seg_size_from_mb(mb: u64) -> anyhow::Result<u64> {
+    if mb == 0 || mb > 1024 || !mb.is_power_of_two() {
+        anyhow::bail!("WALG_PG_WAL_SIZE={mb} must be a power of two between 1 and 1024 (MiB)");
+    }
+    Ok(mb * 1024 * 1024)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentName {
@@ -152,5 +196,20 @@ mod tests {
         let s = SegmentName::parse("0000000100000007000000FF").unwrap();
         let n = s.next(DEFAULT_WAL_SEG_SIZE);
         assert_eq!(n.format(), "000000010000000800000000");
+    }
+
+    #[test]
+    fn seg_size_from_mb_accepts_powers_of_two() {
+        assert_eq!(seg_size_from_mb(16).unwrap(), 16 * 1024 * 1024);
+        assert_eq!(seg_size_from_mb(1).unwrap(), 1024 * 1024);
+        assert_eq!(seg_size_from_mb(64).unwrap(), 64 * 1024 * 1024);
+        assert_eq!(seg_size_from_mb(1024).unwrap(), 1024 * 1024 * 1024);
+        // non-power-of-two, zero, and over the 1 GiB cap are rejected
+        for bad in [0, 3, 24, 1000, 2048] {
+            assert!(
+                seg_size_from_mb(bad).is_err(),
+                "{bad} MiB should be rejected"
+            );
+        }
     }
 }

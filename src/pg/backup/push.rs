@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
-use postgres_protocol::message::backend::Message;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::mpsc;
 
@@ -38,7 +37,7 @@ use crate::pg::replication::PgConfig;
 use crate::pg::replication::base_backup::{
     BackupEvent, BaseBackupOpts, ChannelReader, Tablespace, run_base_backup,
 };
-use crate::pg::replication::conn::{ReplicationConn, error_message};
+use crate::pg::replication::conn::ReplicationConn;
 use crate::storage::DynStorage;
 
 /// Entry name (post-remap) that should be teed into a standalone tar so
@@ -198,7 +197,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
             BackupEvent::Start(info) => {
                 start_lsn = Some(info.start_lsn);
                 tablespace_list = info.tablespaces.clone();
-                let seg_size = crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+                let seg_size = crate::pg::wal::segment::wal_segment_size();
                 let base_name = format_backup_name(info.timeline, info.start_lsn, seg_size);
                 debug_assert!(base_name.starts_with(BACKUP_NAME_PREFIX));
                 // Delta backups get a `_D_<parent-without-base_>` suffix
@@ -540,54 +539,21 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
 }
 
 async fn identify_system(conn: &mut ReplicationConn) -> Result<u64> {
-    conn.send_query("IDENTIFY_SYSTEM").await?;
-    let mut sysid: Option<u64> = None;
-    loop {
-        match conn.recv_message().await? {
-            Message::RowDescription(_) => {}
-            Message::DataRow(row) => {
-                let buf = row.buffer_bytes().clone();
-                if let Some(Some(range)) = first_data_row_col(&row) {
-                    let s = std::str::from_utf8(&buf[range])?;
-                    sysid = Some(s.parse().context("parse system_identifier")?);
-                }
-            }
-            Message::CommandComplete(_) => {}
-            Message::ReadyForQuery(_) => break,
-            Message::ErrorResponse(e) => bail!("IDENTIFY_SYSTEM: {}", error_message(&e)),
-            _ => continue,
-        }
-    }
-    sysid.ok_or_else(|| anyhow!("IDENTIFY_SYSTEM did not return system identifier"))
+    let rows = conn.query_rows("IDENTIFY_SYSTEM").await?;
+    rows.first()
+        .and_then(|cols| cols.first())
+        .and_then(|c| c.as_deref())
+        .ok_or_else(|| anyhow!("IDENTIFY_SYSTEM did not return system identifier"))?
+        .parse()
+        .context("parse system_identifier")
 }
 
 async fn fetch_setting(conn: &mut ReplicationConn, name: &str) -> Result<String> {
-    let q = format!("SHOW {name}");
-    conn.send_query(&q).await?;
-    let mut value: Option<String> = None;
-    loop {
-        match conn.recv_message().await? {
-            Message::RowDescription(_) => {}
-            Message::DataRow(row) => {
-                let buf = row.buffer_bytes().clone();
-                if let Some(Some(range)) = first_data_row_col(&row) {
-                    value = Some(String::from_utf8(buf[range].to_vec())?);
-                }
-            }
-            Message::CommandComplete(_) => {}
-            Message::ReadyForQuery(_) => break,
-            Message::ErrorResponse(e) => bail!("SHOW {name}: {}", error_message(&e)),
-            _ => continue,
-        }
-    }
-    value.ok_or_else(|| anyhow!("SHOW {name} returned no rows"))
-}
-
-fn first_data_row_col(
-    row: &postgres_protocol::message::backend::DataRowBody,
-) -> Option<Option<std::ops::Range<usize>>> {
-    use fallible_iterator::FallibleIterator as _;
-    row.ranges().next().ok().flatten()
+    let rows = conn.query_rows(&format!("SHOW {name}")).await?;
+    rows.into_iter()
+        .next()
+        .and_then(|cols| cols.into_iter().next().flatten())
+        .ok_or_else(|| anyhow!("SHOW {name} returned no rows"))
 }
 
 async fn upload_json<T: serde::Serialize>(

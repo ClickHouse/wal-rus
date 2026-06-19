@@ -153,16 +153,17 @@ async fn collect_wal_keys(
     with_history: bool,
     out: &mut Vec<String>,
 ) -> Result<()> {
-    use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+    use crate::pg::wal::segment::wal_segment_size;
     use crate::pg::wal::segment_file::classify_segment_name;
+    let seg_size = wal_segment_size();
     let wal_prefix = format!("{}/", crate::pg::WAL_FOLDER);
     let mut s = src
         .list(&wal_prefix)
         .await
         .with_context(|| format!("list {wal_prefix}"))?;
-    let segs_per_log = 0x1_0000_0000u64 / DEFAULT_WAL_SEG_SIZE;
+    let segs_per_log = 0x1_0000_0000u64 / seg_size;
     let start = backup.start_seg_no;
-    let finish = backup.finish_lsn / DEFAULT_WAL_SEG_SIZE;
+    let finish = backup.finish_lsn / seg_size;
     while let Some(item) = s.next().await {
         let obj = item.context("list iteration")?;
         let bare = obj.key.rsplit('/').next().unwrap_or(&obj.key);

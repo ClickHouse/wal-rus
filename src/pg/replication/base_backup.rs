@@ -312,7 +312,7 @@ async fn read_tablespaces(conn: &mut ReplicationConn) -> Result<Vec<Tablespace>>
 }
 
 fn data_row_cols(row: &DataRowBody) -> Result<Vec<Option<Bytes>>> {
-    let buf = row.buffer_bytes().clone();
+    let buf = row.buffer_bytes();
     let mut ranges = row.ranges();
     let mut out: Vec<Option<Bytes>> = Vec::new();
     while let Some(range) = ranges.next()? {

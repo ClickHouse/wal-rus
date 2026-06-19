@@ -13,6 +13,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
   # Pinned wal-g release; bump deliberately so a wal-g change can't silently
   # break the cross-tool gate. Release artifacts live at
   # https://github.com/wal-g/wal-g/releases

@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::pg::backup::fetch::fetch_sentinel;
 use crate::pg::backup::{LATEST, name_from_sentinel_key, strip_leftmost_backup_name};
-use crate::pg::wal::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
+use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::storage::DynStorage;
 
 /// `TryFetchTimelineAndLogSegNo`: find the first 24-hex chunk in `name`,
@@ -36,7 +36,7 @@ pub fn try_extract_timeline_seg_no(name: &str) -> Option<(u32, u64)> {
             if left_ok && right_ok {
                 let s = std::str::from_utf8(&bytes[i..i + 24]).ok()?;
                 let seg = SegmentName::parse(s).ok()?;
-                let segs_per_log = 0x1_0000_0000u64 / DEFAULT_WAL_SEG_SIZE;
+                let segs_per_log = 0x1_0000_0000u64 / wal_segment_size();
                 let global = (seg.log_id as u64) * segs_per_log + seg.seg_no as u64;
                 return Some((seg.timeline, global));
             }
@@ -592,7 +592,8 @@ fn permanent_backup_names(backups: &[BackupRecord]) -> HashSet<String> {
 /// match `pg_walfile_name_offset` (segment containing the LSN). Returned
 /// `(timeline, segment_global_no)` pairs the caller can probe per-object
 fn permanent_wal_set(backups: &[BackupRecord]) -> HashSet<(u32, u64)> {
-    let segs_per_log = 0x1_0000_0000u64 / DEFAULT_WAL_SEG_SIZE;
+    let seg_size = wal_segment_size();
+    let segs_per_log = 0x1_0000_0000u64 / seg_size;
     let mut out = HashSet::new();
     for b in backups.iter().filter(|b| b.is_permanent) {
         // Bail to start_seg_no if backup_start_lsn is missing; ignore segments-1 underflow
@@ -601,8 +602,8 @@ fn permanent_wal_set(backups: &[BackupRecord]) -> HashSet<(u32, u64)> {
         if finish_lsn < start_lsn {
             continue;
         }
-        let mut seg = start_lsn / DEFAULT_WAL_SEG_SIZE;
-        let last = finish_lsn / DEFAULT_WAL_SEG_SIZE;
+        let mut seg = start_lsn / seg_size;
+        let last = finish_lsn / seg_size;
         while seg <= last {
             let log_id = seg / segs_per_log;
             let seg_lo = seg % segs_per_log;
@@ -748,6 +749,7 @@ pub fn parse_garbage_scope(args: &[String]) -> Result<GarbageScope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
     fn make_record(name: &str, tli: u32, seg: u64, is_full: bool, perm: bool) -> BackupRecord {
         BackupRecord {

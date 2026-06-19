@@ -22,7 +22,7 @@ use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::storage::DynStorage;
 
-use super::segment::{DEFAULT_WAL_SEG_SIZE, SegmentName};
+use super::segment::{SegmentName, wal_segment_size};
 
 /// `<pg_wal>/.wal-g/prefetch/`
 pub const PREFETCH_SUBDIR: &str = ".wal-g/prefetch";
@@ -72,7 +72,8 @@ pub async fn handle(
     // wal-g CleanupPrefetchDirectories: drop already-replayed segments (< seed)
     cleanup_stale(&pre, &run, seed_seg).await;
 
-    let mut next = seed_seg.next(DEFAULT_WAL_SEG_SIZE);
+    let seg_size = wal_segment_size();
+    let mut next = seed_seg.next(seg_size);
     // missing/transient errors don't fail the batch
     let mut tasks = BoundedTasks::new(
         settings.download_concurrency,
@@ -88,7 +89,7 @@ pub async fn handle(
 
     for _ in 0..count {
         let name = next.format();
-        next = next.next(DEFAULT_WAL_SEG_SIZE);
+        next = next.next(seg_size);
 
         let ready = pre.join(&name);
         let running = run.join(&name);

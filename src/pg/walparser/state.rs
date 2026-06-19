@@ -126,7 +126,7 @@ impl WalParser {
 
         if !self.has_current_record_beginning {
             // Tail without beginning: emit for caller to discard
-            self.set_current_record_data(page.next_record_heading_data.clone());
+            self.set_current_record_data(page.next_record_heading_data);
             return Ok((current_record_data, page.records));
         }
 
