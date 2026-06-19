@@ -558,4 +558,198 @@ mod tests {
                 .starts_with("http://127.0.0.1:4443/")
         );
     }
+
+    /// Emulator-mode GcsStorage (sa = None) built directly against an
+    /// in-process mock of the GCS JSON API; drives put/get/exists/list/
+    /// delete/rewrite without env or credentials.
+    fn emulator(host: String) -> GcsStorage {
+        GcsStorage {
+            cfg: GcsConfig {
+                bucket: "b".into(),
+                prefix: "p".into(),
+                credentials_path: None,
+            },
+            client: Client::builder().build().unwrap(),
+            host,
+            sa: None,
+            token: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn gcs_emulator_roundtrip() {
+        use crate::storage::test_http::{
+            Req, Resp, drain_keys, pct_decode, read_all, reader, serve,
+        };
+        use std::collections::BTreeMap;
+
+        let objects = Arc::new(std::sync::Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
+        let o = objects.clone();
+        let base = serve(move |req: &Req| {
+            let p = req.path.as_str();
+            match req.method.as_str() {
+                "POST" if p.starts_with("/upload/storage/v1/") => {
+                    let name = pct_decode(req.query("name").unwrap_or(""));
+                    o.lock().unwrap().insert(name, req.body.clone());
+                    Resp::new(200).body(b"{}".to_vec())
+                }
+                "POST" if p.contains("/rewriteTo/") => {
+                    let (left, right) = p.split_once("/rewriteTo/").unwrap();
+                    let src_key = pct_decode(left.rsplit("/o/").next().unwrap_or(""));
+                    let dst_key = pct_decode(right.rsplit("/o/").next().unwrap_or(""));
+                    let mut objs = o.lock().unwrap();
+                    if !objs.contains_key(&src_key) {
+                        return Resp::new(404).body(b"{\"error\":{\"code\":404}}".to_vec());
+                    }
+                    // exercise the multi-step rewrite loop for "multi" targets
+                    if dst_key.contains("multi") && !req.has_query("rewriteToken") {
+                        return Resp::new(200)
+                            .body(b"{\"done\":false,\"rewriteToken\":\"tok1\"}".to_vec());
+                    }
+                    let bytes = objs.get(&src_key).cloned().unwrap();
+                    objs.insert(dst_key, bytes);
+                    Resp::new(200).body(b"{\"done\":true}".to_vec())
+                }
+                "GET" if p.ends_with("/o") => {
+                    let prefix = pct_decode(req.query("prefix").unwrap_or(""));
+                    let start: usize =
+                        req.query("pageToken").and_then(|t| t.parse().ok()).unwrap_or(0);
+                    let objs = o.lock().unwrap();
+                    let matching: Vec<(String, usize)> = objs
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix))
+                        .map(|(k, v)| (k.clone(), v.len()))
+                        .collect();
+                    const PAGE: usize = 2;
+                    let end = (start + PAGE).min(matching.len());
+                    let mut json = String::from("{\"items\":[");
+                    for (i, (k, len)) in matching[start..end].iter().enumerate() {
+                        if i > 0 {
+                            json.push(',');
+                        }
+                        json.push_str(&format!(
+                            "{{\"name\":\"{k}\",\"size\":\"{len}\",\"updated\":\"2026-01-01T00:00:00Z\"}}"
+                        ));
+                    }
+                    json.push(']');
+                    if end < matching.len() {
+                        json.push_str(&format!(",\"nextPageToken\":\"{end}\""));
+                    }
+                    json.push('}');
+                    Resp::new(200).body(json.into_bytes())
+                }
+                "GET" => {
+                    let key = pct_decode(p.rsplit("/o/").next().unwrap_or(""));
+                    match o.lock().unwrap().get(&key) {
+                        Some(b) => Resp::new(200).body(b.clone()),
+                        None => Resp::new(404).body(b"{\"error\":{\"code\":404}}".to_vec()),
+                    }
+                }
+                "DELETE" => {
+                    let key = pct_decode(p.rsplit("/o/").next().unwrap_or(""));
+                    if o.lock().unwrap().remove(&key).is_some() {
+                        Resp::new(204)
+                    } else {
+                        Resp::new(404)
+                    }
+                }
+                _ => Resp::new(400),
+            }
+        })
+        .await;
+
+        let s = emulator(base);
+        s.put("a.zst", reader(b"hello"), None).await.unwrap();
+        assert_eq!(read_all(s.get("a.zst").await.unwrap()).await, b"hello");
+        assert!(s.exists("a.zst").await.unwrap());
+        assert!(!s.exists("nope").await.unwrap());
+        assert!(matches!(
+            s.get("nope").await,
+            Err(StorageError::NotFound(_))
+        ));
+
+        s.put("b.zst", reader(b"world!!"), None).await.unwrap();
+        s.put("c.zst", reader(b"three"), None).await.unwrap();
+        let mut keys = drain_keys(&s, "").await;
+        keys.sort();
+        assert_eq!(keys, ["a.zst", "b.zst", "c.zst"]);
+
+        let src = s.copy_source("b.zst").unwrap();
+        s.copy_within(&src, "d.zst").await.unwrap();
+        assert_eq!(read_all(s.get("d.zst").await.unwrap()).await, b"world!!");
+
+        // multi-step rewrite (done=false + rewriteToken, then done=true)
+        let src2 = s.copy_source("c.zst").unwrap();
+        s.copy_within(&src2, "multi.zst").await.unwrap();
+        assert_eq!(read_all(s.get("multi.zst").await.unwrap()).await, b"three");
+
+        s.delete("a.zst").await.unwrap();
+        assert!(!s.exists("a.zst").await.unwrap());
+        // delete missing is a no-op success (404 treated as ok)
+        s.delete("ghost").await.unwrap();
+    }
+
+    /// Generate a throwaway 2048-bit RSA key via openssl; None when openssl
+    /// is unavailable so local runs without it skip rather than fail (the
+    /// coverage CI lane has openssl)
+    fn openssl_rsa_key() -> Option<String> {
+        let out = std::process::Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+            ])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).ok())
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn access_token_mints_jwt_and_caches() {
+        use crate::storage::test_http::{Resp, serve};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let Some(pem) = openssl_rsa_key() else {
+            eprintln!("skip access_token_mints_jwt_and_caches: openssl unavailable");
+            return;
+        };
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        let token_base = serve(move |_req| {
+            h.fetch_add(1, Ordering::SeqCst);
+            Resp::new(200).body(b"{\"access_token\":\"tok123\",\"expires_in\":3600}".to_vec())
+        })
+        .await;
+
+        let s = GcsStorage {
+            cfg: GcsConfig {
+                bucket: "b".into(),
+                prefix: "p".into(),
+                credentials_path: None,
+            },
+            client: Client::builder().build().unwrap(),
+            host: "http://127.0.0.1:1".into(), // unused: access_token only hits token_uri
+            sa: Some(ServiceAccount {
+                client_email: "svc@test.iam.gserviceaccount.com".into(),
+                private_key: pem,
+                token_uri: Some(format!("{token_base}/token")),
+            }),
+            token: Arc::new(Mutex::new(None)),
+        };
+
+        assert_eq!(s.access_token().await.unwrap(), "tok123");
+        // second call rides the in-memory cache, no fresh mint
+        assert_eq!(s.access_token().await.unwrap(), "tok123");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second token request must hit the cache"
+        );
+    }
 }

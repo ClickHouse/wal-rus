@@ -15,6 +15,8 @@ pub mod fs;
 pub mod gcs;
 pub mod retrying;
 pub mod s3;
+#[cfg(test)]
+pub(crate) mod test_http;
 
 pub type AsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 pub type ObjectStream =

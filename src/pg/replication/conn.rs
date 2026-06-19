@@ -524,12 +524,96 @@ fn parse_server_version(s: &str) -> Option<i32> {
 mod tests {
     use super::*;
 
+    use bytes::BufMut;
+
+    /// Frame `tag` + length + `payload` and run it through the backend parser
+    fn framed(tag: u8, payload: &[u8]) -> Message {
+        let mut buf = BytesMut::new();
+        buf.put_u8(tag);
+        buf.put_i32((payload.len() + 4) as i32);
+        buf.extend_from_slice(payload);
+        Message::parse(&mut buf).unwrap().unwrap()
+    }
+
+    /// Build an ErrorResponse/NoticeResponse field block: each (type, value)
+    /// then the trailing NUL terminator
+    fn error_fields(fields: &[(u8, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (t, v) in fields {
+            out.push(*t);
+            out.extend_from_slice(v.as_bytes());
+            out.push(0);
+        }
+        out.push(0);
+        out
+    }
+
+    fn error_body(fields: &[(u8, &str)]) -> postgres_protocol::message::backend::ErrorResponseBody {
+        match framed(b'E', &error_fields(fields)) {
+            Message::ErrorResponse(b) => b,
+            other => panic!("expected ErrorResponse, got {}", message_kind(&other)),
+        }
+    }
+
     #[test]
     fn parses_server_version() {
         assert_eq!(parse_server_version("16.3"), Some(160003));
         assert_eq!(parse_server_version("18"), Some(180000));
         assert_eq!(parse_server_version("17beta1"), Some(170000));
         assert_eq!(parse_server_version("9.6.24"), Some(90624));
+    }
+
+    #[test]
+    fn message_kind_labels_each_tag() {
+        assert_eq!(
+            message_kind(&framed(b'R', &[0, 0, 0, 0])),
+            "AuthenticationOk"
+        );
+        assert_eq!(
+            message_kind(&framed(b'K', &[0, 0, 0, 1, 0, 0, 0, 2])),
+            "BackendKeyData"
+        );
+        assert_eq!(
+            message_kind(&framed(b'C', b"SELECT 1\0")),
+            "CommandComplete"
+        );
+        assert_eq!(message_kind(&framed(b'c', &[])), "CopyDone");
+        assert_eq!(message_kind(&framed(b'Z', b"I")), "ReadyForQuery");
+        assert_eq!(
+            message_kind(&framed(b'N', &error_fields(&[(b'M', "n")]))),
+            "NoticeResponse"
+        );
+        assert_eq!(message_kind(&framed(b'D', &[0, 0])), "DataRow");
+        assert_eq!(message_kind(&framed(b'T', &[0, 0])), "RowDescription");
+        assert_eq!(
+            message_kind(&framed(b'S', b"server_version\x0016.3\0")),
+            "ParameterStatus"
+        );
+        assert_eq!(
+            message_kind(&Message::ErrorResponse(error_body(&[(b'C', "X")]))),
+            "ErrorResponse"
+        );
+    }
+
+    #[test]
+    fn error_message_and_code_extract_fields() {
+        let body = error_body(&[
+            (b'S', "ERROR"),
+            (b'C', "42710"),
+            (b'M', "duplicate object"),
+            (b'D', "ignored detail"),
+        ]);
+        assert_eq!(error_message(&body), "ERROR 42710: duplicate object");
+        assert_eq!(error_code(&body), "42710");
+
+        // 'V' (localized severity) also populates the severity slot
+        let v_only = error_body(&[(b'V', "FATAL"), (b'M', "boom")]);
+        assert_eq!(error_message(&v_only), "FATAL : boom");
+
+        // missing fields -> empty pieces, no panic; absent code is ""
+        let bare = error_body(&[(b'M', "lonely")]);
+        assert_eq!(error_message(&bare), " : lonely");
+        assert_eq!(error_code(&bare), "");
     }
 
     #[tokio::test]

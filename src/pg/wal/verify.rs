@@ -180,3 +180,124 @@ fn print_timeline(r: &TimelineReport) {
         println!("  latest_backup: {b}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pg::backup::test_fixtures::{fs_store, lsn_for_seg, put_sentinel, put_wal_segment};
+    use crate::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2};
+
+    fn sentinel(seg_no: u64) -> BackupSentinelDtoV2 {
+        BackupSentinelDtoV2 {
+            sentinel: BackupSentinelDto {
+                backup_start_lsn: Some(lsn_for_seg(seg_no)),
+                backup_finish_lsn: Some(lsn_for_seg(seg_no)),
+                pg_version: 160003,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn integrity_ok_when_contiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_sentinel(&s, "base_000000010000000000000002", &sentinel(2)).await;
+        put_wal_segment(&s, "000000010000000000000002").await;
+        put_wal_segment(&s, "000000010000000000000003").await;
+
+        let r = check_integrity(s).await.unwrap();
+        assert_eq!(r.status, ReportStatus::Ok);
+        assert_eq!(r.timeline, 1);
+        assert_eq!(r.start_lsn, Some(lsn_for_seg(2)));
+        assert!(r.gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn integrity_failure_on_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_sentinel(&s, "base_000000010000000000000002", &sentinel(2)).await;
+        put_wal_segment(&s, "000000010000000000000002").await;
+        // gap: seg 3 missing, head is seg 4
+        put_wal_segment(&s, "000000010000000000000004").await;
+
+        let r = check_integrity(s.clone()).await.unwrap();
+        assert_eq!(r.status, ReportStatus::Failure);
+        assert!(!r.gaps.is_empty());
+
+        // run() surfaces FAILURE as a non-zero (Err) exit
+        let err = run(s, WalVerifyOp::Integrity { json: false })
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("FAILURE"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn integrity_empty_without_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_wal_segment(&s, "000000010000000000000002").await;
+        let r = check_integrity(s).await.unwrap();
+        assert_eq!(r.status, ReportStatus::Empty);
+        assert!(r.backup_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn integrity_failure_without_start_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        // sentinel lacking LSN -> can't bound the WAL range -> FAILURE
+        let mut sent = sentinel(2);
+        sent.sentinel.backup_start_lsn = None;
+        put_sentinel(&s, "base_000000010000000000000002", &sent).await;
+        let r = check_integrity(s).await.unwrap();
+        assert_eq!(r.status, ReportStatus::Failure);
+        assert!(r.start_lsn.is_none());
+    }
+
+    #[tokio::test]
+    async fn timeline_ok_failure_empty() {
+        // empty store -> Empty
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        assert_eq!(check_timeline(s).await.unwrap().status, ReportStatus::Empty);
+
+        // matching timelines -> Ok
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_sentinel(&s, "base_000000010000000000000002", &sentinel(2)).await;
+        put_wal_segment(&s, "000000010000000000000002").await;
+        let t = check_timeline(s).await.unwrap();
+        assert_eq!(t.status, ReportStatus::Ok);
+        assert_eq!(t.current_timeline, Some(1));
+        assert_eq!(t.latest_backup_timeline, Some(1));
+
+        // backup on tli 1 but archived segment on tli 2 -> Failure
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_sentinel(&s, "base_000000010000000000000002", &sentinel(2)).await;
+        put_wal_segment(&s, "000000020000000000000009").await;
+        assert_eq!(
+            check_timeline(s).await.unwrap().status,
+            ReportStatus::Failure
+        );
+    }
+
+    #[tokio::test]
+    async fn run_all_ok_plain_and_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_sentinel(&s, "base_000000010000000000000002", &sentinel(2)).await;
+        put_wal_segment(&s, "000000010000000000000002").await;
+        put_wal_segment(&s, "000000010000000000000003").await;
+        // plain branch (print_integrity + print_timeline)
+        run(s.clone(), WalVerifyOp::All { json: false })
+            .await
+            .unwrap();
+        // json branch
+        run(s, WalVerifyOp::All { json: true }).await.unwrap();
+    }
+}

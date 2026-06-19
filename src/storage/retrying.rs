@@ -240,6 +240,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegators_pass_through_to_inner() {
+        use futures::StreamExt;
+
+        let retry = RetryingStorage::new(StubStorage::new(), fast_policy());
+        assert_eq!(retry.describe(), "stub://");
+        assert!(retry.exists("k").await.unwrap());
+        let mut st = retry.list("").await.unwrap();
+        assert!(st.next().await.is_none());
+        retry.delete("k").await.unwrap();
+        // stub has no server-side copy support: default impls flow through
+        assert!(retry.copy_source("k").is_none());
+        let src = CopySource {
+            backend: "x".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        assert!(matches!(
+            retry.copy_within(&src, "d").await,
+            Err(StorageError::Unimplemented(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn put_bypasses_retry_when_size_unknown() {
         let stub = StubStorage::new();
         stub.put_script

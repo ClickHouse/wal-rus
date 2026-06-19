@@ -441,6 +441,56 @@ impl Default for BackupSentinelDtoV2 {
     }
 }
 
+/// Shared fixture builders for the `file://`-backed backup/wal command tests
+/// (list, show, wal-verify). Seeds a temp FsStorage with sentinels, files-
+/// metadata sidecars and WAL segments in the wal-g object layout
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use super::*;
+    use crate::storage::{AsyncReader, DynStorage, fs::FsStorage};
+    use std::sync::Arc;
+
+    pub(crate) fn fs_store(dir: &std::path::Path) -> DynStorage {
+        Arc::new(FsStorage::new(dir).unwrap())
+    }
+
+    fn reader(bytes: Vec<u8>) -> AsyncReader {
+        Box::pin(std::io::Cursor::new(bytes))
+    }
+
+    pub(crate) async fn put_bytes(s: &DynStorage, key: &str, bytes: Vec<u8>) {
+        let len = bytes.len() as u64;
+        s.put(key, reader(bytes), Some(len)).await.unwrap();
+    }
+
+    pub(crate) async fn put_sentinel(s: &DynStorage, name: &str, sentinel: &BackupSentinelDtoV2) {
+        put_bytes(
+            s,
+            &sentinel_key(name),
+            serde_json::to_vec(sentinel).unwrap(),
+        )
+        .await;
+    }
+
+    pub(crate) async fn put_files_metadata(s: &DynStorage, name: &str, fm: &FilesMetadataDto) {
+        put_bytes(
+            s,
+            &files_metadata_key(name),
+            serde_json::to_vec(fm).unwrap(),
+        )
+        .await;
+    }
+
+    pub(crate) async fn put_wal_segment(s: &DynStorage, seg: &str) {
+        put_bytes(s, &format!("{}/{seg}", crate::pg::WAL_FOLDER), Vec::new()).await;
+    }
+
+    /// 16 MiB-aligned start LSN for segment `seg_no` on log 0
+    pub(crate) fn lsn_for_seg(seg_no: u64) -> u64 {
+        seg_no * 16 * 1024 * 1024
+    }
+}
+
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }

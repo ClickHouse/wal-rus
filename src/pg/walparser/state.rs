@@ -645,4 +645,160 @@ mod tests {
         process_locations_from_page(&mut parser2, &page, |loc| locs2.push(loc)).unwrap();
         assert_eq!(locs2, locs);
     }
+
+    use super::super::types::{
+        XLP_FIRST_IS_CONT_RECORD, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG14, XLR_BLOCK_ID_DATA_LONG,
+    };
+
+    const PAGE: usize = WAL_PAGE_SIZE as usize;
+
+    /// 36-byte long page header + 16-byte trailer; `remaining` carries a
+    /// prev-record tail (0 = none)
+    fn long_page_header(remaining: u32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&XLP_PAGE_MAGIC_PG14.to_le_bytes());
+        h.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        h.extend_from_slice(&1u32.to_le_bytes()); // timeline
+        h.extend_from_slice(&0u64.to_le_bytes()); // page_address
+        h.extend_from_slice(&remaining.to_le_bytes());
+        h.extend_from_slice(&12345u64.to_le_bytes()); // sysid
+        h.extend_from_slice(&(16u32 * 1024 * 1024).to_le_bytes()); // seg size
+        h.extend_from_slice(&8192u32.to_le_bytes()); // xlog block size
+        h
+    }
+
+    /// 20-byte short page header (mid-segment pages)
+    fn short_page_header(info: u16, remaining: u32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&XLP_PAGE_MAGIC_PG14.to_le_bytes());
+        h.extend_from_slice(&info.to_le_bytes());
+        h.extend_from_slice(&1u32.to_le_bytes()); // timeline
+        h.extend_from_slice(&(PAGE as u64).to_le_bytes()); // page_address
+        h.extend_from_slice(&remaining.to_le_bytes());
+        h
+    }
+
+    /// Minimal complete record: 24-byte header, no body (rmid Heap)
+    fn minimal_record() -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend_from_slice(&(X_LOG_RECORD_HEADER_SIZE as u32).to_le_bytes());
+        r.extend_from_slice(&0u32.to_le_bytes()); // xact
+        r.extend_from_slice(&0u64.to_le_bytes()); // prev
+        r.push(0u8); // info
+        r.push(RmId::Heap as u8);
+        r.push(0);
+        r.push(0);
+        r.extend_from_slice(&0u32.to_le_bytes()); // crc
+        r
+    }
+    use super::super::types::X_LOG_RECORD_HEADER_SIZE;
+
+    #[test]
+    fn record_continuation_across_page_boundary() {
+        // 9029-byte record (24 header + 5-byte LONG-data marker + 9000 main
+        // data). Long header(36)+align(4)=40 used on page 1, leaving 8152 for
+        // the record; the trailing 877 bytes land on page 2
+        let main = vec![0x5Au8; 9000];
+        let mut record = Vec::new();
+        record.extend_from_slice(&9029u32.to_le_bytes()); // total_record_length
+        record.extend_from_slice(&0u32.to_le_bytes()); // xact
+        record.extend_from_slice(&0u64.to_le_bytes()); // prev
+        record.push(0u8); // info
+        record.push(RmId::Heap as u8);
+        record.push(0);
+        record.push(0);
+        record.extend_from_slice(&0u32.to_le_bytes()); // crc
+        record.push(XLR_BLOCK_ID_DATA_LONG);
+        record.extend_from_slice(&9000u32.to_le_bytes());
+        record.extend_from_slice(&main);
+        assert_eq!(record.len(), 9029);
+
+        let split = 8152; // record bytes that fit on page 1 after header+align
+        let mut page1 = long_page_header(0);
+        page1.extend_from_slice(&[0u8; 4]); // 36 -> 40 alignment pad
+        page1.extend_from_slice(&record[..split]);
+        assert_eq!(page1.len(), PAGE);
+
+        let mut page2 = short_page_header(XLP_FIRST_IS_CONT_RECORD, (9029 - split) as u32);
+        page2.extend_from_slice(&[0u8; 4]); // 20 -> 24 alignment pad
+        page2.extend_from_slice(&record[split..]);
+        page2.resize(PAGE, 0);
+
+        let mut parser = WalParser::new();
+        let (tail1, recs1) = parser.parse_records_from_page(&page1).unwrap();
+        assert!(tail1.is_empty());
+        assert!(recs1.is_empty(), "record incomplete after first page");
+        assert!(parser.has_current_record_beginning());
+        assert_eq!(parser.page_magic(), XLP_PAGE_MAGIC_PG14);
+
+        let (tail2, recs2) = parser.parse_records_from_page(&page2).unwrap();
+        assert!(tail2.is_empty());
+        assert_eq!(recs2.len(), 1, "stitched record emitted on second page");
+        assert_eq!(recs2[0].main_data_len, 9000);
+        assert_eq!(recs2[0].main_data.len(), 9000);
+        assert!(!parser.has_current_record_beginning());
+    }
+
+    #[test]
+    fn multi_record_page_emits_all_records() {
+        let rec = minimal_record();
+        let mut page = long_page_header(0);
+        page.extend_from_slice(&[0u8; 4]);
+        page.extend_from_slice(&rec);
+        page.extend_from_slice(&rec); // 24-byte records stay 8-aligned
+        page.resize(PAGE, 0);
+
+        let mut parser = WalParser::new();
+        let (tail, recs) = parser.parse_records_from_page(&page).unwrap();
+        assert!(tail.is_empty());
+        assert_eq!(recs.len(), 2);
+    }
+
+    #[test]
+    fn zero_page_yields_nothing() {
+        let mut parser = WalParser::new();
+        let page = vec![0u8; PAGE];
+        let (tail, recs) = parser.parse_records_from_page(&page).unwrap();
+        assert!(tail.is_empty() && recs.is_empty());
+    }
+
+    #[test]
+    fn zero_page_header_with_nonzero_body_errors() {
+        // header bytes all zero (-> ZeroPageHeader) but page not all-zero, so
+        // it is a real corruption rather than end-of-data padding
+        let mut page = vec![0u8; PAGE];
+        page[2000] = 0xFF;
+        let mut parser = WalParser::new();
+        let err = parser.parse_records_from_page(&page).unwrap_err();
+        assert!(matches!(
+            err,
+            ParsePageError::Parse(ParseError::ZeroPageHeader)
+        ));
+    }
+
+    #[test]
+    fn invalidate_clears_buffered_head() {
+        let mut p = WalParser::from_current_record_head(vec![1, 2, 3]);
+        assert!(p.has_current_record_beginning());
+        p.invalidate();
+        assert!(p.current_record_data().is_empty());
+        assert!(!p.has_current_record_beginning());
+    }
+
+    #[test]
+    fn parse_to_extract_maps_each_variant() {
+        assert!(matches!(
+            parse_to_extract(ParsePageError::Parse(ParseError::PartialPage)),
+            ExtractError::Parse(ParseError::PartialPage)
+        ));
+        assert!(matches!(
+            parse_to_extract(ParsePageError::Io(io::Error::other("x"))),
+            ExtractError::Io(_)
+        ));
+        // CantSavePartialParser folds into a PartialPage parse error
+        assert!(matches!(
+            parse_to_extract(ParsePageError::CantSavePartialParser),
+            ExtractError::Parse(ParseError::PartialPage)
+        ));
+    }
 }

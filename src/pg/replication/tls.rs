@@ -351,6 +351,25 @@ impl ServerCertVerifier for SkipHostnameVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // build_client_config / load_client_auth / SslMode::from_env read process
+    // env (PGSSLMODE / PGSSLROOTCERT / PGSSLCERT / PGSSLKEY); serialize every
+    // test that reads or mutates them so they can't observe each other's writes
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_env(k: &str, v: Option<&str>) {
+        unsafe {
+            match v {
+                Some(x) => std::env::set_var(k, x),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
 
     #[test]
     fn parses_sslmodes() {
@@ -382,6 +401,10 @@ mod tests {
 
     #[test]
     fn client_config_builds_for_all_modes() {
+        let _e = lock_env();
+        for k in ["PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"] {
+            set_env(k, None);
+        }
         for m in [
             SslMode::Prefer,
             SslMode::Require,
@@ -396,6 +419,8 @@ mod tests {
     /// and only suppress the hostname mismatch.
     #[test]
     fn verify_ca_rejects_bogus_cert() {
+        let _e = lock_env();
+        set_env("PGSSLROOTCERT", None);
         // Run only after the aws-lc-rs provider is installed by build_client_config above
         let _ = build_client_config(SslMode::VerifyCa).unwrap();
 
@@ -543,5 +568,117 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
         let server_sock = server.await.unwrap();
         // No bytes pending: peek with try_read on a non-blocking socket
         let _ = server_sock;
+    }
+
+    #[tokio::test]
+    async fn maybe_upgrade_rejects_unexpected_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 8];
+            sock.read_exact(&mut req).await.unwrap();
+            sock.write_all(b"X").await.unwrap();
+            sock
+        });
+        let raw = TcpStream::connect(addr).await.unwrap();
+        let err = maybe_upgrade(raw, "127.0.0.1", SslMode::Prefer)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("unexpected SSLRequest reply"),
+            "{err}"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn pem_roots_loads_ca_and_rejects_empty() {
+        let ca = write_tmp("pemroots-ca", TEST_CRT);
+        let mut roots = RootCertStore::empty();
+        load_pem_roots(ca.to_str().unwrap(), &mut roots).unwrap();
+        assert!(!roots.is_empty());
+        std::fs::remove_file(ca).ok();
+
+        let empty = write_tmp("pemroots-empty", "no pem here\n");
+        let mut roots = RootCertStore::empty();
+        let err = load_pem_roots(empty.to_str().unwrap(), &mut roots)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("no certificates"), "{err}");
+        std::fs::remove_file(empty).ok();
+    }
+
+    #[test]
+    fn no_verifier_accepts_any_cert_and_offers_schemes() {
+        let v = NoVerifier;
+        let cert = CertificateDer::from(vec![0u8; 32]);
+        let name = ServerName::try_from("anything.example").unwrap();
+        assert!(
+            v.verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
+                .is_ok()
+        );
+        assert!(!v.supported_verify_schemes().is_empty());
+    }
+
+    #[test]
+    fn skip_hostname_verifier_delegates_schemes() {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let inner = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let v = SkipHostnameVerifier { inner };
+        // delegates to the inner webpki verifier rather than a hardcoded list
+        assert!(!v.supported_verify_schemes().is_empty());
+    }
+
+    #[test]
+    fn build_client_config_env_branches() {
+        let _e = lock_env();
+        // snapshot the four vars so the process env is left as found
+        let keys = ["PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in keys {
+            set_env(k, None);
+        }
+
+        // SslMode::from_env: unset -> Prefer, set -> parsed, garbage -> err
+        assert_eq!(SslMode::from_env().unwrap(), SslMode::Prefer);
+        set_env("PGSSLMODE", Some("verify-full"));
+        assert_eq!(SslMode::from_env().unwrap(), SslMode::VerifyFull);
+        set_env("PGSSLMODE", Some("nonsense"));
+        assert!(SslMode::from_env().is_err());
+        set_env("PGSSLMODE", None);
+
+        // PGSSLROOTCERT=<file> drives the load_pem_roots branch (not "system")
+        let ca = write_tmp("env-ca", TEST_CRT);
+        set_env("PGSSLROOTCERT", Some(ca.to_str().unwrap()));
+        build_client_config(SslMode::VerifyFull).unwrap();
+        build_client_config(SslMode::VerifyCa).unwrap();
+        set_env("PGSSLROOTCERT", None);
+
+        // PGSSLCERT + PGSSLKEY drive the with_client_auth_cert branch
+        let crt = write_tmp("env-crt", TEST_CRT);
+        let key = write_tmp("env-key", TEST_KEY);
+        set_env("PGSSLCERT", Some(crt.to_str().unwrap()));
+        set_env("PGSSLKEY", Some(key.to_str().unwrap()));
+        build_client_config(SslMode::Prefer).unwrap();
+
+        // half-configured client auth is a hard error (both required)
+        set_env("PGSSLKEY", None);
+        assert!(build_client_config(SslMode::Prefer).is_err());
+        set_env("PGSSLCERT", None);
+        set_env("PGSSLKEY", Some(key.to_str().unwrap()));
+        assert!(build_client_config(SslMode::Prefer).is_err());
+
+        for (k, v) in &saved {
+            set_env(k, v.as_deref());
+        }
+        std::fs::remove_file(ca).ok();
+        std::fs::remove_file(crt).ok();
+        std::fs::remove_file(key).ok();
     }
 }

@@ -622,6 +622,257 @@ mod tests {
     }
 
     #[test]
+    fn split_bucket_prefix_variants() {
+        assert_eq!(
+            split_bucket_prefix("bkt/some/prefix"),
+            ("bkt".into(), "some/prefix".into())
+        );
+        // trailing slash trimmed
+        assert_eq!(
+            split_bucket_prefix("bkt/some/prefix/"),
+            ("bkt".into(), "some/prefix".into())
+        );
+        // bucket only, no slash -> empty prefix
+        assert_eq!(split_bucket_prefix("bkt"), ("bkt".into(), String::new()));
+    }
+
+    #[test]
+    fn storage_from_uri_file_and_bare_path() {
+        let src = StorageSettings::Fs { path: "/x".into() };
+        match storage_from_uri("file:///tmp/dst", &src).unwrap() {
+            StorageSettings::Fs { path } => assert_eq!(path, "/tmp/dst"),
+            other => panic!("expected Fs, got {other:?}"),
+        }
+        // bare path with no scheme falls back to fs verbatim
+        match storage_from_uri("/var/backups", &src).unwrap() {
+            StorageSettings::Fs { path } => assert_eq!(path, "/var/backups"),
+            other => panic!("expected Fs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_from_uri_gs_inherits_then_falls_back_to_env() {
+        // gs src carries credentials_path -> inherited, env ignored
+        {
+            let _g = EnvGuard::new(&[("GOOGLE_APPLICATION_CREDENTIALS", Some("/env/sa.json"))]);
+            let src = StorageSettings::Gcs(gcs::GcsConfig {
+                bucket: "srcb".into(),
+                prefix: "srcp".into(),
+                credentials_path: Some("/src/sa.json".into()),
+            });
+            match storage_from_uri("gs://dstb/dst/pre", &src).unwrap() {
+                StorageSettings::Gcs(c) => {
+                    assert_eq!(c.bucket, "dstb");
+                    assert_eq!(c.prefix, "dst/pre");
+                    assert_eq!(c.credentials_path.as_deref(), Some("/src/sa.json"));
+                }
+                other => panic!("expected Gcs, got {other:?}"),
+            }
+        }
+        // non-gcs src -> credentials_path falls back to env
+        {
+            let _g = EnvGuard::new(&[("GOOGLE_APPLICATION_CREDENTIALS", Some("/env/sa.json"))]);
+            let src = StorageSettings::Fs { path: "/x".into() };
+            match storage_from_uri("gs://b", &src).unwrap() {
+                StorageSettings::Gcs(c) => {
+                    assert_eq!(c.bucket, "b");
+                    assert_eq!(c.prefix, "");
+                    assert_eq!(c.credentials_path.as_deref(), Some("/env/sa.json"));
+                }
+                other => panic!("expected Gcs, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn storage_from_uri_s3_inherits_credentials_from_s3_src() {
+        // S3 source -> every credential field copied, env not consulted
+        let _g = EnvGuard::new(&[
+            ("AWS_REGION", None),
+            ("AWS_ACCESS_KEY_ID", None),
+            ("AWS_SECRET_ACCESS_KEY", None),
+        ]);
+        let src = StorageSettings::S3(s3::S3Config {
+            bucket: "srcb".into(),
+            prefix: "srcp".into(),
+            region: "ap-south-1".into(),
+            access_key: "AKIASRC".into(),
+            secret_key: "secretsrc".into(),
+            session_token: Some("toksrc".into()),
+            endpoint: Some("http://ceph:7480".into()),
+            force_path_style: true,
+        });
+        match storage_from_uri("s3://dstb/dst", &src).unwrap() {
+            StorageSettings::S3(c) => {
+                assert_eq!(c.bucket, "dstb");
+                assert_eq!(c.prefix, "dst");
+                assert_eq!(c.region, "ap-south-1");
+                assert_eq!(c.access_key, "AKIASRC");
+                assert_eq!(c.secret_key, "secretsrc");
+                assert_eq!(c.session_token.as_deref(), Some("toksrc"));
+                assert_eq!(c.endpoint.as_deref(), Some("http://ceph:7480"));
+                assert!(c.force_path_style);
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_storage_arms() {
+        // file prefix wins
+        {
+            let _g = EnvGuard::new(&[
+                ("WALG_FILE_PREFIX", Some("/srv/wal")),
+                ("WALG_S3_PREFIX", None),
+                ("WALG_GS_PREFIX", None),
+            ]);
+            match detect_storage().unwrap() {
+                StorageSettings::Fs { path } => assert_eq!(path, "/srv/wal"),
+                other => panic!("expected Fs, got {other:?}"),
+            }
+        }
+        // s3 prefix with credential env
+        {
+            let _g = EnvGuard::new(&[
+                ("WALG_FILE_PREFIX", None),
+                ("WALG_S3_PREFIX", Some("s3://mybkt/walg")),
+                ("WALG_GS_PREFIX", None),
+                ("AWS_REGION", Some("us-west-1")),
+                ("WALG_S3_REGION", None),
+                ("AWS_ACCESS_KEY_ID", Some("AKID")),
+                ("AWS_ACCESS_KEY", None),
+                ("AWS_SECRET_ACCESS_KEY", Some("SEKRIT")),
+                ("AWS_SECRET_KEY", None),
+                ("AWS_SESSION_TOKEN", None),
+                ("AWS_ENDPOINT_URL", None),
+                ("WALG_S3_ENDPOINT", None),
+                ("WALG_S3_FORCE_PATH_STYLE", None),
+            ]);
+            match detect_storage().unwrap() {
+                StorageSettings::S3(c) => {
+                    assert_eq!(c.bucket, "mybkt");
+                    assert_eq!(c.prefix, "walg");
+                    assert_eq!(c.region, "us-west-1");
+                    assert_eq!(c.access_key, "AKID");
+                    assert_eq!(c.secret_key, "SEKRIT");
+                    // no endpoint -> path style defaults off
+                    assert!(!c.force_path_style);
+                }
+                other => panic!("expected S3, got {other:?}"),
+            }
+        }
+        // s3 prefix but missing credentials -> error
+        {
+            let _g = EnvGuard::new(&[
+                ("WALG_FILE_PREFIX", None),
+                ("WALG_S3_PREFIX", Some("s3://mybkt")),
+                ("WALG_GS_PREFIX", None),
+                ("AWS_ACCESS_KEY_ID", None),
+                ("AWS_ACCESS_KEY", None),
+                ("AWS_SECRET_ACCESS_KEY", None),
+                ("AWS_SECRET_KEY", None),
+            ]);
+            assert!(detect_storage().is_err());
+        }
+        // gs prefix, credentials path from env (path not opened here)
+        {
+            let _g = EnvGuard::new(&[
+                ("WALG_FILE_PREFIX", None),
+                ("WALG_S3_PREFIX", None),
+                ("WALG_GS_PREFIX", Some("gs://gbkt/walg/")),
+                ("GOOGLE_APPLICATION_CREDENTIALS", Some("/creds/sa.json")),
+            ]);
+            match detect_storage().unwrap() {
+                StorageSettings::Gcs(c) => {
+                    assert_eq!(c.bucket, "gbkt");
+                    assert_eq!(c.prefix, "walg");
+                    assert_eq!(c.credentials_path.as_deref(), Some("/creds/sa.json"));
+                }
+                other => panic!("expected Gcs, got {other:?}"),
+            }
+        }
+        // nothing configured -> error
+        {
+            let _g = EnvGuard::new(&[
+                ("WALG_FILE_PREFIX", None),
+                ("WALG_S3_PREFIX", None),
+                ("WALG_GS_PREFIX", None),
+            ]);
+            assert!(detect_storage().is_err());
+        }
+    }
+
+    #[test]
+    fn build_storage_for_each_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        // fs: no retry wrapper
+        let fs = Settings::build_storage_for(
+            &StorageSettings::Fs {
+                path: dir.path().to_string_lossy().into(),
+            },
+            RetryPolicy::default(),
+        )
+        .unwrap();
+        assert!(fs.describe().starts_with("file://"));
+
+        // s3: client construction only, no IO
+        let s3 = Settings::build_storage_for(
+            &StorageSettings::S3(s3::S3Config {
+                bucket: "b".into(),
+                prefix: "p".into(),
+                region: "us-east-1".into(),
+                access_key: "AKID".into(),
+                secret_key: "sek".into(),
+                session_token: None,
+                endpoint: None,
+                force_path_style: false,
+            }),
+            RetryPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(s3.describe(), "s3://b/p");
+
+        // gcs: a credentials file lets new() succeed without env or network
+        // (avoids racing the gcs WALG_GS_ENDPOINT unit test)
+        let sa = dir.path().join("sa.json");
+        std::fs::write(&sa, r#"{"client_email":"x@y","private_key":"dummy"}"#).unwrap();
+        let gcs = Settings::build_storage_for(
+            &StorageSettings::Gcs(gcs::GcsConfig {
+                bucket: "gb".into(),
+                prefix: "gp".into(),
+                credentials_path: Some(sa.to_string_lossy().into()),
+            }),
+            RetryPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(gcs.describe(), "gs://gb/gp");
+    }
+
+    #[test]
+    fn build_dst_storage_resolves_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            storage: StorageSettings::Fs {
+                path: dir.path().to_string_lossy().into(),
+            },
+            ..Settings::default()
+        };
+        let dst = settings
+            .build_dst_storage(&format!("file://{}", dir.path().display()))
+            .unwrap();
+        assert!(dst.describe().starts_with("file://"));
+
+        // build_storage (instance) rides the same path
+        assert!(
+            settings
+                .build_storage()
+                .unwrap()
+                .describe()
+                .starts_with("file://")
+        );
+    }
+
+    #[test]
     fn delta_settings_origin_and_steps() {
         let keys = [
             "WALG_DELTA_MAX_STEPS",
