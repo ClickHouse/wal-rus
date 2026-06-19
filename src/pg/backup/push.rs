@@ -664,3 +664,16 @@ fn build_delta_map_from_summaries(
     })?;
     Ok(map)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_map_from_summaries_requires_pgdata() {
+        // Summaries live on the PG host filesystem; without --pgdata the map
+        // can't be read, so the wrapper must bail before touching disk
+        let err = build_delta_map_from_summaries(None, 1, 0x100, 0x200).unwrap_err();
+        assert!(format!("{err:#}").contains("--pgdata"), "{err:#}");
+    }
+}

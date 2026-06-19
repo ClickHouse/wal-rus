@@ -188,3 +188,200 @@ async fn collect_wal_keys(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pg::backup::{
+        BackupSentinelDto, BackupSentinelDtoV2, format_backup_name, sentinel_key,
+    };
+    use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
+    use crate::storage::fs::FsStorage;
+    use crate::storage::{
+        AsyncReader, ObjectStream, Result as StorageResult, Storage, StorageError,
+    };
+    use std::sync::Arc;
+
+    fn fs(dir: &std::path::Path) -> DynStorage {
+        Arc::new(FsStorage::new(dir).unwrap())
+    }
+
+    async fn put_bytes(store: &DynStorage, key: &str, bytes: Vec<u8>) {
+        let len = bytes.len() as u64;
+        let r: AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+        store.put(key, r, Some(len)).await.unwrap();
+    }
+
+    async fn seed_backup(store: &DynStorage, name: &str, start_lsn: u64, finish_lsn: u64) {
+        let v2 = BackupSentinelDtoV2 {
+            sentinel: BackupSentinelDto {
+                backup_start_lsn: Some(start_lsn),
+                backup_finish_lsn: Some(finish_lsn),
+                pg_version: 160003,
+                ..Default::default()
+            },
+            hostname: "h".into(),
+            data_dir: "/d".into(),
+            ..Default::default()
+        };
+        put_bytes(store, &sentinel_key(name), serde_json::to_vec(&v2).unwrap()).await;
+    }
+
+    async fn list_keys(store: &DynStorage, prefix: &str) -> Vec<String> {
+        let mut s = store.list(prefix).await.unwrap();
+        let mut out = Vec::new();
+        while let Some(item) = s.next().await {
+            out.push(item.unwrap().key);
+        }
+        out.sort();
+        out
+    }
+
+    fn args(backup_name: Option<&str>, all: bool, with_history: bool) -> CopyArgs {
+        CopyArgs {
+            backup_name: backup_name.map(str::to_string),
+            all,
+            with_history,
+        }
+    }
+
+    #[tokio::test]
+    async fn all_and_backup_name_are_mutually_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = handle(
+            &Settings::default(),
+            fs(dir.path()),
+            fs(&dir.path().join("dst")),
+            args(Some("x"), true, false),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("mutually exclusive"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn empty_source_copies_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = fs(&dir.path().join("dst"));
+        handle(
+            &Settings::default(),
+            fs(dir.path()),
+            dst.clone(),
+            args(None, true, false),
+        )
+        .await
+        .unwrap();
+        assert!(list_keys(&dst, "").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_clones_every_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = fs(dir.path());
+        let seg = DEFAULT_WAL_SEG_SIZE;
+        let a = format_backup_name(1, seg, seg);
+        let b = format_backup_name(1, 3 * seg, seg);
+        seed_backup(&src, &a, seg, seg + 0x100).await;
+        seed_backup(&src, &b, 3 * seg, 3 * seg + 0x100).await;
+        let dst = fs(&dir.path().join("dst"));
+        handle(
+            &Settings::default(),
+            src,
+            dst.clone(),
+            args(None, true, false),
+        )
+        .await
+        .unwrap();
+        assert!(dst.exists(&sentinel_key(&a)).await.unwrap());
+        assert!(dst.exists(&sentinel_key(&b)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn specific_backup_windows_wal_and_passes_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = fs(dir.path());
+        let seg = DEFAULT_WAL_SEG_SIZE;
+        let name = format_backup_name(1, 2 * seg, seg); // start_seg_no = 2
+        seed_backup(&src, &name, 2 * seg, 3 * seg + 0x100).await; // finish global = 3
+        let seg_name = |g: u32| format!("{:08X}{:08X}{:08X}", 1u32, 0u32, g);
+        for g in 1u32..=4 {
+            put_bytes(
+                &src,
+                &format!("{}/{}", crate::pg::WAL_FOLDER, seg_name(g)),
+                vec![0u8; 16],
+            )
+            .await;
+        }
+        put_bytes(
+            &src,
+            &format!("{}/00000001.history", crate::pg::WAL_FOLDER),
+            b"1\t0/0\tno reason\n".to_vec(),
+        )
+        .await;
+
+        let dst = fs(&dir.path().join("dst"));
+        handle(
+            &Settings::default(),
+            src,
+            dst.clone(),
+            args(Some(&name), false, false),
+        )
+        .await
+        .unwrap();
+
+        let wal = list_keys(&dst, &format!("{}/", crate::pg::WAL_FOLDER)).await;
+        let has = |g: u32| wal.iter().any(|k| k.ends_with(&seg_name(g)));
+        assert!(has(2) && has(3), "in-window segments copied: {wal:?}");
+        assert!(
+            !has(1) && !has(4),
+            "out-of-window segments skipped: {wal:?}"
+        );
+        assert!(
+            wal.iter().any(|k| k.ends_with("00000001.history")),
+            "history passthrough: {wal:?}"
+        );
+    }
+
+    /// Destination whose `put` always fails — drives the best-effort sweep's
+    /// failure accumulation + `last_err` return
+    struct FailPut;
+    #[async_trait::async_trait]
+    impl Storage for FailPut {
+        fn describe(&self) -> String {
+            "failput".into()
+        }
+        async fn put(&self, key: &str, _b: AsyncReader, _h: Option<u64>) -> StorageResult<()> {
+            Err(StorageError::Transport(format!("put {key} denied")))
+        }
+        async fn get(&self, _k: &str) -> StorageResult<AsyncReader> {
+            Err(StorageError::Unimplemented("get"))
+        }
+        async fn exists(&self, _k: &str) -> StorageResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self, _p: &str) -> StorageResult<ObjectStream> {
+            Err(StorageError::Unimplemented("list"))
+        }
+        async fn delete(&self, _k: &str) -> StorageResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_failures_surface_last_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = fs(dir.path());
+        let seg = DEFAULT_WAL_SEG_SIZE;
+        let name = format_backup_name(1, seg, seg);
+        seed_backup(&src, &name, seg, seg + 0x100).await;
+        let err = handle(
+            &Settings::default(),
+            src,
+            Arc::new(FailPut),
+            args(Some(&name), false, false),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("denied"), "{err:#}");
+    }
+}

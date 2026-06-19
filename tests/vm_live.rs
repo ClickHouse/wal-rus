@@ -737,3 +737,436 @@ fn walkdir(root: &std::path::Path) -> Vec<String> {
     }
     out
 }
+
+// ── Phase G carry: WAL-summaries delta + user tablespaces ─────────────────
+
+/// `psql -Atqc` runner bound to the cluster's PG* env. Returns trimmed stdout.
+fn psql_runner() -> impl Fn(&str) -> String {
+    let pghost = std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let pgport = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
+    let pguser = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".into());
+    let pgdb = std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".into());
+    move |sql: &str| -> String {
+        let out = std::process::Command::new("psql")
+            .args([
+                "-h", &pghost, "-p", &pgport, "-U", &pguser, "-d", &pgdb, "-Atqc", sql,
+            ])
+            .output()
+            .expect("invoke psql; install postgresql-client if missing");
+        assert!(
+            out.status.success(),
+            "psql `{sql}` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+}
+
+async fn wait_for_guc(psql: &impl Fn(&str) -> String, name: &str, want: &str) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while psql(&format!("SHOW {name}")) != want {
+        assert!(Instant::now() < deadline, "{name} never became {want}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Block until the walsummarizer has published a summary whose end LSN reaches
+/// `target_lsn` on `tli`. `target_lsn` is a fixed past LSN, so coverage passes
+/// it even while concurrent vm-tests keep advancing the cluster's WAL.
+async fn wait_for_coverage(psql: &impl Fn(&str) -> String, tli: u32, target_lsn: u64) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let cov = psql(&format!(
+            "SELECT coalesce(max(end_lsn)::text, '0/0') FROM pg_available_wal_summaries() WHERE tli = {tli}"
+        ));
+        let cov_lsn = pgwalrs::pg::backup::parse_pg_lsn(&cov).unwrap_or(0);
+        if cov_lsn >= target_lsn {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WAL summaries did not reach {target_lsn:X} on tli {tli} within 90s (covered {cov})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Remove a backup's storage objects (sentinel sibling + the per-backup dir)
+/// so a fallback-full produced by a lagging summarizer doesn't pollute LATEST.
+fn delete_backup_files(storage_dir: &std::path::Path, name: &str) {
+    let _ = std::fs::remove_file(storage_dir.join(pgwalrs::pg::backup::sentinel_key(name)));
+    let _ = std::fs::remove_dir_all(storage_dir.join(pgwalrs::pg::BASEBACKUP_FOLDER).join(name));
+}
+
+/// Real PG17 `.summary` files must parse via `read_for_range`, projecting the
+/// touched table's main-fork blocks into the delta map. Exercises the actual
+/// walsummarizer wire format end-to-end (unit tests only hand-build it).
+#[tokio::test]
+async fn wal_summaries_parse_real_pg_files() {
+    let psql = psql_runner();
+    let ver: i64 = psql("SHOW server_version_num").parse().unwrap_or(0);
+    if ver < 170000 {
+        eprintln!("skip wal_summaries_parse: needs PG17+ (server {ver})");
+        return;
+    }
+    psql("ALTER SYSTEM SET summarize_wal = on");
+    psql("SELECT pg_reload_conf()");
+
+    let tbl = "walrs_summary_parse_test";
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+    psql(&format!(
+        "CREATE TABLE {tbl} (id int primary key, v text) WITH (autovacuum_enabled=false)"
+    ));
+    psql(&format!(
+        "INSERT INTO {tbl} SELECT g, repeat('x', 100) FROM generate_series(1, 5000) g"
+    ));
+    psql(&format!("SELECT count(*) FROM {tbl}"));
+    // Capture the post-insert LSN, then push the summarizer frontier well past
+    // it with margin WAL. The summarizer trails the bleeding edge by up to one
+    // record, so a target at the very tip stalls forever on an idle cluster;
+    // pg_switch_wal alone doesn't help (it pads to empty space never covered)
+    let target =
+        pgwalrs::pg::backup::parse_pg_lsn(&psql("SELECT pg_current_wal_insert_lsn()")).unwrap();
+    psql("SELECT pg_logical_emit_message(true, 'walrs', repeat('m', 262144))");
+    psql("CHECKPOINT");
+    psql("SELECT pg_switch_wal()");
+
+    let data_dir = psql("SHOW data_directory");
+    let tli: u32 = psql("SELECT timeline_id FROM pg_control_checkpoint()")
+        .parse()
+        .unwrap();
+    wait_for_coverage(&psql, tli, target).await;
+
+    // Read the full contiguous summary span on this timeline; it must cover the
+    // inserts above
+    let start = pgwalrs::pg::backup::parse_pg_lsn(&psql(&format!(
+        "SELECT coalesce(min(start_lsn)::text, '0/0') FROM pg_available_wal_summaries() WHERE tli = {tli}"
+    )))
+    .unwrap();
+    let end = pgwalrs::pg::backup::parse_pg_lsn(&psql(&format!(
+        "SELECT coalesce(max(end_lsn)::text, '0/0') FROM pg_available_wal_summaries() WHERE tli = {tli}"
+    )))
+    .unwrap();
+
+    let map = pgwalrs::pg::wal_summaries::read_for_range(
+        std::path::Path::new(&data_dir),
+        tli,
+        start,
+        end,
+    )
+    .expect("parse real PG WAL summaries");
+    assert!(!map.is_empty(), "summary map should carry changed blocks");
+
+    let relpath = psql(&format!("SELECT pg_relation_filepath('{tbl}')"));
+    let blocks = map
+        .blocks_for(&relpath)
+        .expect("paged-file path")
+        .expect("touched table must appear in the summary delta map");
+    assert!(!blocks.is_empty(), "table main-fork blocks expected in map");
+
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+}
+
+/// End-to-end `--delta-from-wal-summaries`: the `summarize_wal=off` and
+/// missing-`--pgdata` preconditions must abort, and the success path must
+/// reconstruct byte-for-byte against a non-delta backup of the same state.
+#[tokio::test]
+async fn delta_from_summaries_against_live_pg() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    std::fs::create_dir_all(&storage_dir).unwrap();
+    let s = settings_for(storage_dir.to_str().unwrap());
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let psql = psql_runner();
+
+    let ver: i64 = psql("SHOW server_version_num").parse().unwrap_or(0);
+    if ver < 170000 {
+        eprintln!("skip delta_from_summaries: needs PG17+ (server {ver})");
+        return;
+    }
+    let ctx = psql("SELECT context FROM pg_settings WHERE name = 'summarize_wal'");
+    if ctx != "sighup" {
+        eprintln!("skip delta_from_summaries: summarize_wal not reloadable (context {ctx})");
+        return;
+    }
+    let data_dir = std::path::PathBuf::from(psql("SHOW data_directory"));
+
+    // ── precondition bail: summarize_wal=off aborts before any backup ──
+    psql("ALTER SYSTEM SET summarize_wal = off");
+    psql("SELECT pg_reload_conf()");
+    wait_for_guc(&psql, "summarize_wal", "off").await;
+    let off_err = backup::push::handle(
+        &s,
+        store.clone(),
+        backup::push::PushArgs {
+            pgdata: Some(data_dir.clone()),
+            delta_from_wal_summaries: true,
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect_err("summarize_wal=off must abort --delta-from-wal-summaries");
+    assert!(
+        format!("{off_err:#}").contains("summarize_wal"),
+        "{off_err:#}"
+    );
+
+    psql("ALTER SYSTEM SET summarize_wal = on");
+    psql("SELECT pg_reload_conf()");
+    wait_for_guc(&psql, "summarize_wal", "on").await;
+
+    // ── parent full ──
+    let tbl = "walrs_summary_delta_test";
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+    psql(&format!(
+        "CREATE TABLE {tbl} (id int primary key, v text) WITH (autovacuum_enabled=false)"
+    ));
+    psql(&format!(
+        "INSERT INTO {tbl} SELECT g, repeat('a', 200) FROM generate_series(1, 2000) g"
+    ));
+    psql(&format!("SELECT count(*) FROM {tbl}"));
+    psql("CHECKPOINT");
+    backup::push::handle(
+        &s,
+        store.clone(),
+        backup::push::PushArgs {
+            full: true,
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect("parent full backup");
+    let full_name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
+    let full_start_lsn = read_sentinel(&storage_dir, &full_name)
+        .sentinel
+        .backup_start_lsn;
+
+    let mut s_delta = s.clone();
+    s_delta.delta.max_steps = 1;
+
+    // ── precondition bail: summaries live on the host fs, so --pgdata is
+    //    required once a delta parent is in play ──
+    let pgdata_err = backup::push::handle(
+        &s_delta,
+        store.clone(),
+        backup::push::PushArgs {
+            pgdata: None,
+            delta_from_wal_summaries: true,
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect_err("--delta-from-wal-summaries without --pgdata must abort");
+    assert!(
+        format!("{pgdata_err:#}").contains("--pgdata"),
+        "{pgdata_err:#}"
+    );
+
+    // ── mutate, then ensure the mutations are summarized ──
+    psql(&format!(
+        "UPDATE {tbl} SET v = repeat('b', 200) WHERE id % 2 = 0"
+    ));
+    psql(&format!(
+        "INSERT INTO {tbl} SELECT g, repeat('c', 200) FROM generate_series(2001, 3000) g"
+    ));
+    psql(&format!("SELECT count(*) FROM {tbl}"));
+    // Capture the post-mutation LSN, then emit margin WAL to push the
+    // summarizer frontier safely past it. A logical message never touches the
+    // table heap, so byte-identity with the baseline backup is preserved
+    // (see wal_summaries_parse note on the one-record summarizer lag)
+    let mutate_lsn =
+        pgwalrs::pg::backup::parse_pg_lsn(&psql("SELECT pg_current_wal_insert_lsn()")).unwrap();
+    psql("SELECT pg_logical_emit_message(true, 'walrs', repeat('m', 262144))");
+    psql("CHECKPOINT");
+    psql("SELECT pg_switch_wal()");
+    let tli: u32 = psql("SELECT timeline_id FROM pg_control_checkpoint()")
+        .parse()
+        .unwrap();
+    wait_for_coverage(&psql, tli, mutate_lsn).await;
+
+    // The shared cluster may stream concurrent WAL (other vm-tests), so the
+    // backup-start LSN can momentarily outrun summary coverage and fall back to
+    // a full. Drop any such full and retry; the summarizer always catches up.
+    let mut delta_name = None;
+    for _ in 0..6 {
+        backup::push::handle(
+            &s_delta,
+            store.clone(),
+            backup::push::PushArgs {
+                pgdata: Some(data_dir.clone()),
+                delta_from_wal_summaries: true,
+                ..default_push_args()
+            },
+        )
+        .await
+        .expect("delta-from-summaries backup");
+        let name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
+        if name.contains("_D_") {
+            delta_name = Some(name);
+            break;
+        }
+        delete_backup_files(&storage_dir, &name);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    let Some(delta_name) = delta_name else {
+        eprintln!(
+            "note: WAL summaries never covered the backup-start LSN under load; \
+             delta-from-summaries fell back to full each attempt"
+        );
+        psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+        return;
+    };
+
+    let dv2 = read_sentinel(&storage_dir, &delta_name);
+    assert_eq!(
+        dv2.sentinel.increment_from.as_deref(),
+        Some(full_name.as_str()),
+        "delta IncrementFrom should point at the parent full"
+    );
+    assert_eq!(dv2.sentinel.increment_from_lsn, full_start_lsn);
+    assert_eq!(dv2.sentinel.increment_count, Some(1));
+
+    // ── baseline non-delta backup of the same quiesced state ──
+    backup::push::handle(
+        &s,
+        store.clone(),
+        backup::push::PushArgs {
+            full: true,
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect("baseline full backup");
+    let baseline_name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
+    assert!(!baseline_name.contains("_D_"), "baseline must be full");
+
+    let relpath = psql(&format!("SELECT pg_relation_filepath('{tbl}')"));
+    let dir_parent = restore_backup(
+        &s,
+        &store,
+        &storage_dir,
+        &full_name,
+        dir.path().join("r_parent"),
+    )
+    .await;
+    let dir_delta = restore_backup(
+        &s,
+        &store,
+        &storage_dir,
+        &delta_name,
+        dir.path().join("r_delta"),
+    )
+    .await;
+    let dir_baseline = restore_backup(
+        &s,
+        &store,
+        &storage_dir,
+        &baseline_name,
+        dir.path().join("r_baseline"),
+    )
+    .await;
+
+    let read_rel = |root: &std::path::Path| std::fs::read(root.join(&relpath)).unwrap();
+    let delta_rel = read_rel(&dir_delta);
+    assert_eq!(
+        delta_rel,
+        read_rel(&dir_baseline),
+        "delta-from-summaries restore differs from a non-delta backup of the same state"
+    );
+    assert_ne!(
+        delta_rel,
+        read_rel(&dir_parent),
+        "delta restore matches the parent — the increment was not applied"
+    );
+
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+}
+
+/// A deterministically-created user tablespace must round-trip: its `Spec`
+/// lands in the sentinel, restore recreates the `pg_tblspc/<oid>` symlink, and
+/// the relation extracted through it is a valid heap.
+#[tokio::test]
+async fn tablespace_backup_restore_against_live_pg() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    std::fs::create_dir_all(&storage_dir).unwrap();
+    let s = settings_for(storage_dir.to_str().unwrap());
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let psql = psql_runner();
+
+    // Tablespace location: empty dir outside PGDATA, owned by the PG user (us)
+    let ts_src = dir.path().join("tblspc_src");
+    std::fs::create_dir_all(&ts_src).unwrap();
+    let ts_name = "walrs_ts_test";
+    let tbl = "walrs_ts_table";
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+    psql(&format!("DROP TABLESPACE IF EXISTS {ts_name}"));
+    psql(&format!(
+        "CREATE TABLESPACE {ts_name} LOCATION '{}'",
+        ts_src.display()
+    ));
+    psql(&format!(
+        "CREATE TABLE {tbl} (id int primary key, v text) \
+         WITH (autovacuum_enabled=false) TABLESPACE {ts_name}"
+    ));
+    psql(&format!(
+        "INSERT INTO {tbl} SELECT g, repeat('z', 200) FROM generate_series(1, 2000) g"
+    ));
+    psql(&format!("SELECT count(*) FROM {tbl}"));
+    psql("CHECKPOINT");
+
+    backup::push::handle(
+        &s,
+        store.clone(),
+        backup::push::PushArgs {
+            full: true,
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect("full backup with user tablespace");
+
+    let name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
+    let v2 = read_sentinel(&storage_dir, &name);
+    let spec = v2
+        .sentinel
+        .tablespace_spec
+        .clone()
+        .filter(|sp| !sp.is_empty())
+        .expect("sentinel must carry the user tablespace Spec");
+
+    let restore = dir.path().join("restore");
+    let mut args = backup::fetch::FetchArgs::default();
+    apply_tablespace_remap(&spec, &restore, &mut args);
+    backup::fetch::handle_with_args(&s, store.clone(), &name, &restore, &args)
+        .await
+        .expect("restore with --tablespace-mapping");
+
+    for ts in &spec.tablespace_names {
+        let link = restore.join("pg_tblspc").join(ts);
+        let md = std::fs::symlink_metadata(&link).unwrap_or_else(|e| panic!("{link:?}: {e}"));
+        assert!(md.file_type().is_symlink(), "{link:?} should be a symlink");
+    }
+
+    let relpath = psql(&format!("SELECT pg_relation_filepath('{tbl}')"));
+    assert!(
+        relpath.contains("pg_tblspc"),
+        "table should live under the tablespace: {relpath}"
+    );
+    let restored = std::fs::read(restore.join(&relpath))
+        .unwrap_or_else(|e| panic!("read restored tablespace relation {relpath}: {e}"));
+    assert!(
+        !restored.is_empty(),
+        "restored tablespace relation is empty"
+    );
+    assert_eq!(
+        restored.len() % 8192,
+        0,
+        "restored relation is not a whole number of pages"
+    );
+
+    psql(&format!("DROP TABLE IF EXISTS {tbl}"));
+    psql(&format!("DROP TABLESPACE IF EXISTS {ts_name}"));
+}

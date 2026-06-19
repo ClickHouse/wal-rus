@@ -24,7 +24,29 @@ use pgwalrs::pg::replication::stream::{
 };
 use pgwalrs::pg::replication::tls::SslMode;
 use postgres_protocol::message::backend::Message;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+
+fn test_identity() -> Identity {
+    Identity {
+        system_id: "7340000000000000000".into(),
+        timeline: 1,
+        xlogpos: 0,
+        dbname: None,
+    }
+}
+
+fn client_config(port: u16, sslmode: SslMode) -> PgConfig {
+    PgConfig {
+        host: "127.0.0.1".into(),
+        port,
+        user: "u".into(),
+        password: None,
+        database: "u".into(),
+        application_name: "wal-rs-server-test".into(),
+        sslmode,
+    }
+}
 
 #[tokio::test]
 async fn protocol_roundtrip_through_tcp() {
@@ -165,4 +187,134 @@ async fn protocol_roundtrip_through_tcp() {
         0x016B_3750 + payload.len() as u64,
         "server saw client's flush_lsn"
     );
+}
+
+/// sslmode=prefer makes the real client emit an SSLRequest first; the server's
+/// startup reader must answer 'N' and re-read the actual StartupMessage.
+#[tokio::test]
+async fn ssl_request_restart_with_real_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = test_identity();
+    let server_task = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        handshake_and_await_start(&mut sock, &identity)
+            .await
+            .expect("handshake")
+            .start_lsn
+    });
+
+    let mut client = ReplicationConn::connect(&client_config(addr.port(), SslMode::Prefer))
+        .await
+        .expect("client connect");
+    client
+        .send_query("START_REPLICATION PHYSICAL 0/0")
+        .await
+        .expect("send start");
+    client
+        .expect_copy_both_open()
+        .await
+        .expect("CopyBothResponse");
+
+    let start_lsn = tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server join");
+    assert_eq!(start_lsn, 0);
+}
+
+/// `TIMELINE_HISTORY` row encoding on the server must parse via the real
+/// client's `timeline_history`, yielding the `<tli>.history` filename + empty
+/// body for a single-timeline source.
+#[tokio::test]
+async fn timeline_history_round_trips_through_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = test_identity();
+    let server_task = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        handshake_and_await_start(&mut sock, &identity)
+            .await
+            .expect("handshake");
+    });
+
+    let mut client = ReplicationConn::connect(&client_config(addr.port(), SslMode::Disable))
+        .await
+        .expect("client connect");
+    let (name, content) = client
+        .timeline_history(1)
+        .await
+        .expect("timeline_history")
+        .expect("history row present");
+    assert_eq!(name, "00000001.history");
+    assert!(content.is_empty());
+
+    client
+        .send_query("START_REPLICATION PHYSICAL 0/0")
+        .await
+        .expect("send start");
+    client
+        .expect_copy_both_open()
+        .await
+        .expect("CopyBothResponse");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server join");
+}
+
+/// Malformed `StartupMessage`s surface as protocol errors from
+/// `handshake_and_await_start` rather than hanging or panicking.
+#[tokio::test]
+async fn handshake_rejects_malformed_startup() {
+    let identity = test_identity();
+
+    // Unsupported protocol version (2.0)
+    let (client, mut server) = tokio::io::duplex(256);
+    let writer = tokio::spawn(async move {
+        let mut client = client;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        buf.extend_from_slice(b"user\0u\0\0");
+        let _ = client.write_all(&buf).await;
+    });
+    let err = handshake_and_await_start(&mut server, &identity)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported protocol version"),
+        "{err}"
+    );
+    writer.await.unwrap();
+
+    // Startup length too short (< 8)
+    let (client, mut server) = tokio::io::duplex(64);
+    let writer = tokio::spawn(async move {
+        let mut client = client;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&196608u32.to_be_bytes());
+        let _ = client.write_all(&buf).await;
+    });
+    let err = handshake_and_await_start(&mut server, &identity)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("too short"), "{err}");
+    writer.await.unwrap();
+}
+
+/// `WalSenderConn::try_recv_frame` rejects a CopyData envelope whose declared
+/// length is below the 4-byte minimum.
+#[tokio::test]
+async fn walsender_conn_rejects_malformed_copy_data() {
+    let (client, server) = tokio::io::duplex(64);
+    let writer = tokio::spawn(async move {
+        let mut client = client;
+        let _ = client.write_all(&[b'd', 0, 0, 0, 3]).await;
+    });
+    let mut conn = WalSenderConn::new(server);
+    let err = conn.try_recv_frame().await.unwrap_err();
+    assert!(format!("{err}").contains("too short"), "{err}");
+    writer.await.unwrap();
 }

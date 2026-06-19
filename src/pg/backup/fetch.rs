@@ -440,3 +440,45 @@ fn method_from_key(key: &str) -> compression::Method {
     let ext = key.rsplit('.').next().unwrap_or("");
     compression::Method::from_extension(ext).unwrap_or(compression::Method::None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::fs::FsStorage;
+
+    /// A tar part whose only file is flagged incremented, restored into an
+    /// empty dir: `apply_increment_in_place` needs the base file the parent
+    /// chain step wrote, so the missing-target open must surface a wrapped,
+    /// path-tagged error rather than a bare io error
+    #[tokio::test]
+    async fn increment_apply_wraps_missing_target_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let data = crate::pg::backup::increment::INCREMENT_MAGIC.to_vec();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut header, "base/16384/16385", &data[..])
+            .unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let key = "basebackups_005/base_test/tar_partitions/part_001.tar";
+        let len = tar_bytes.len() as u64;
+        let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(tar_bytes));
+        storage.put(key, r, Some(len)).await.unwrap();
+
+        let restore = dir.path().join("restore");
+        let settings = Settings::default();
+        let incremented = Arc::new(HashSet::from(["base/16384/16385".to_string()]));
+        let err = unpack_part(&settings, &storage, key, &restore, incremented)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("apply increment"), "{msg}");
+        assert!(msg.contains("open target"), "{msg}");
+    }
+}
