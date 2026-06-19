@@ -11,9 +11,9 @@ use pgwalrs::pg::backup::fetch as fetch_mod;
 use pgwalrs::pg::backup::increment::write_increment_header;
 use pgwalrs::pg::backup::list as list_mod;
 use pgwalrs::pg::backup::{
-    BackupSentinelDto, BackupSentinelDtoV2, FileDescription, FilesMetadataDto,
-    METADATA_DATETIME_FORMAT, PG_CONTROL_TARNAME, TablespaceSpec, files_metadata_key,
-    format_backup_name, sentinel_key, tar_part_key, tar_partitions_prefix,
+    BackupSentinelDto, BackupSentinelDtoV2, FileDescription, FilesMetadataDto, PG_CONTROL_TARNAME,
+    TablespaceSpec, files_metadata_key, format_backup_name, sentinel_key, tar_part_key,
+    tar_partitions_prefix,
 };
 use pgwalrs::storage::Storage;
 use pgwalrs::storage::fs::FsStorage;
@@ -23,18 +23,7 @@ fn test_settings() -> Settings {
         storage: StorageSettings::Fs {
             path: "/tmp".into(),
         },
-        compression: Method::Zstd,
-        compression_level: 3,
-        upload_concurrency: 1,
-        upload_queue: 1,
-        download_concurrency: 1,
-        prevent_wal_overwrite: false,
-        use_wal_delta: false,
-        retry: pgwalrs::retry::RetryPolicy::default(),
-        network_rate_limit: 0,
-        disk_rate_limit: 0,
-        delta: Default::default(),
-        crypter: None,
+        ..Default::default()
     }
 }
 
@@ -42,30 +31,17 @@ fn make_sentinel_v2(name_data_dir: &str) -> BackupSentinelDtoV2 {
     BackupSentinelDtoV2 {
         sentinel: BackupSentinelDto {
             backup_start_lsn: Some(0x0300_0000),
-            increment_from_lsn: None,
-            increment_from: None,
-            increment_full_name: None,
-            increment_count: None,
-            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(0x0300_1000),
             system_identifier: Some(7000000000000000000),
             uncompressed_size: 1024,
             compressed_size: 512,
-            data_catalog_size: 0,
-            user_data: None,
             files_metadata_disabled: true,
-            tablespace_spec: None,
-            backup_start_chkp_num: Some(0),
-            increment_from_chkp_num: None,
+            ..Default::default()
         },
-        version: 2,
-        start_time: Utc::now(),
-        finish_time: Utc::now(),
-        date_fmt: METADATA_DATETIME_FORMAT.into(),
         hostname: "testhost".into(),
         data_dir: name_data_dir.into(),
-        is_permanent: false,
+        ..Default::default()
     }
 }
 
@@ -453,9 +429,7 @@ async fn delta_parent_picks_latest_when_enabled() {
 
     let delta = DeltaSettings {
         max_steps: 3,
-        from_full: false,
-        from_name: None,
-        from_user_data: None,
+        ..Default::default()
     };
     let info = delta_mod::configure_delta_parent(&store, &delta, false)
         .await
@@ -505,9 +479,7 @@ async fn delta_parent_falls_back_when_max_steps_reached() {
 
     let delta = DeltaSettings {
         max_steps: 3,
-        from_full: false,
-        from_name: None,
-        from_user_data: None,
+        ..Default::default()
     };
     let info = delta_mod::configure_delta_parent(&store, &delta, false)
         .await

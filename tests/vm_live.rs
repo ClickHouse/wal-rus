@@ -16,7 +16,6 @@
 
 use std::sync::Arc;
 
-use pgwalrs::compression::Method;
 use pgwalrs::config::{Settings, StorageSettings};
 use pgwalrs::pg::backup;
 use pgwalrs::pg::wal;
@@ -26,18 +25,7 @@ use pgwalrs::storage::fs::FsStorage;
 fn settings_for(path: &str) -> Settings {
     Settings {
         storage: StorageSettings::Fs { path: path.into() },
-        compression: Method::Zstd,
-        compression_level: 3,
-        upload_concurrency: 1,
-        upload_queue: 1,
-        download_concurrency: 1,
-        prevent_wal_overwrite: false,
-        use_wal_delta: false,
-        retry: pgwalrs::retry::RetryPolicy::default(),
-        network_rate_limit: 0,
-        disk_rate_limit: 0,
-        delta: Default::default(),
-        crypter: None,
+        ..Default::default()
     }
 }
 

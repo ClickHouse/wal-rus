@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 
 use pgwalrs::cli::DaemonOp;
-use pgwalrs::compression::Method;
 use pgwalrs::config::{Settings, StorageSettings};
 use pgwalrs::daemon::protocol::{MessageType, read_message, write_message};
 use pgwalrs::storage::fs::FsStorage;
@@ -17,18 +16,7 @@ fn fs_settings(storage_dir: &std::path::Path) -> Settings {
         storage: StorageSettings::Fs {
             path: storage_dir.to_str().unwrap().into(),
         },
-        compression: Method::Zstd,
-        compression_level: 3,
-        upload_concurrency: 1,
-        upload_queue: 1,
-        download_concurrency: 1,
-        prevent_wal_overwrite: false,
-        use_wal_delta: false,
-        retry: pgwalrs::retry::RetryPolicy::default(),
-        network_rate_limit: 0,
-        disk_rate_limit: 0,
-        delta: Default::default(),
-        crypter: None,
+        ..Default::default()
     }
 }
 

@@ -21,17 +21,7 @@ fn settings_for(path: &str, method: Method) -> Settings {
     Settings {
         storage: StorageSettings::Fs { path: path.into() },
         compression: method,
-        compression_level: 3,
-        upload_concurrency: 1,
-        upload_queue: 1,
-        download_concurrency: 1,
-        prevent_wal_overwrite: false,
-        use_wal_delta: false,
-        retry: pgwalrs::retry::RetryPolicy::default(),
-        network_rate_limit: 0,
-        disk_rate_limit: 0,
-        delta: Default::default(),
-        crypter: None,
+        ..Default::default()
     }
 }
 
@@ -550,30 +540,13 @@ async fn wal_verify_integrity_detects_gap_after_backup() {
     let v2 = pgwalrs::pg::backup::BackupSentinelDtoV2 {
         sentinel: pgwalrs::pg::backup::BackupSentinelDto {
             backup_start_lsn: Some(seg_size),
-            increment_from_lsn: None,
-            increment_from: None,
-            increment_full_name: None,
-            increment_count: None,
-            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(seg_size + 16),
             system_identifier: Some(1),
-            uncompressed_size: 0,
-            compressed_size: 0,
-            data_catalog_size: 0,
-            user_data: None,
             files_metadata_disabled: true,
-            tablespace_spec: None,
-            backup_start_chkp_num: Some(0),
-            increment_from_chkp_num: None,
+            ..Default::default()
         },
-        version: 2,
-        start_time: chrono::Utc::now(),
-        finish_time: chrono::Utc::now(),
-        date_fmt: pgwalrs::pg::backup::METADATA_DATETIME_FORMAT.into(),
-        hostname: "h".into(),
-        data_dir: "/d".into(),
-        is_permanent: false,
+        ..Default::default()
     };
     let bytes = serde_json::to_vec(&v2).unwrap();
     let len = bytes.len() as u64;

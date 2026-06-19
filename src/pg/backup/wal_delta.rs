@@ -610,23 +610,14 @@ mod tests {
     }
 
     fn test_settings(bucket: &Path) -> Settings {
-        use crate::config::{DeltaSettings, StorageSettings};
+        use crate::config::StorageSettings;
         Settings {
             storage: StorageSettings::Fs {
                 path: bucket.to_string_lossy().into_owned(),
             },
             compression: compression::Method::None,
-            compression_level: 0,
-            upload_concurrency: 1,
-            upload_queue: 1,
-            download_concurrency: 1,
-            prevent_wal_overwrite: false,
             use_wal_delta: true,
-            retry: crate::retry::RetryPolicy::default(),
-            network_rate_limit: 0,
-            disk_rate_limit: 0,
-            delta: DeltaSettings::default(),
-            crypter: None,
+            ..Default::default()
         }
     }
 

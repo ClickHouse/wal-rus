@@ -828,17 +828,7 @@ mod tests {
                 path: store.to_string_lossy().into(),
             },
             compression: crate::compression::Method::None,
-            compression_level: 3,
-            upload_concurrency: 1,
-            upload_queue: 1,
-            download_concurrency: 1,
-            prevent_wal_overwrite: false,
-            use_wal_delta: false,
-            retry: crate::retry::RetryPolicy::default(),
-            network_rate_limit: 0,
-            disk_rate_limit: 0,
-            delta: Default::default(),
-            crypter: None,
+            ..Default::default()
         }
     }
 
@@ -852,58 +842,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn decode_wal_frame() {
-        // 'w' | start_lsn=0x100 | server_end=0x200 | send_time=0 | "hello"
-        let mut p = Vec::new();
-        p.push(b'w');
-        p.extend_from_slice(&0x100u64.to_be_bytes());
-        p.extend_from_slice(&0x200u64.to_be_bytes());
-        p.extend_from_slice(&0i64.to_be_bytes());
-        p.extend_from_slice(b"hello");
-        let f = decode_frame(&p).unwrap();
-        match f {
-            Frame::Wal(w) => {
-                assert_eq!(w.start_lsn, 0x100);
-                assert_eq!(w.data, b"hello");
-            }
-            _ => panic!("expected WAL frame"),
-        }
-    }
-
-    #[test]
-    fn decode_keepalive_frame() {
-        let mut p = Vec::new();
-        p.push(b'k');
-        p.extend_from_slice(&0x300u64.to_be_bytes());
-        p.extend_from_slice(&12345i64.to_be_bytes());
-        p.push(1);
-        let f = decode_frame(&p).unwrap();
-        match f {
-            Frame::Keepalive(k) => assert!(k.reply_requested),
-            _ => panic!("expected keepalive"),
-        }
-    }
-
-    #[test]
-    fn rejects_short_frames() {
-        assert!(decode_frame(b"w").is_err());
-        assert!(decode_frame(b"k\x00").is_err());
-        assert!(decode_frame(b"").is_err());
-        assert!(decode_frame(b"x\x00\x00").is_err());
-    }
-
-    #[test]
-    fn status_update_encoding() {
-        let bytes = build_status_update(0x1, 0x2, 0x3);
-        assert_eq!(bytes[0], b'r');
-        assert_eq!(bytes.len(), 1 + 8 * 4 + 1);
-        let write = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
-        let flush = u64::from_be_bytes(bytes[9..17].try_into().unwrap());
-        let apply = u64::from_be_bytes(bytes[17..25].try_into().unwrap());
-        assert_eq!((write, flush, apply), (0x1, 0x2, 0x3));
-        assert_eq!(bytes[33], 0);
-    }
+    // decode_frame / build_status_update wire coverage lives in the owner
+    // module `replication::stream`; receive-side tests focus on the accumulator
 
     #[tokio::test]
     async fn finalize_partial_keeps_partial_segment() {
