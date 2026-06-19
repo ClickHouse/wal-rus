@@ -24,4 +24,3 @@ subcommand.
 
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture & design decisions
 - [docs/WALG_COMPAT.md](docs/WALG_COMPAT.md) — wal-g interop guarantees & divergences
-- [docs/TESTING.md](docs/TESTING.md) — test strategy

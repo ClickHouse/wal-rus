@@ -1,9 +1,3 @@
-# Design notes
-
-Decisions not derivable from reading code, kept terse. Companion docs:
-[WALG_COMPAT.md](WALG_COMPAT.md) for interop guarantees,
-[TESTING.md](TESTING.md) for test strategy.
-
 ## Goal
 
 Functional parity with wal-g's Postgres surface so an on-prem shop can
