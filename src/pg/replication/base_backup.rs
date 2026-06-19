@@ -10,8 +10,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use fallible_iterator::FallibleIterator as _;
-use postgres_protocol::message::backend::{DataRowBody, Message};
+use postgres_protocol::message::backend::Message;
 use std::pin::Pin;
 use std::task::{Context as TaskCtx, Poll};
 use tokio::io::AsyncRead;
@@ -239,96 +238,46 @@ fn quote_pg_str(s: &str) -> String {
 }
 
 async fn read_lsn_row(conn: &mut ReplicationConn) -> Result<(u64, u32)> {
-    let mut start_lsn: Option<u64> = None;
-    let mut timeline: Option<u32> = None;
-    loop {
-        match conn.recv_message().await? {
-            Message::RowDescription(_) => {}
-            Message::DataRow(row) => {
-                let cols = data_row_cols(&row)?;
-                if cols.len() != 2 {
-                    bail!("expected 2 cols for LSN row, got {}", cols.len());
-                }
-                let lsn_text = utf8_or_err(&cols[0])?;
-                start_lsn = Some(parse_pg_lsn(lsn_text)?);
-                let tli_text = utf8_or_err(&cols[1])?;
-                timeline = Some(tli_text.parse().context("tli is not an int")?);
-            }
-            Message::CommandComplete(_) => break,
-            Message::ErrorResponse(e) => bail!("read_lsn_row: {}", error_message(&e)),
-            m => bail!("read_lsn_row: unexpected message {:?}", message_kind(&m)),
-        }
+    let rows = conn.collect_command_rows().await?;
+    let cols = rows.first().ok_or_else(|| anyhow!("no LSN row received"))?;
+    if cols.len() != 2 {
+        bail!("expected 2 cols for LSN row, got {}", cols.len());
     }
+    let lsn_text = cols[0]
+        .as_deref()
+        .ok_or_else(|| anyhow!("null LSN column"))?;
+    let tli_text = cols[1]
+        .as_deref()
+        .ok_or_else(|| anyhow!("null timeline column"))?;
     Ok((
-        start_lsn.ok_or_else(|| anyhow!("no LSN row received"))?,
-        timeline.ok_or_else(|| anyhow!("no timeline received"))?,
+        parse_pg_lsn(lsn_text)?,
+        tli_text.parse().context("tli is not an int")?,
     ))
 }
 
 async fn read_tablespaces(conn: &mut ReplicationConn) -> Result<Vec<Tablespace>> {
-    let mut out = Vec::new();
-    loop {
-        match conn.recv_message().await? {
-            Message::RowDescription(_) => {}
-            Message::DataRow(row) => {
-                let cols = data_row_cols(&row)?;
-                if cols.len() < 3 {
-                    bail!("tablespace row needs 3 cols, got {}", cols.len());
-                }
-                let oid: u32 = match &cols[0] {
-                    Some(b) => utf8_or_err(&Some(b.clone()))?
-                        .parse()
-                        .context("tablespace oid")?,
-                    None => 0,
-                };
-                let location = match &cols[1] {
-                    Some(b) => String::from_utf8(b.to_vec()).unwrap_or_default(),
-                    None => String::new(),
-                };
-                let size: Option<i64> = match &cols[2] {
-                    Some(b) => Some(
-                        std::str::from_utf8(b)
-                            .context("tablespace size utf8")?
-                            .parse()
-                            .context("tablespace size int")?,
-                    ),
-                    None => None,
-                };
-                out.push(Tablespace {
-                    oid,
-                    location,
-                    size,
-                });
-            }
-            Message::CommandComplete(_) => break,
-            Message::ErrorResponse(e) => bail!("read_tablespaces: {}", error_message(&e)),
-            m => bail!(
-                "read_tablespaces: unexpected message {:?}",
-                message_kind(&m)
-            ),
+    let rows = conn.collect_command_rows().await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for cols in rows {
+        if cols.len() < 3 {
+            bail!("tablespace row needs 3 cols, got {}", cols.len());
         }
+        let oid: u32 = match cols[0].as_deref() {
+            Some(s) => s.parse().context("tablespace oid")?,
+            None => 0,
+        };
+        let location = cols[1].clone().unwrap_or_default();
+        let size: Option<i64> = match cols[2].as_deref() {
+            Some(s) => Some(s.parse().context("tablespace size int")?),
+            None => None,
+        };
+        out.push(Tablespace {
+            oid,
+            location,
+            size,
+        });
     }
     Ok(out)
-}
-
-fn data_row_cols(row: &DataRowBody) -> Result<Vec<Option<Bytes>>> {
-    let buf = row.buffer_bytes();
-    let mut ranges = row.ranges();
-    let mut out: Vec<Option<Bytes>> = Vec::new();
-    while let Some(range) = ranges.next()? {
-        match range {
-            Some(r) => out.push(Some(buf.slice(r))),
-            None => out.push(None),
-        }
-    }
-    Ok(out)
-}
-
-fn utf8_or_err(b: &Option<Bytes>) -> Result<&str> {
-    match b {
-        Some(b) => std::str::from_utf8(b).context("non-utf8 column"),
-        None => bail!("unexpected null column"),
-    }
 }
 
 async fn stream_archives_compat(

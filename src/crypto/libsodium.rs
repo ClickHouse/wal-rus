@@ -163,6 +163,23 @@ pub fn from_env() -> Result<Option<DynCrypter>> {
 //     append plaintext to `out`, drain into caller
 //   - FINAL tag flips `finalized = true`; subsequent reads return EOF
 
+/// Copy queued bytes from `out[*out_pos..]` into `buf`, resetting the buffer
+/// once fully drained. Returns true when there were bytes pending (caller then
+/// yields `Ready`), mirroring the secretstream readers' drain-first step
+fn drain_into(out: &mut Vec<u8>, out_pos: &mut usize, buf: &mut ReadBuf<'_>) -> bool {
+    if *out_pos >= out.len() {
+        return false;
+    }
+    let want = buf.remaining().min(out.len() - *out_pos);
+    buf.put_slice(&out[*out_pos..*out_pos + want]);
+    *out_pos += want;
+    if *out_pos == out.len() {
+        out.clear();
+        *out_pos = 0;
+    }
+    true
+}
+
 struct EncryptReader {
     inner: AsyncReader,
     stream: Option<DryocStream<Push>>,
@@ -242,14 +259,7 @@ impl AsyncRead for EncryptReader {
 
         loop {
             // 1) Drain any ready ciphertext (or header bytes)
-            if me.out_pos < me.out.len() {
-                let want = buf.remaining().min(me.out.len() - me.out_pos);
-                buf.put_slice(&me.out[me.out_pos..me.out_pos + want]);
-                me.out_pos += want;
-                if me.out_pos == me.out.len() {
-                    me.out.clear();
-                    me.out_pos = 0;
-                }
+            if drain_into(&mut me.out, &mut me.out_pos, buf) {
                 return Poll::Ready(Ok(()));
             }
             if me.finalized {
@@ -350,14 +360,7 @@ impl AsyncRead for DecryptReader {
         let me = &mut *self;
         loop {
             // 1) Drain plaintext
-            if me.out_pos < me.out.len() {
-                let want = buf.remaining().min(me.out.len() - me.out_pos);
-                buf.put_slice(&me.out[me.out_pos..me.out_pos + want]);
-                me.out_pos += want;
-                if me.out_pos == me.out.len() {
-                    me.out.clear();
-                    me.out_pos = 0;
-                }
+            if drain_into(&mut me.out, &mut me.out_pos, buf) {
                 return Poll::Ready(Ok(()));
             }
             if me.finalized {

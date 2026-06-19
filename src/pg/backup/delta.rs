@@ -700,16 +700,11 @@ mod tests {
     #[tokio::test]
     async fn delta_parent_carries_increment_format() {
         use crate::config::DeltaSettings;
-        use crate::pg::backup::{
-            BackupSentinelDto, METADATA_DATETIME_FORMAT, format_backup_name, sentinel_key,
-        };
+        use crate::pg::backup::{BackupSentinelDto, format_backup_name, sentinel_key};
         use crate::storage::fs::FsStorage;
         use std::sync::Arc;
 
         let seg = DEFAULT_WAL_SEG_SIZE;
-        let ts = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
 
         let sentinel = |from: Option<&str>, fmt: increment::Format| BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
@@ -721,23 +716,11 @@ mod tests {
                 increment_format: fmt,
                 pg_version: 170000,
                 backup_finish_lsn: Some(seg + 1),
-                system_identifier: None,
-                uncompressed_size: 0,
-                compressed_size: 0,
-                data_catalog_size: 0,
-                user_data: None,
-                files_metadata_disabled: true,
-                tablespace_spec: None,
-                backup_start_chkp_num: Some(0),
-                increment_from_chkp_num: None,
+                ..Default::default()
             },
-            version: 2,
-            start_time: ts,
-            finish_time: ts,
-            date_fmt: METADATA_DATETIME_FORMAT.into(),
             hostname: "h".into(),
             data_dir: "/d".into(),
-            is_permanent: false,
+            ..Default::default()
         };
 
         // Parent is itself a delta → its format constrains the new push

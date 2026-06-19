@@ -277,17 +277,8 @@ mod tests {
                 path: store.to_string_lossy().into(),
             },
             compression: crate::compression::Method::None,
-            compression_level: 3,
             upload_concurrency: concurrency,
-            upload_queue: 1,
-            download_concurrency: 1,
-            prevent_wal_overwrite: false,
-            use_wal_delta: false,
-            retry: crate::retry::RetryPolicy::default(),
-            network_rate_limit: 0,
-            disk_rate_limit: 0,
-            delta: Default::default(),
-            crypter: None,
+            ..Default::default()
         }
     }
 

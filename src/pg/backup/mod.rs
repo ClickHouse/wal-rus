@@ -306,7 +306,7 @@ pub struct FileDescription {
 }
 
 /// Sentinel: subset of wal-g BackupSentinelDto. Skips delta-backup fields we do not produce
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackupSentinelDto {
     #[serde(rename = "LSN", default)]
     pub backup_start_lsn: Option<u64>,
@@ -423,6 +423,24 @@ pub struct BackupSentinelDtoV2 {
     pub is_permanent: bool,
 }
 
+impl Default for BackupSentinelDtoV2 {
+    /// Epoch timestamps + empty host/dir; `version` 2 and the standard date
+    /// format. Tests override only the fields under test via struct-update
+    fn default() -> Self {
+        let epoch = DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch valid");
+        Self {
+            sentinel: BackupSentinelDto::default(),
+            version: 2,
+            start_time: epoch,
+            finish_time: epoch,
+            date_fmt: METADATA_DATETIME_FORMAT.into(),
+            hostname: String::new(),
+            data_dir: String::new(),
+            is_permanent: false,
+        }
+    }
+}
+
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
@@ -513,22 +531,13 @@ mod tests {
     fn sentinel_v1_serde_roundtrip() {
         let s = BackupSentinelDto {
             backup_start_lsn: Some(0x0300_0000),
-            increment_from_lsn: None,
-            increment_from: None,
-            increment_full_name: None,
-            increment_count: None,
-            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(0x0300_1000),
             system_identifier: Some(7000000000000000000),
             uncompressed_size: 1024,
             compressed_size: 512,
-            data_catalog_size: 0,
-            user_data: None,
             files_metadata_disabled: true,
-            tablespace_spec: None,
-            backup_start_chkp_num: Some(0),
-            increment_from_chkp_num: None,
+            ..Default::default()
         };
         let j = serde_json::to_string(&s).unwrap();
         // wal-g compatibility: keys must be PascalCase JSON
@@ -553,15 +562,7 @@ mod tests {
             increment_format: Format::Native,
             pg_version: 170000,
             backup_finish_lsn: Some(2),
-            system_identifier: None,
-            uncompressed_size: 0,
-            compressed_size: 0,
-            data_catalog_size: 0,
-            user_data: None,
-            files_metadata_disabled: false,
-            tablespace_spec: None,
-            backup_start_chkp_num: None,
-            increment_from_chkp_num: None,
+            ..Default::default()
         };
         // Native deltas record the format
         let j = serde_json::to_string(&s).unwrap();
@@ -607,34 +608,14 @@ mod tests {
         let s = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
                 backup_start_lsn: Some(1),
-                increment_from_lsn: None,
-                increment_from: None,
-                increment_full_name: None,
-                increment_count: None,
-                increment_format: Default::default(),
                 pg_version: 160003,
                 backup_finish_lsn: Some(2),
-                system_identifier: None,
-                uncompressed_size: 0,
-                compressed_size: 0,
-                data_catalog_size: 0,
-                user_data: None,
                 files_metadata_disabled: true,
-                tablespace_spec: None,
-                backup_start_chkp_num: Some(0),
-                increment_from_chkp_num: None,
+                ..Default::default()
             },
-            version: 2,
-            start_time: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            finish_time: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:01:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            date_fmt: METADATA_DATETIME_FORMAT.into(),
             hostname: "h".into(),
             data_dir: "/d".into(),
-            is_permanent: false,
+            ..Default::default()
         };
         let j = serde_json::to_string(&s).unwrap();
         assert!(j.contains("\"Version\":2"));

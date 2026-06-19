@@ -142,3 +142,18 @@ pub trait Storage: Send + Sync {
 }
 
 pub type DynStorage = Arc<dyn Storage>;
+
+/// Join a storage `prefix` to an object `key`, collapsing the slash between
+/// them. Empty prefix returns the key unchanged. Shared by object backends so
+/// their `full_key` mappings stay identical
+pub(crate) fn join_prefix_key(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            prefix.trim_end_matches('/'),
+            key.trim_start_matches('/')
+        )
+    }
+}

@@ -59,6 +59,31 @@ pub enum StorageSettings {
     Gcs(gcs::GcsConfig),
 }
 
+impl Default for Settings {
+    /// Convenience defaults: single-worker fs pipeline at zstd-3, no throttling
+    /// or encryption. Production constructs via [`Settings::from_env`]; this
+    /// lets tests vary only the fields they exercise via `..Default::default()`
+    fn default() -> Self {
+        Settings {
+            storage: StorageSettings::Fs {
+                path: String::new(),
+            },
+            compression: compression::Method::Zstd,
+            compression_level: 3,
+            upload_concurrency: 1,
+            upload_queue: 1,
+            download_concurrency: 1,
+            prevent_wal_overwrite: false,
+            use_wal_delta: false,
+            retry: RetryPolicy::default(),
+            network_rate_limit: 0,
+            disk_rate_limit: 0,
+            delta: DeltaSettings::default(),
+            crypter: None,
+        }
+    }
+}
+
 impl Settings {
     pub fn from_env() -> Result<Self> {
         let storage = detect_storage()?;
@@ -201,46 +226,12 @@ fn storage_from_uri(uri: &str, src: &StorageSettings) -> Result<StorageSettings>
     if let Some(rest) = uri.strip_prefix("s3://") {
         let (bucket, prefix) = split_bucket_prefix(rest);
         let s3_src = match src {
-            StorageSettings::S3(c) => Some(c.clone()),
+            StorageSettings::S3(c) => Some(c),
             _ => None,
         };
-        let region = s3_src
-            .as_ref()
-            .map(|c| c.region.clone())
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .unwrap_or_else(|| "us-east-1".into());
-        let access_key = s3_src
-            .as_ref()
-            .map(|c| c.access_key.clone())
-            .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
-            .ok_or_else(|| anyhow!("AWS_ACCESS_KEY_ID not set"))?;
-        let secret_key = s3_src
-            .as_ref()
-            .map(|c| c.secret_key.clone())
-            .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
-            .ok_or_else(|| anyhow!("AWS_SECRET_ACCESS_KEY not set"))?;
-        let session_token = s3_src
-            .as_ref()
-            .and_then(|c| c.session_token.clone())
-            .or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
-        let endpoint = s3_src
-            .as_ref()
-            .and_then(|c| c.endpoint.clone())
-            .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-        let force_path_style = s3_src
-            .as_ref()
-            .map(|c| c.force_path_style)
-            .unwrap_or(endpoint.is_some());
-        return Ok(StorageSettings::S3(s3::S3Config {
-            bucket,
-            prefix,
-            region,
-            access_key,
-            secret_key,
-            session_token,
-            endpoint,
-            force_path_style,
-        }));
+        return Ok(StorageSettings::S3(s3_config_from_env(
+            bucket, prefix, s3_src,
+        )?));
     }
     if let Some(rest) = uri.strip_prefix("gs://") {
         let (bucket, prefix) = split_bucket_prefix(rest);
@@ -266,6 +257,55 @@ fn split_bucket_prefix(rest: &str) -> (String, String) {
         Some((b, p)) => (b.to_string(), p.trim_end_matches('/').to_string()),
         None => (rest.to_string(), String::new()),
     }
+}
+
+/// Resolve an `S3Config` for `bucket`/`prefix`, layering credential fields.
+/// `src` (an existing S3 source for `backup-copy`) takes priority; otherwise
+/// fall back to env honoring every wal-g alias so detection & destination
+/// resolution read the same names: AWS_REGION/WALG_S3_REGION,
+/// AWS_ACCESS_KEY_ID/AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY/AWS_SECRET_KEY,
+/// AWS_SESSION_TOKEN, AWS_ENDPOINT_URL/WALG_S3_ENDPOINT, WALG_S3_FORCE_PATH_STYLE
+fn s3_config_from_env(
+    bucket: String,
+    prefix: String,
+    src: Option<&s3::S3Config>,
+) -> Result<s3::S3Config> {
+    let region = src
+        .map(|c| c.region.clone())
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("WALG_S3_REGION").ok())
+        .unwrap_or_else(|| "us-east-1".into());
+    let access_key = src
+        .map(|c| c.access_key.clone())
+        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
+        .or_else(|| std::env::var("AWS_ACCESS_KEY").ok())
+        .ok_or_else(|| anyhow!("AWS_ACCESS_KEY_ID not set"))?;
+    let secret_key = src
+        .map(|c| c.secret_key.clone())
+        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
+        .or_else(|| std::env::var("AWS_SECRET_KEY").ok())
+        .ok_or_else(|| anyhow!("AWS_SECRET_ACCESS_KEY not set"))?;
+    let session_token = src
+        .and_then(|c| c.session_token.clone())
+        .or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
+    let endpoint = src
+        .and_then(|c| c.endpoint.clone())
+        .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
+        .or_else(|| std::env::var("WALG_S3_ENDPOINT").ok());
+    let force_path_style = match src {
+        Some(c) => c.force_path_style,
+        None => parse_env_bool("WALG_S3_FORCE_PATH_STYLE", endpoint.is_some())?,
+    };
+    Ok(s3::S3Config {
+        bucket,
+        prefix,
+        region,
+        access_key,
+        secret_key,
+        session_token,
+        endpoint,
+        force_path_style,
+    })
 }
 
 impl DeltaSettings {
@@ -298,30 +338,9 @@ fn detect_storage() -> Result<StorageSettings> {
     }
     if let Ok(s3_prefix) = std::env::var("WALG_S3_PREFIX") {
         let (bucket, prefix) = parse_uri_prefix(&s3_prefix, "s3://")?;
-        let region = std::env::var("AWS_REGION")
-            .or_else(|_| std::env::var("WALG_S3_REGION"))
-            .unwrap_or_else(|_| "us-east-1".into());
-        let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-            .or_else(|_| std::env::var("AWS_ACCESS_KEY"))
-            .map_err(|_| anyhow!("AWS_ACCESS_KEY_ID not set"))?;
-        let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-            .or_else(|_| std::env::var("AWS_SECRET_KEY"))
-            .map_err(|_| anyhow!("AWS_SECRET_ACCESS_KEY not set"))?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        let endpoint = std::env::var("AWS_ENDPOINT_URL")
-            .or_else(|_| std::env::var("WALG_S3_ENDPOINT"))
-            .ok();
-        let force_path_style = parse_env_bool("WALG_S3_FORCE_PATH_STYLE", endpoint.is_some())?;
-        return Ok(StorageSettings::S3(s3::S3Config {
-            bucket,
-            prefix,
-            region,
-            access_key,
-            secret_key,
-            session_token,
-            endpoint,
-            force_path_style,
-        }));
+        return Ok(StorageSettings::S3(s3_config_from_env(
+            bucket, prefix, None,
+        )?));
     }
     if let Ok(gs_prefix) = std::env::var("WALG_GS_PREFIX") {
         let (bucket, prefix) = parse_uri_prefix(&gs_prefix, "gs://")?;
@@ -506,6 +525,39 @@ mod tests {
         assert_eq!(b, "bucket");
         assert_eq!(p, "some/prefix");
         assert!(parse_uri_prefix("s3:///prefix", "s3://").is_err());
+    }
+
+    #[test]
+    fn s3_dst_from_non_s3_src_honors_walg_aliases() {
+        // file://->s3:// copy: no S3 source to inherit, so credential fields
+        // come from env. Must read the same aliases as detect_storage, not just
+        // the bare AWS_* names
+        let vars = [
+            ("AWS_REGION", None),
+            ("WALG_S3_REGION", Some("eu-west-2")),
+            ("AWS_ACCESS_KEY_ID", None),
+            ("AWS_ACCESS_KEY", Some("AKIA_ALIAS")),
+            ("AWS_SECRET_ACCESS_KEY", None),
+            ("AWS_SECRET_KEY", Some("secret_alias")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_ENDPOINT_URL", None),
+            ("WALG_S3_ENDPOINT", Some("http://minio:9000")),
+            ("WALG_S3_FORCE_PATH_STYLE", Some("true")),
+        ];
+        let _g = EnvGuard::new(&vars);
+        let src = StorageSettings::Fs { path: "/x".into() };
+        match storage_from_uri("s3://bkt/pre/fix", &src).unwrap() {
+            StorageSettings::S3(c) => {
+                assert_eq!(c.bucket, "bkt");
+                assert_eq!(c.prefix, "pre/fix");
+                assert_eq!(c.region, "eu-west-2");
+                assert_eq!(c.access_key, "AKIA_ALIAS");
+                assert_eq!(c.secret_key, "secret_alias");
+                assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
+                assert!(c.force_path_style);
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
     }
 
     #[test]

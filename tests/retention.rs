@@ -7,15 +7,12 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use pgwalrs::compression::Method;
 use pgwalrs::config::{Settings, StorageSettings};
 use pgwalrs::pg::backup::copy as copy_mod;
 use pgwalrs::pg::backup::delete::{
     self, DeleteModifier, DeleteOp, GarbageScope, try_extract_timeline_seg_no,
 };
-use pgwalrs::pg::backup::{
-    BackupSentinelDto, BackupSentinelDtoV2, METADATA_DATETIME_FORMAT, sentinel_key, tar_part_key,
-};
+use pgwalrs::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, sentinel_key, tar_part_key};
 use pgwalrs::storage::Storage;
 use pgwalrs::storage::fs::FsStorage;
 
@@ -24,18 +21,9 @@ fn test_settings() -> Settings {
         storage: StorageSettings::Fs {
             path: "/tmp".into(),
         },
-        compression: Method::Zstd,
-        compression_level: 3,
         upload_concurrency: 2,
-        upload_queue: 1,
         download_concurrency: 2,
-        prevent_wal_overwrite: false,
-        use_wal_delta: false,
-        retry: pgwalrs::retry::RetryPolicy::default(),
-        network_rate_limit: 0,
-        disk_rate_limit: 0,
-        delta: Default::default(),
-        crypter: None,
+        ..Default::default()
     }
 }
 
@@ -47,30 +35,18 @@ fn make_sentinel(start_lsn: u64, is_permanent: bool) -> BackupSentinelDtoV2 {
     BackupSentinelDtoV2 {
         sentinel: BackupSentinelDto {
             backup_start_lsn: Some(start_lsn),
-            increment_from_lsn: None,
-            increment_from: None,
-            increment_full_name: None,
-            increment_count: None,
-            increment_format: Default::default(),
             pg_version: 160003,
             backup_finish_lsn: Some(start_lsn + seg_size()),
             system_identifier: Some(7000000000000000000),
             uncompressed_size: 1024,
             compressed_size: 512,
-            data_catalog_size: 0,
-            user_data: None,
             files_metadata_disabled: true,
-            tablespace_spec: None,
-            backup_start_chkp_num: Some(0),
-            increment_from_chkp_num: None,
+            ..Default::default()
         },
-        version: 2,
-        start_time: Utc::now(),
-        finish_time: Utc::now(),
-        date_fmt: METADATA_DATETIME_FORMAT.into(),
         hostname: "testhost".into(),
         data_dir: "/var/lib/postgres/data".into(),
         is_permanent,
+        ..Default::default()
     }
 }
 

@@ -83,15 +83,7 @@ impl S3Storage {
     }
 
     fn full_key(&self, key: &str) -> String {
-        if self.cfg.prefix.is_empty() {
-            key.to_string()
-        } else {
-            format!(
-                "{}/{}",
-                self.cfg.prefix.trim_end_matches('/'),
-                key.trim_start_matches('/')
-            )
-        }
+        super::join_prefix_key(&self.cfg.prefix, key)
     }
 
     /// Server-side copy identity: same endpoint/region + same credential.

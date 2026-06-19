@@ -180,6 +180,26 @@ impl ReplicationConn {
         Ok(rows)
     }
 
+    /// Collect the current result set's `DataRow`s as text columns, consuming
+    /// up to and including the terminating `CommandComplete`. Unlike
+    /// [`query_rows`](Self::query_rows) it neither sends a query nor waits for
+    /// `ReadyForQuery`, so it suits replication commands like `BASE_BACKUP`
+    /// that emit several result sets interleaved with CopyOut streams. NULL
+    /// columns map to `None`
+    pub async fn collect_command_rows(&mut self) -> Result<Vec<Vec<Option<String>>>> {
+        let mut rows = Vec::new();
+        loop {
+            match self.recv_message().await? {
+                Message::RowDescription(_) => {}
+                Message::DataRow(row) => rows.push(data_row_text(&row)?),
+                Message::CommandComplete(_) => break,
+                Message::ErrorResponse(e) => bail!("result set: {}", error_message(&e)),
+                m => bail!("result set: unexpected message {:?}", message_kind(&m)),
+            }
+        }
+        Ok(rows)
+    }
+
     /// `CREATE_REPLICATION_SLOT <name> PHYSICAL`. A pre-existing slot
     /// (`duplicate_object`, 42710) is treated as success so a restart after a
     /// crash between the existence check and creation is idempotent
