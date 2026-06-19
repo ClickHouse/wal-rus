@@ -118,3 +118,77 @@ fn print_plain(backups: &[BackupSummary]) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pg::backup::test_fixtures::{fs_store, put_bytes, put_sentinel};
+    use crate::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, sentinel_key};
+    use chrono::{TimeZone, Utc};
+
+    fn sentinel(host: &str, ts: i64, perm: bool) -> BackupSentinelDtoV2 {
+        BackupSentinelDtoV2 {
+            sentinel: BackupSentinelDto {
+                backup_start_lsn: Some(0x0200_0000),
+                backup_finish_lsn: Some(0x0200_1000),
+                pg_version: 160003,
+                uncompressed_size: 2048,
+                compressed_size: 1024,
+                ..Default::default()
+            },
+            hostname: host.into(),
+            is_permanent: perm,
+            start_time: Utc.timestamp_opt(ts, 0).unwrap(),
+            finish_time: Utc.timestamp_opt(ts + 60, 0).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_reads_sorts_and_skips_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_sentinel(
+            &s,
+            "base_000000010000000000000005",
+            &sentinel("hostB", 2000, false),
+        )
+        .await;
+        put_sentinel(
+            &s,
+            "base_000000010000000000000003",
+            &sentinel("hostA", 1000, true),
+        )
+        .await;
+        // corrupt sentinel: discovered by suffix, fetched as a fallback summary
+        put_bytes(
+            &s,
+            &sentinel_key("base_000000010000000000000007"),
+            b"not json".to_vec(),
+        )
+        .await;
+
+        let backups = collect(s.clone()).await.unwrap();
+        assert_eq!(backups.len(), 3);
+
+        let a = backups
+            .iter()
+            .find(|b| b.name.ends_with("00000003"))
+            .unwrap();
+        assert_eq!(a.hostname.as_deref(), Some("hostA"));
+        assert!(a.is_permanent);
+        assert_eq!(a.pg_version, 160003);
+        assert_eq!(a.compressed_size, 1024);
+
+        let corrupt = backups
+            .iter()
+            .find(|b| b.name.ends_with("00000007"))
+            .unwrap();
+        assert_eq!(corrupt.pg_version, 0, "corrupt sentinel -> fallback");
+        assert!(corrupt.hostname.is_none());
+
+        // both output formats render without error
+        handle(s.clone(), Format::Plain).await.unwrap();
+        handle(s, Format::Json).await.unwrap();
+    }
+}

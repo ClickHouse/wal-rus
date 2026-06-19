@@ -190,3 +190,69 @@ fn print_plain(name: &str, s: &BackupSentinelDtoV2, files: Option<&FilesMetadata
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pg::backup::test_fixtures::{fs_store, put_files_metadata, put_sentinel};
+    use crate::pg::backup::{BackupSentinelDto, FileDescription, LATEST, TablespaceSpec};
+
+    const NAME: &str = "base_000000010000000000000002";
+
+    fn sentinel() -> BackupSentinelDtoV2 {
+        BackupSentinelDtoV2 {
+            sentinel: BackupSentinelDto {
+                backup_start_lsn: Some(0x0200_0000),
+                backup_finish_lsn: Some(0x0200_1000),
+                pg_version: 160003,
+                system_identifier: Some(7_000_000_000_000_000_000),
+                uncompressed_size: 2048,
+                compressed_size: 1024,
+                ..Default::default()
+            },
+            hostname: "host".into(),
+            data_dir: "/data".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn show_with_files_metadata_and_tablespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        let mut sent = sentinel();
+        let mut spec = TablespaceSpec::new("/var/lib/pg/16/main");
+        spec.add(16384, "/srv/ts_a");
+        sent.sentinel.tablespace_spec = Some(spec);
+        put_sentinel(&s, NAME, &sent).await;
+
+        let mut fm = FilesMetadataDto::default();
+        fm.files.insert("base/1".into(), FileDescription::default());
+        fm.tar_file_sets
+            .insert("part_001.tar".into(), vec!["base/1".into()]);
+        put_files_metadata(&s, NAME, &fm).await;
+
+        // plain + json branches; plain hits the files + tablespace formatting
+        show(s.clone(), NAME, Format::Plain).await.unwrap();
+        show(s.clone(), NAME, Format::Json).await.unwrap();
+        // LATEST resolves the single backup by mtime
+        show(s, LATEST, Format::Plain).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn show_files_metadata_disabled_then_missing() {
+        // FilesMetadataDisabled -> "disabled", no sidecar fetch attempted
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        let mut sent = sentinel();
+        sent.sentinel.files_metadata_disabled = true;
+        put_sentinel(&s, NAME, &sent).await;
+        show(s, NAME, Format::Plain).await.unwrap();
+
+        // not disabled, no sidecar present -> "missing" (warn path)
+        let dir = tempfile::tempdir().unwrap();
+        let s = fs_store(dir.path());
+        put_sentinel(&s, NAME, &sentinel()).await;
+        show(s, NAME, Format::Plain).await.unwrap();
+    }
+}

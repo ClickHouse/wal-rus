@@ -1051,4 +1051,145 @@ mod tests {
         assert!(names.contains("base_d3"));
         assert!(!names.contains("base_full"));
     }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn modifier_args_parse_all_shapes() {
+        assert_eq!(
+            parse_modifier_args(&args(&["5"])).unwrap(),
+            (DeleteModifier::None, "5".into())
+        );
+        assert_eq!(
+            parse_modifier_args(&args(&["FULL", "5"])).unwrap(),
+            (DeleteModifier::Full, "5".into())
+        );
+        assert_eq!(
+            parse_modifier_args(&args(&["FIND_FULL", "5"])).unwrap(),
+            (DeleteModifier::FindFull, "5".into())
+        );
+        assert!(parse_modifier_args(&args(&[])).is_err());
+        assert!(parse_modifier_args(&args(&["BOGUS", "5"])).is_err());
+        assert!(parse_modifier_args(&args(&["FULL", "5", "x"])).is_err());
+    }
+
+    #[test]
+    fn everything_force_parses() {
+        assert!(!parse_everything_force(&args(&[])).unwrap());
+        assert!(parse_everything_force(&args(&["FORCE"])).unwrap());
+        assert!(parse_everything_force(&args(&["NOPE"])).is_err());
+        assert!(parse_everything_force(&args(&["FORCE", "x"])).is_err());
+    }
+
+    #[test]
+    fn garbage_scope_parses() {
+        assert_eq!(parse_garbage_scope(&args(&[])).unwrap(), GarbageScope::All);
+        assert_eq!(
+            parse_garbage_scope(&args(&["ARCHIVES"])).unwrap(),
+            GarbageScope::Archives
+        );
+        assert_eq!(
+            parse_garbage_scope(&args(&["BACKUPS"])).unwrap(),
+            GarbageScope::Backups
+        );
+        assert!(parse_garbage_scope(&args(&["WHAT"])).is_err());
+        assert!(parse_garbage_scope(&args(&["ARCHIVES", "x"])).is_err());
+    }
+
+    fn empty_store() -> (tempfile::TempDir, DynStorage) {
+        let dir = tempfile::tempdir().unwrap();
+        let s: DynStorage =
+            std::sync::Arc::new(crate::storage::fs::FsStorage::new(dir.path()).unwrap());
+        (dir, s)
+    }
+
+    #[tokio::test]
+    async fn plan_before_no_match_returns_empty() {
+        let (_d, storage) = empty_store();
+        let backups = vec![make_record(
+            "base_000000010000000000000005",
+            1,
+            5,
+            true,
+            false,
+        )];
+        let plan = plan_before(&storage, &backups, "base_zzz", DeleteModifier::None)
+            .await
+            .unwrap();
+        assert!(plan.objects.is_empty());
+        assert!(plan.target.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_retain_zero_errors_and_overshoot_is_empty() {
+        let (_d, storage) = empty_store();
+        let backups = vec![make_record("base_1", 1, 1, true, false)];
+        assert!(
+            plan_retain(&storage, &backups, 0, DeleteModifier::None, None)
+                .await
+                .is_err()
+        );
+        // retaining more than exist resolves no target -> empty plan
+        let plan = plan_retain(&storage, &backups, 5, DeleteModifier::None, None)
+            .await
+            .unwrap();
+        assert!(plan.objects.is_empty());
+        assert!(plan.target.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_garbage_all_permanent_returns_empty() {
+        let (_d, storage) = empty_store();
+        let backups = vec![make_record("base_1", 1, 1, true, true)];
+        let plan = plan_garbage(&storage, &backups, GarbageScope::All)
+            .await
+            .unwrap();
+        assert!(plan.objects.is_empty());
+        assert!(plan.target.is_none());
+        assert_eq!(plan.kept_permanent_backups, vec!["base_1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn plan_everything_force_gate() {
+        let (_d, storage) = empty_store();
+        let backups = vec![make_record("base_1", 1, 1, true, true)];
+        assert!(
+            plan_everything(&storage, &backups, false).await.is_err(),
+            "must refuse permanent without FORCE"
+        );
+        let plan = plan_everything(&storage, &backups, true).await.unwrap();
+        assert!(plan.objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_target_latest_selects_newest() {
+        let (_d, storage) = empty_store();
+        let backups = vec![
+            make_record("base_000000010000000000000001", 1, 1, true, false),
+            make_record("base_000000010000000000000007", 1, 7, true, false),
+        ];
+        let plan = plan_target(&storage, &backups, LATEST, DeleteModifier::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.target.as_deref(),
+            Some("base_000000010000000000000007")
+        );
+        assert!(plan.objects.is_empty());
+
+        // FULL modifier is rejected for target
+        assert!(
+            plan_target(&storage, &backups, LATEST, DeleteModifier::Full)
+                .await
+                .is_err()
+        );
+        // unknown name errors
+        assert!(
+            plan_target(&storage, &backups, "base_nope", DeleteModifier::None)
+                .await
+                .is_err()
+        );
+    }
 }

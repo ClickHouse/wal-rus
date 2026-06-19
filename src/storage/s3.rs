@@ -991,4 +991,200 @@ mod tests {
             )
         );
     }
+
+    /// Full roundtrip against an in-process mock speaking minimal S3 REST,
+    /// reached via the path-style endpoint override. Drives every network op
+    /// (single PUT, multipart, get, exists, list pagination, delete, copy)
+    /// so the signer + request plumbing actually execute; the mock accepts
+    /// the signature blindly.
+    #[tokio::test]
+    async fn s3_roundtrip_through_mock() {
+        use crate::storage::test_http::{
+            Req, Resp, drain_keys, payload, pct_decode, read_all, reader, serve,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        type Objects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+        type Uploads = Arc<Mutex<BTreeMap<String, BTreeMap<u32, Vec<u8>>>>>;
+
+        let objects: Objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let uploads: Uploads = Arc::new(Mutex::new(BTreeMap::new()));
+        let upload_seq = Arc::new(AtomicU32::new(0));
+
+        let (o, u, seq) = (objects.clone(), uploads.clone(), upload_seq.clone());
+        let base = serve(move |req: &Req| {
+            let rest = req.path.trim_start_matches('/');
+            let key = rest.split_once('/').map(|(_, k)| k).unwrap_or("");
+            match req.method.as_str() {
+                "PUT" if req.has_query("partNumber") && req.has_query("uploadId") => {
+                    let part: u32 = req.query("partNumber").unwrap().parse().unwrap();
+                    // transient on the 2nd part for "boom" keys -> exercises abort
+                    if key.contains("boom") && part >= 2 {
+                        return Resp::new(503).body(b"<Error/>".to_vec());
+                    }
+                    let id = req.query("uploadId").unwrap().to_string();
+                    u.lock()
+                        .unwrap()
+                        .entry(id)
+                        .or_default()
+                        .insert(part, req.body.clone());
+                    Resp::new(200).header("etag", &format!("\"etag-{part}\""))
+                }
+                "PUT" if req.headers.contains_key("x-amz-copy-source") => {
+                    let hdr = req.headers.get("x-amz-copy-source").unwrap();
+                    let src_key =
+                        pct_decode(hdr.trim_start_matches('/').split_once('/').map_or("", |(_, k)| k));
+                    let mut objs = o.lock().unwrap();
+                    match objs.get(&src_key).cloned() {
+                        Some(bytes) => {
+                            objs.insert(key.to_string(), bytes);
+                            Resp::new(200)
+                                .body(b"<CopyObjectResult><ETag>e</ETag></CopyObjectResult>".to_vec())
+                        }
+                        None => Resp::new(404).body(b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                    }
+                }
+                "PUT" => {
+                    o.lock().unwrap().insert(key.to_string(), req.body.clone());
+                    Resp::new(200)
+                }
+                "POST" if req.has_query("uploads") => {
+                    let n = seq.fetch_add(1, Ordering::SeqCst);
+                    let id = format!("upload-{n}");
+                    u.lock().unwrap().insert(id.clone(), BTreeMap::new());
+                    Resp::new(200).body(
+                        format!(
+                            "<InitiateMultipartUploadResult><UploadId>{id}</UploadId></InitiateMultipartUploadResult>"
+                        )
+                        .into_bytes(),
+                    )
+                }
+                "POST" if req.has_query("uploadId") => {
+                    let parts = u
+                        .lock()
+                        .unwrap()
+                        .remove(req.query("uploadId").unwrap())
+                        .unwrap_or_default();
+                    let buf: Vec<u8> = parts.into_values().flatten().collect();
+                    o.lock().unwrap().insert(key.to_string(), buf);
+                    Resp::new(200).body(b"<CompleteMultipartUploadResult/>".to_vec())
+                }
+                "GET" if key.is_empty() || req.has_query("list-type") => {
+                    let prefix = req.query("prefix").unwrap_or("");
+                    let start: usize = req
+                        .query("continuation-token")
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(0);
+                    let objs = o.lock().unwrap();
+                    let matching: Vec<(String, usize)> = objs
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(prefix))
+                        .map(|(k, v)| (k.clone(), v.len()))
+                        .collect();
+                    const PAGE: usize = 2;
+                    let end = (start + PAGE).min(matching.len());
+                    let truncated = end < matching.len();
+                    let mut xml = String::from("<ListBucketResult>");
+                    xml.push_str(if truncated {
+                        "<IsTruncated>true</IsTruncated>"
+                    } else {
+                        "<IsTruncated>false</IsTruncated>"
+                    });
+                    if truncated {
+                        xml.push_str(&format!("<NextContinuationToken>{end}</NextContinuationToken>"));
+                    }
+                    for (k, len) in &matching[start..end] {
+                        xml.push_str(&format!(
+                            "<Contents><Key>{k}</Key><Size>{len}</Size>\
+                             <LastModified>2026-01-01T00:00:00Z</LastModified></Contents>"
+                        ));
+                    }
+                    xml.push_str("</ListBucketResult>");
+                    Resp::new(200).body(xml.into_bytes())
+                }
+                "GET" => match o.lock().unwrap().get(key) {
+                    Some(b) => Resp::new(200).body(b.clone()),
+                    None => Resp::new(404).body(b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                },
+                "HEAD" => {
+                    if o.lock().unwrap().contains_key(key) {
+                        Resp::new(200)
+                    } else {
+                        Resp::new(404)
+                    }
+                }
+                "DELETE" if req.has_query("uploadId") => {
+                    u.lock().unwrap().remove(req.query("uploadId").unwrap());
+                    Resp::new(204)
+                }
+                "DELETE" => {
+                    o.lock().unwrap().remove(key);
+                    Resp::new(204)
+                }
+                _ => Resp::new(400),
+            }
+        })
+        .await;
+
+        let cfg = S3Config {
+            bucket: "bkt".into(),
+            prefix: "p".into(),
+            region: "us-east-1".into(),
+            access_key: "AKID".into(),
+            secret_key: "sek".into(),
+            session_token: None,
+            endpoint: Some(base),
+            force_path_style: true,
+        };
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
+        };
+        let s = S3Storage::with_retry_policy(cfg, policy).unwrap();
+
+        // single PUT (known small size), get, exists, missing
+        s.put("a.zst", reader(b"hello"), Some(5)).await.unwrap();
+        assert_eq!(read_all(s.get("a.zst").await.unwrap()).await, b"hello");
+        assert!(s.exists("a.zst").await.unwrap());
+        assert!(!s.exists("nope").await.unwrap());
+        assert!(matches!(
+            s.get("nope").await,
+            Err(StorageError::NotFound(_))
+        ));
+
+        // unknown-size small body buffers to a single PUT
+        s.put("b.zst", reader(b"world!!"), None).await.unwrap();
+        s.put("c.zst", reader(b"three"), Some(5)).await.unwrap();
+
+        // list walks the continuation token (PAGE=2 over 3 objects)
+        let mut keys = drain_keys(&s, "").await;
+        keys.sort();
+        assert_eq!(keys, ["a.zst", "b.zst", "c.zst"]);
+
+        // server-side copy (matching backend id)
+        let src = s.copy_source("b.zst").unwrap();
+        s.copy_within(&src, "d.zst").await.unwrap();
+        assert_eq!(read_all(s.get("d.zst").await.unwrap()).await, b"world!!");
+
+        s.delete("a.zst").await.unwrap();
+        assert!(!s.exists("a.zst").await.unwrap());
+
+        // multipart: size_hint over the 32 MiB threshold walks the part loop
+        let big = payload(33 * 1024 * 1024);
+        s.put("big.zst", reader(&big), Some(big.len() as u64))
+            .await
+            .unwrap();
+        assert_eq!(read_all(s.get("big.zst").await.unwrap()).await, big);
+
+        // transient part failure -> abort_multipart, surfaced error
+        let err = s
+            .put("boom.zst", reader(&big), Some(big.len() as u64))
+            .await;
+        assert!(matches!(err, Err(StorageError::Http { status: 503, .. })));
+        assert!(uploads.lock().unwrap().is_empty(), "abort must clean up");
+    }
 }
