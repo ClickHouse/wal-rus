@@ -107,6 +107,74 @@ fn dispatch_inspect_and_retention_subcommands() {
 }
 
 #[test]
+fn dispatch_wal_and_copy_subcommands() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let run = |args: &[&str]| {
+        wal_rs()
+            .env("WALG_FILE_PREFIX", &store)
+            .args(args)
+            .status()
+            .unwrap()
+    };
+
+    // wal-push a full-size segment, then wal-fetch it back byte-for-byte
+    let stage = dir.path().join("stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    let seg = "000000010000000000000005";
+    let seg_path = stage.join(seg);
+    std::fs::write(&seg_path, vec![0x5au8; 16 * 1024 * 1024]).unwrap();
+    assert!(
+        run(&["wal-push", seg_path.to_str().unwrap()]).success(),
+        "wal-push"
+    );
+
+    let fetched = dir.path().join("fetched");
+    assert!(
+        run(&["wal-fetch", seg, fetched.to_str().unwrap()]).success(),
+        "wal-fetch"
+    );
+    assert_eq!(std::fs::read(&fetched).unwrap().len(), 16 * 1024 * 1024);
+
+    // wal-prefetch walks forward from a seed, staging what exists
+    let pg_wal = dir.path().join("pg_wal");
+    std::fs::create_dir_all(&pg_wal).unwrap();
+    assert!(
+        run(&[
+            "wal-prefetch",
+            "000000010000000000000004",
+            pg_wal.to_str().unwrap(),
+            "--count",
+            "2",
+        ])
+        .success(),
+        "wal-prefetch"
+    );
+
+    // wal-restore fills gaps into a local dir
+    let restore = dir.path().join("wal_restore");
+    std::fs::create_dir_all(&restore).unwrap();
+    assert!(
+        run(&["wal-restore", restore.to_str().unwrap()]).success(),
+        "wal-restore"
+    );
+
+    // copy --all to a second file:// prefix (seed a backup sentinel first)
+    seed_store(&store);
+    let to = format!("file://{}", dir.path().join("copydst").display());
+    assert!(run(&["copy", "--all", "--to", &to]).success(), "copy --all");
+
+    // backup-fetch by name resolves LATEST, then fails on a sentinel-only
+    // backup (no tar parts) — exercises the name-resolution dispatch arm
+    let bf = dir.path().join("bf");
+    assert!(
+        !run(&["backup-fetch", bf.to_str().unwrap(), "LATEST"]).success(),
+        "backup-fetch LATEST should reach handle and fail without tar parts"
+    );
+}
+
+#[test]
 fn dispatch_backup_mark_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     seed_store(dir.path());

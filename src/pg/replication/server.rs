@@ -808,4 +808,248 @@ mod tests {
         assert_eq!(parsed.flush_lsn, 0x08);
         assert_eq!(parsed.apply_lsn, 0x04);
     }
+
+    #[test]
+    fn decode_standby_status_rejects_bad_input() {
+        // Wrong leading tag, even at the right length
+        assert!(decode_standby_status(&[b'x'; 1 + 8 * 4 + 1]).is_none());
+        // Right tag but truncated
+        assert!(decode_standby_status(b"r").is_none());
+        assert!(decode_standby_status(&[]).is_none());
+    }
+
+    /// Untyped startup frame with an arbitrary protocol code + body
+    fn build_startup_raw(protocol: u32, body: &[u8]) -> Vec<u8> {
+        let len = 8 + body.len();
+        let mut buf = Vec::with_capacity(len);
+        buf.extend_from_slice(&(len as u32).to_be_bytes());
+        buf.extend_from_slice(&protocol.to_be_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_startup_negotiates_ssl_then_gssenc_then_startup() {
+        // SSLRequest -> 'N', GSSENCRequest -> 'N', then the real StartupMessage
+        let (client, server) = tokio::io::duplex(4096);
+        let client_task = tokio::spawn(async move {
+            let mut client = client;
+            let mut n = [0u8; 1];
+            client
+                .write_all(&build_startup_raw(80877103, &[]))
+                .await
+                .unwrap();
+            client.read_exact(&mut n).await.unwrap();
+            assert_eq!(n[0], b'N');
+            client
+                .write_all(&build_startup_raw(80877104, &[]))
+                .await
+                .unwrap();
+            client.read_exact(&mut n).await.unwrap();
+            assert_eq!(n[0], b'N');
+            client
+                .write_all(&build_startup_message(&[
+                    ("user", "u"),
+                    ("replication", "true"),
+                ]))
+                .await
+                .unwrap();
+        });
+        let mut server = server;
+        let params = read_startup(&mut server).await.expect("read_startup");
+        assert_eq!(params.get("user").map(String::as_str), Some("u"));
+        assert_eq!(params.get("replication").map(String::as_str), Some("true"));
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_startup_rejects_old_protocol() {
+        let (client, server) = tokio::io::duplex(256);
+        let writer = tokio::spawn(async move {
+            let mut client = client;
+            // protocol 2.0 — unsupported
+            client
+                .write_all(&build_startup_raw(0x0002_0000, b"user\0u\0\0"))
+                .await
+                .unwrap();
+        });
+        let mut server = server;
+        let err = read_startup(&mut server).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported protocol version"),
+            "{err}"
+        );
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_startup_rejects_short_length() {
+        let (client, server) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            let mut client = client;
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&4u32.to_be_bytes()); // length < 8
+            buf.extend_from_slice(&196608u32.to_be_bytes());
+            client.write_all(&buf).await.unwrap();
+        });
+        let mut server = server;
+        let err = read_startup(&mut server).await.unwrap_err();
+        assert!(format!("{err}").contains("too short"), "{err}");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_startup_rejects_unterminated_key_and_value() {
+        for (body, needle) in [
+            (&b"keynoterminator"[..], "key not null-terminated"),
+            (&b"user\0valnoterminator"[..], "value not null-terminated"),
+        ] {
+            let (client, server) = tokio::io::duplex(256);
+            let raw = build_startup_raw(196608, body);
+            let writer = tokio::spawn(async move {
+                let mut client = client;
+                client.write_all(&raw).await.unwrap();
+            });
+            let mut server = server;
+            let err = read_startup(&mut server).await.unwrap_err();
+            assert!(format!("{err}").contains(needle), "{err}");
+            writer.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn parse_simple_query_arms() {
+        assert_eq!(
+            parse_simple_query(b"IDENTIFY_SYSTEM\0").unwrap(),
+            "IDENTIFY_SYSTEM"
+        );
+        assert!(parse_simple_query(b"no-nul").is_err());
+        assert!(parse_simple_query(&[0xff, 0xfe, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_start_replication_error_arms() {
+        assert!(parse_start_replication("START_REPLICATION SLOT").is_err());
+        assert!(matches!(
+            parse_start_replication("START_REPLICATION LOGICAL 0/0"),
+            Err(ServerError::Unsupported(_))
+        ));
+        assert!(parse_start_replication("START_REPLICATION PHYSICAL").is_err());
+        assert!(parse_start_replication("START_REPLICATION PHYSICAL notanlsn").is_err());
+        assert!(parse_start_replication("START_REPLICATION PHYSICAL 0/0 TIMELINE").is_err());
+        assert!(parse_start_replication("START_REPLICATION PHYSICAL 0/0 TIMELINE xx").is_err());
+    }
+
+    #[test]
+    fn parse_one_copy_data_arms() {
+        // incomplete header -> None
+        let mut rx = BytesMut::from(&[b'd', 0, 0][..]);
+        assert!(parse_one_copy_data(&mut rx).unwrap().is_none());
+        // declared length < 4 -> error
+        let mut rx = BytesMut::from(&[b'd', 0, 0, 0, 3][..]);
+        assert!(parse_one_copy_data(&mut rx).is_err());
+        // header present but body short -> None (await more)
+        let mut rx = BytesMut::from(&[b'd', 0, 0, 0, 8, 1, 2][..]);
+        assert!(parse_one_copy_data(&mut rx).unwrap().is_none());
+        // complete 'd' frame -> body without the envelope
+        let mut rx = BytesMut::from(&[b'd', 0, 0, 0, 8, 1, 2, 3, 4][..]);
+        let body = parse_one_copy_data(&mut rx).unwrap().unwrap();
+        assert_eq!(&body[..], &[1, 2, 3, 4]);
+        // control tags surface as protocol errors
+        for tag in [b'c', b'f', b'X', b'q'] {
+            let mut rx = BytesMut::from(&[tag, 0, 0, 0, 4][..]);
+            assert!(parse_one_copy_data(&mut rx).is_err(), "tag {}", tag as char);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn walsender_conn_write_paths() {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut conn = WalSenderConn::new(server);
+        // empty inputs are no-ops
+        conn.write_raw(&[]).await.unwrap();
+        conn.write_framed(&[]).await.unwrap();
+        conn.enqueue_raw(&[]);
+        conn.flush().await.unwrap();
+        // stage a raw payload (gets the 'd' envelope) then a pre-framed frame
+        conn.enqueue_raw(&[1, 2, 3]);
+        let mut framed = Vec::new();
+        framed.extend_from_slice(b"d");
+        framed.extend_from_slice(&6u32.to_be_bytes());
+        framed.extend_from_slice(&[9, 9]);
+        conn.enqueue_framed(&framed);
+        conn.flush().await.unwrap();
+
+        let mut client = client;
+        let mut buf = [0u8; 15];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], b'd');
+        assert_eq!(u32::from_be_bytes(buf[1..5].try_into().unwrap()), 7);
+        assert_eq!(&buf[5..8], &[1, 2, 3]);
+        assert_eq!(buf[8], b'd');
+        assert_eq!(u32::from_be_bytes(buf[9..13].try_into().unwrap()), 6);
+        assert_eq!(&buf[13..15], &[9, 9]);
+
+        let _sock = conn.into_inner();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn walsender_conn_recv_clean_close() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(client);
+        let mut conn = WalSenderConn::new(server);
+        assert!(conn.try_recv_frame().await.unwrap().is_none());
+    }
+
+    async fn run_dispatch(
+        query: &str,
+        identity: &Identity,
+    ) -> (Result<Option<StartReplication>, ServerError>, Vec<u8>) {
+        let (client, mut server) = tokio::io::duplex(8192);
+        let mut tx = BytesMut::new();
+        let res = dispatch_query(&mut server, &mut tx, query, identity).await;
+        drop(server); // close the write half so read_to_end terminates
+        let mut client = client;
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        (res, buf)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_query_arms() {
+        let identity = Identity {
+            system_id: "7340000000000000000".into(),
+            timeline: 1,
+            xlogpos: 0x10,
+            dbname: Some("db".into()),
+        };
+
+        let (res, buf) = run_dispatch("IDENTIFY_SYSTEM", &identity).await;
+        assert!(matches!(res, Ok(None)));
+        assert_eq!(buf[0], b'T'); // RowDescription first
+
+        let (res, buf) = run_dispatch("TIMELINE_HISTORY 1", &identity).await;
+        assert!(matches!(res, Ok(None)));
+        assert_eq!(buf[0], b'T');
+        assert!(
+            buf.windows(b"00000001.history".len())
+                .any(|w| w == b"00000001.history"),
+            "timeline history filename missing"
+        );
+
+        let (res, buf) = run_dispatch("START_REPLICATION PHYSICAL 0/0", &identity).await;
+        let start = res.unwrap().expect("START_REPLICATION yields start");
+        assert_eq!(start.start_lsn, 0);
+        assert_eq!(buf[0], b'W'); // CopyBothResponse
+
+        for q in ["SHOW data_directory_mode", "BEGIN", "END"] {
+            let (res, buf) = run_dispatch(q, &identity).await;
+            assert!(matches!(res, Ok(None)), "{q}");
+            assert_eq!(buf[0], b'I', "{q} should emit EmptyQueryResponse");
+        }
+
+        let (res, buf) = run_dispatch("VACUUM", &identity).await;
+        assert!(matches!(res, Err(ServerError::Unsupported(_))));
+        assert_eq!(buf[0], b'E'); // ErrorResponse
+    }
 }

@@ -57,3 +57,100 @@ pub fn spawn_watchdog() {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixDatagram;
+    use std::sync::Mutex;
+
+    // notify / spawn_watchdog read NOTIFY_SOCKET / WATCHDOG_USEC from the
+    // process env; serialize every test that mutates them
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_env(k: &str, v: Option<&str>) {
+        unsafe {
+            match v {
+                Some(x) => std::env::set_var(k, x),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn notify_without_socket_is_noop() {
+        let _g = lock_env();
+        set_env("NOTIFY_SOCKET", None);
+        notify("READY=1"); // absent NOTIFY_SOCKET: returns without sending
+    }
+
+    #[test]
+    fn notify_sends_datagram_to_path_socket() {
+        let _g = lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let server = UnixDatagram::bind(&path).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        set_env("NOTIFY_SOCKET", Some(path.to_str().unwrap()));
+        notify("READY=1");
+        set_env("NOTIFY_SOCKET", None);
+
+        let mut buf = [0u8; 64];
+        let n = server.recv(&mut buf).expect("READY datagram");
+        assert_eq!(&buf[..n], b"READY=1");
+    }
+
+    #[test]
+    fn send_reaches_abstract_namespace_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::SocketAddr;
+        let name = format!("walrs-sd-test-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let server = UnixDatagram::bind_addr(&addr).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // systemd encodes abstract sockets with a leading '@'
+        send(&std::ffi::OsString::from(format!("@{name}")), "WATCHDOG=1").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = server.recv(&mut buf).expect("abstract-namespace datagram");
+        assert_eq!(&buf[..n], b"WATCHDOG=1");
+    }
+
+    #[test]
+    fn watchdog_without_usec_is_noop() {
+        let _g = lock_env();
+        set_env("WATCHDOG_USEC", None);
+        // No runtime needed: must return before spawning anything
+        spawn_watchdog();
+    }
+
+    // multi-thread so the spawned pinger runs while the test blocks on recv
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_pings_when_enabled() {
+        let _g = lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wd.sock");
+        let server = UnixDatagram::bind(&path).unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        set_env("NOTIFY_SOCKET", Some(path.to_str().unwrap()));
+        set_env("WATCHDOG_USEC", Some("1000000")); // 1s → first tick fires immediately
+        spawn_watchdog();
+
+        let mut buf = [0u8; 64];
+        let n = server.recv(&mut buf).expect("watchdog ping");
+        assert_eq!(&buf[..n], b"WATCHDOG=1");
+
+        set_env("WATCHDOG_USEC", None);
+        set_env("NOTIFY_SOCKET", None);
+    }
+}

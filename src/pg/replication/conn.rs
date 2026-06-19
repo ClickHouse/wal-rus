@@ -637,4 +637,278 @@ mod tests {
             "expected unix-socket context, got: {s}"
         );
     }
+
+    // ── Auth handshakes against a scripted backend peer ───────────────────────
+    //
+    // `from_test_socket` skips startup (already sent by `connect_with`), so
+    // `do_auth` is driven directly: the peer emits the Authentication* messages
+    // a real PG backend would, and we assert the client's reply + outcome.
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// `'R'` Authentication message: u32 subtype `code` + `extra` payload
+    fn auth_msg(code: i32, extra: &[u8]) -> Vec<u8> {
+        let mut v = vec![b'R'];
+        v.extend_from_slice(&((8 + extra.len()) as u32).to_be_bytes());
+        v.extend_from_slice(&code.to_be_bytes());
+        v.extend_from_slice(extra);
+        v
+    }
+    fn auth_ok() -> Vec<u8> {
+        auth_msg(0, &[])
+    }
+    fn auth_sasl(mechs: &[&str]) -> Vec<u8> {
+        let mut extra = Vec::new();
+        for m in mechs {
+            extra.extend_from_slice(m.as_bytes());
+            extra.push(0);
+        }
+        extra.push(0); // terminating empty mechanism
+        auth_msg(10, &extra)
+    }
+
+    /// Read one typed backend-bound message (tag + length-prefixed body)
+    async fn read_typed(sock: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut hdr = [0u8; 5];
+        sock.read_exact(&mut hdr).await.unwrap();
+        let len = u32::from_be_bytes(hdr[1..5].try_into().unwrap()) as usize;
+        let mut body = vec![0u8; len - 4];
+        sock.read_exact(&mut body).await.unwrap();
+        (hdr[0], body)
+    }
+
+    fn test_cfg(password: Option<&str>) -> PgConfig {
+        PgConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            user: "u".into(),
+            password: password.map(str::to_string),
+            database: "u".into(),
+            application_name: "wal-rs-auth-test".into(),
+            sslmode: SslMode::Disable,
+        }
+    }
+
+    async fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn cleartext_password_auth_succeeds() {
+        let (client, mut server) = connected_pair().await;
+        let peer = tokio::spawn(async move {
+            server.write_all(&auth_msg(3, &[])).await.unwrap(); // AuthenticationCleartextPassword
+            let (tag, body) = read_typed(&mut server).await;
+            assert_eq!(tag, b'p');
+            assert_eq!(&body[..body.len() - 1], b"hunter2");
+            assert_eq!(*body.last().unwrap(), 0, "password is NUL-terminated");
+            server.write_all(&auth_ok()).await.unwrap();
+        });
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        conn.do_auth(&test_cfg(Some("hunter2")))
+            .await
+            .expect("auth");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleartext_password_missing_bails() {
+        let (client, mut server) = connected_pair().await;
+        // Trigger message buffers in the socket; the client reads it before the
+        // dropped `server` half delivers EOF, so no drain read is needed.
+        let peer = tokio::spawn(async move {
+            server.write_all(&auth_msg(3, &[])).await.unwrap();
+        });
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        let err = conn.do_auth(&test_cfg(None)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("password"), "{err:#}");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn md5_password_rejected() {
+        let (client, mut server) = connected_pair().await;
+        let peer = tokio::spawn(async move {
+            server.write_all(&auth_msg(5, &[1, 2, 3, 4])).await.unwrap(); // AuthenticationMD5Password
+        });
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        let err = conn.do_auth(&test_cfg(Some("pw"))).await.unwrap_err();
+        assert!(format!("{err:#}").contains("MD5"), "{err:#}");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sasl_without_scram_mechanism_bails() {
+        let (client, mut server) = connected_pair().await;
+        let peer = tokio::spawn(async move {
+            server
+                .write_all(&auth_sasl(&["SCRAM-SHA-256-PLUS"]))
+                .await
+                .unwrap();
+        });
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        let err = conn.do_auth(&test_cfg(Some("pw"))).await.unwrap_err();
+        assert!(format!("{err:#}").contains("SCRAM-SHA-256"), "{err:#}");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scram_without_password_bails() {
+        let (client, mut server) = connected_pair().await;
+        let peer = tokio::spawn(async move {
+            server
+                .write_all(&auth_sasl(&["SCRAM-SHA-256"]))
+                .await
+                .unwrap();
+        });
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        let err = conn.do_auth(&test_cfg(None)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("PGPASSWORD"), "{err:#}");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scram_sha256_full_handshake_succeeds() {
+        let (client, server) = connected_pair().await;
+        let peer = tokio::spawn(scram_backend(server, "s3cr3t".to_string()));
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        conn.do_auth(&test_cfg(Some("s3cr3t")))
+            .await
+            .expect("SCRAM auth");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scram_sha256_wrong_password_fails() {
+        let (client, server) = connected_pair().await;
+        // Backend salts/signs against "right"; client offers "wrong" — the
+        // client's own ServerSignature check (scram.finish) must reject.
+        let peer = tokio::spawn(scram_backend(server, "right".to_string()));
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        conn.do_auth(&test_cfg(Some("wrong")))
+            .await
+            .expect_err("wrong password must fail the server-signature check");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expect_copy_both_open_accepts_copy_out_response() {
+        let (client, mut server) = connected_pair().await;
+        let peer = tokio::spawn(async move {
+            // CopyOutResponse 'H': format(0) + ncols(0)
+            server
+                .write_all(&[b'H', 0, 0, 0, 7, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        conn.expect_copy_both_open()
+            .await
+            .expect("CopyOutResponse accepted");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expect_copy_both_open_surfaces_error_response() {
+        let (client, mut server) = connected_pair().await;
+        let peer = tokio::spawn(async move {
+            let body = error_fields(&[(b'S', "ERROR"), (b'C', "55000"), (b'M', "no slot")]);
+            let mut msg = vec![b'E'];
+            msg.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+            msg.extend_from_slice(&body);
+            server.write_all(&msg).await.unwrap();
+        });
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+        let err = conn.expect_copy_both_open().await.unwrap_err();
+        assert!(format!("{err:#}").contains("no slot"), "{err:#}");
+        peer.await.unwrap();
+    }
+
+    // ── Minimal SCRAM-SHA-256 server (RFC 5802) for the auth peer ─────────────
+
+    const SCRAM_ITERS: u32 = 4096;
+    const SCRAM_SALT: &[u8] = b"0123456789abcdef";
+
+    fn b64_encode(b: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let k = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
+        aws_lc_rs::hmac::sign(&k, data).as_ref().to_vec()
+    }
+
+    fn salted_password(password: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        aws_lc_rs::pbkdf2::derive(
+            aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(SCRAM_ITERS).unwrap(),
+            SCRAM_SALT,
+            password.as_bytes(),
+            &mut out,
+        );
+        out
+    }
+
+    /// client-first-message-bare = everything after the gs2 header (2nd comma)
+    fn client_first_bare(client_first: &str) -> &str {
+        let second = client_first
+            .match_indices(',')
+            .nth(1)
+            .expect("gs2 header has two commas")
+            .0;
+        &client_first[second + 1..]
+    }
+
+    /// Drive the server side of a SCRAM-SHA-256 exchange against `password`,
+    /// emitting SASLContinue (server-first), SASLFinal (server-signature), and
+    /// AuthenticationOk. The client verifies the server signature itself, so a
+    /// mismatched client password surfaces as a client-side error.
+    async fn scram_backend(mut sock: TcpStream, password: String) {
+        sock.write_all(&auth_sasl(&["SCRAM-SHA-256"]))
+            .await
+            .unwrap();
+
+        // SASLInitialResponse: mechanism NUL + i32 len + client-first-message
+        let (tag, body) = read_typed(&mut sock).await;
+        assert_eq!(tag, b'p');
+        let nul = body.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&body[..nul], b"SCRAM-SHA-256");
+        let client_first = String::from_utf8(body[nul + 5..].to_vec()).unwrap();
+        let cf_bare = client_first_bare(&client_first).to_string();
+        let cnonce = cf_bare
+            .split(',')
+            .find_map(|t| t.strip_prefix("r="))
+            .unwrap()
+            .to_string();
+
+        let combined = format!("{cnonce}serverNONCE");
+        let server_first = format!("r={combined},s={},i={SCRAM_ITERS}", b64_encode(SCRAM_SALT));
+        sock.write_all(&auth_msg(11, server_first.as_bytes()))
+            .await
+            .unwrap();
+
+        // SASLResponse: client-final-message (c=...,r=...,p=<proof>)
+        let (tag, body) = read_typed(&mut sock).await;
+        assert_eq!(tag, b'p');
+        let client_final = String::from_utf8(body).unwrap();
+        let proof_at = client_final.rfind(",p=").unwrap();
+        let client_final_no_proof = &client_final[..proof_at];
+
+        let auth_message = format!("{cf_bare},{server_first},{client_final_no_proof}");
+        let salted = salted_password(&password);
+        let server_key = hmac_sha256(&salted, b"Server Key");
+        let server_sig = hmac_sha256(&server_key, auth_message.as_bytes());
+        let server_final = format!("v={}", b64_encode(&server_sig));
+        sock.write_all(&auth_msg(12, server_final.as_bytes()))
+            .await
+            .unwrap();
+        sock.write_all(&auth_ok()).await.unwrap();
+    }
 }

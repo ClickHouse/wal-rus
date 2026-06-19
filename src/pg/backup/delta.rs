@@ -856,4 +856,95 @@ mod tests {
         assert_eq!(df2.locations[1].block_no, 0);
         assert!(df2.wal_parser.current_record_data().is_empty());
     }
+
+    #[test]
+    fn delta_map_is_empty_tracks_contents() {
+        let mut m = PagedFileDeltaMap::new();
+        assert!(m.is_empty());
+        m.add_location(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 0));
+        assert!(!m.is_empty());
+    }
+
+    async fn seed_sentinel(storage: &DynStorage, name: &str, user_data: serde_json::Value) {
+        use crate::pg::backup::{BackupSentinelDto, sentinel_key};
+        let v2 = BackupSentinelDtoV2 {
+            sentinel: BackupSentinelDto {
+                backup_start_lsn: Some(DEFAULT_WAL_SEG_SIZE),
+                backup_finish_lsn: Some(DEFAULT_WAL_SEG_SIZE + 1),
+                pg_version: 170000,
+                user_data: Some(user_data),
+                ..Default::default()
+            },
+            hostname: "h".into(),
+            data_dir: "/d".into(),
+            ..Default::default()
+        };
+        let body = serde_json::to_vec(&v2).unwrap();
+        let len = body.len() as u64;
+        let r: crate::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
+        storage
+            .put(&sentinel_key(name), r, Some(len))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn find_by_user_data_matches_sentinel() {
+        use crate::pg::backup::format_backup_name;
+        use crate::storage::fs::FsStorage;
+        let seg = DEFAULT_WAL_SEG_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let a = format_backup_name(1, seg, seg);
+        let b = format_backup_name(1, seg * 3, seg);
+        seed_sentinel(&storage, &a, serde_json::json!({"label": "alpha"})).await;
+        seed_sentinel(&storage, &b, serde_json::json!({"label": "beta"})).await;
+
+        let (name, v2) = find_by_user_data(&storage, r#"{"label":"beta"}"#)
+            .await
+            .unwrap()
+            .expect("a sentinel matches the needle");
+        assert_eq!(name, b);
+        assert_eq!(
+            v2.sentinel.user_data,
+            Some(serde_json::json!({"label": "beta"}))
+        );
+
+        // No match -> Ok(None)
+        assert!(
+            find_by_user_data(&storage, r#"{"label":"absent"}"#)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Non-JSON needle -> Err
+        assert!(find_by_user_data(&storage, "not json").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_delta_file_reads_sidecar() {
+        use crate::storage::fs::FsStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let settings = crate::config::Settings::default();
+        let method = compression::Method::None;
+
+        let mut df = DeltaFile::new(WalParser::new());
+        df.locations
+            .push(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 7));
+        let mut raw = Vec::new();
+        df.save(&mut raw).unwrap();
+
+        let group = delta_group_name(1, 0, DEFAULT_WAL_SEG_SIZE);
+        let key = delta_storage_key(&group, method);
+        let len = raw.len() as u64;
+        let r: crate::compression::AsyncReader = Box::pin(std::io::Cursor::new(raw));
+        storage.put(&key, r, Some(len)).await.unwrap();
+
+        let got = get_delta_file(&settings, &storage, &group, method)
+            .await
+            .unwrap();
+        assert_eq!(got.locations.len(), 1);
+        assert_eq!(got.locations[0].block_no, 7);
+    }
 }

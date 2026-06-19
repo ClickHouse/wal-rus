@@ -159,3 +159,67 @@ pub(crate) fn join_prefix_key(prefix: &str, key: &str) -> String {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn is_transient_classifies_each_variant() {
+        assert!(StorageError::Transport("blip".into()).is_transient());
+        for s in [408u16, 425, 429, 500, 502, 503, 599] {
+            let e = StorageError::Http {
+                status: s,
+                body: String::new(),
+            };
+            assert!(e.is_transient(), "{s} should be transient");
+        }
+        for s in [400u16, 401, 403, 404, 412] {
+            let e = StorageError::Http {
+                status: s,
+                body: String::new(),
+            };
+            assert!(!e.is_transient(), "{s} should be permanent");
+        }
+        for k in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(StorageError::Io(IoError::from(k)).is_transient(), "{k:?}");
+        }
+        assert!(!StorageError::Io(IoError::from(ErrorKind::NotFound)).is_transient());
+        assert!(!StorageError::NotFound("k".into()).is_transient());
+        assert!(!StorageError::Auth("a".into()).is_transient());
+        assert!(!StorageError::Config("c".into()).is_transient());
+        assert!(!StorageError::Unimplemented("x").is_transient());
+    }
+
+    #[test]
+    fn join_prefix_key_collapses_separators() {
+        assert_eq!(join_prefix_key("", "wal_005/x"), "wal_005/x");
+        assert_eq!(join_prefix_key("pre", "key"), "pre/key");
+        assert_eq!(join_prefix_key("pre/", "/key"), "pre/key");
+        assert_eq!(join_prefix_key("a/b/", "c"), "a/b/c");
+    }
+
+    #[tokio::test]
+    async fn reqwest_connect_error_maps_to_transport() {
+        // 127.0.0.1:1 is closed → connection refused, no HTTP status, so the
+        // conversion must land on Transport rather than Http
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.status().is_none(), "connect failure carries no status");
+        assert!(matches!(
+            StorageError::from(err),
+            StorageError::Transport(_)
+        ));
+    }
+}

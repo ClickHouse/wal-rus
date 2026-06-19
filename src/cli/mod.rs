@@ -528,6 +528,13 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[test]
+    fn increment_format_arg_maps_to_wire_format() {
+        use backup::increment::Format;
+        assert_eq!(Format::from(IncrementFormatArg::Wi1), Format::Wi1);
+        assert_eq!(Format::from(IncrementFormatArg::Native), Format::Native);
+    }
+
     fn worker_threads_of(args: &[&str]) -> usize {
         Cli::parse_from(args).worker_threads().unwrap()
     }
