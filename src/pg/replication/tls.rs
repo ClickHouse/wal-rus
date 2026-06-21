@@ -458,7 +458,7 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
     fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "wal-rs-tls-test-{name}-{:?}",
+            "walrus-tls-test-{name}-{:?}",
             std::thread::current().id()
         ));
         std::fs::write(&p, body).unwrap();

@@ -1,9 +1,9 @@
 name: pg-compat
 
 # Integration tests adapted from wal-g's docker/pg_tests test scripts. Verifies
-# wal-rs against a real PostgreSQL cluster on the fs storage backend, plus
+# walrus against a real PostgreSQL cluster on the fs storage backend, plus
 # bidirectional bucket interop with an installed wal-g binary (forward:
-# wal-rs writes & wal-g reads, reverse: wal-g writes & wal-rs reads).
+# walrus writes & wal-g reads, reverse: wal-g writes & walrus reads).
 
 on:
   push:
@@ -27,11 +27,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --bin wal-rs
+      - run: cargo build --release --locked --bin walrus
       - uses: actions/upload-artifact@v7
         with:
-          name: wal-rs-bin
-          path: target/release/wal-rs
+          name: walrus-bin
+          path: target/release/walrus
           if-no-files-found: error
           retention-days: 7
 
@@ -57,14 +57,14 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          cargo build --bin wal-rs --locked
+          cargo build --bin walrus --locked
           # show-env picks the target dir; stage under the name the lanes expect.
           mkdir -p cov-out
-          cp "${CARGO_LLVM_COV_TARGET_DIR:-target}/debug/wal-rs" cov-out/wal-rs
+          cp "${CARGO_LLVM_COV_TARGET_DIR:-target}/debug/walrus" cov-out/walrus
       - uses: actions/upload-artifact@v7
         with:
-          name: wal-rs-cov
-          path: cov-out/wal-rs
+          name: walrus-cov
+          path: cov-out/walrus
           if-no-files-found: error
           retention-days: 7
 
@@ -102,22 +102,22 @@ jobs:
       # by coverage-merge); other versions run the release binary, keeping the
       # cross-version functional gate on the shipped build. Both unpack to bin/
       # so the run step is identical.
-      - name: Fetch release wal-rs
+      - name: Fetch release walrus
         if: matrix.pg != 17
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-bin
+          name: walrus-bin
           path: bin
-      - name: Fetch instrumented wal-rs
+      - name: Fetch instrumented walrus
         if: matrix.pg == 17
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-cov
+          name: walrus-cov
           path: bin
       - name: Prepare binary + coverage env
         run: |
-          chmod +x bin/wal-rs && bin/wal-rs --version
-          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          chmod +x bin/walrus && bin/walrus --version
+          echo "WALRUS_BIN=$GITHUB_WORKSPACE/bin/walrus" >>"$GITHUB_ENV"
           if [ "${{ matrix.pg }}" = 17 ]; then
             mkdir -p "$RUNNER_TEMP/prof"
             echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/pg-${{ matrix.test }}-%p-%16m.profraw" >>"$GITHUB_ENV"
@@ -162,8 +162,8 @@ jobs:
         with:
           name: logs-pg${{ matrix.pg }}-${{ matrix.test }}
           path: |
-            /tmp/wal-rs-ci-*/**/*.log
-            /tmp/wal-rs-ci-*/**/log/*
+            /tmp/walrus-ci-*/**/*.log
+            /tmp/walrus-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -193,7 +193,7 @@ jobs:
           PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
           # Unused by the cargo tests (they call library functions directly),
           # but lib.sh requires it set; point at the build output.
-          WALRS_BIN: ${{ github.workspace }}/target/debug/wal-rs
+          WALRUS_BIN: ${{ github.workspace }}/target/debug/walrus
         run: ci/vm_test_cluster.sh cargo test --features vm-test --locked
 
       - name: Collect PG logs on failure
@@ -202,8 +202,8 @@ jobs:
         with:
           name: logs-vmtest-pg${{ matrix.pg }}
           path: |
-            /tmp/wal-rs-ci-*/**/*.log
-            /tmp/wal-rs-ci-*/**/log/*
+            /tmp/walrus-ci-*/**/*.log
+            /tmp/walrus-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -223,15 +223,15 @@ jobs:
 
       # Instrumented binary: storage_copy is the only live cover for server-side
       # copy_within, and s3.rs/gcs.rs run live only here (vm-test is file:// only).
-      - name: Fetch instrumented wal-rs
+      - name: Fetch instrumented walrus
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-cov
+          name: walrus-cov
           path: bin
       - name: Prepare binary + coverage env
         run: |
-          chmod +x bin/wal-rs && bin/wal-rs --version
-          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          chmod +x bin/walrus && bin/walrus --version
+          echo "WALRUS_BIN=$GITHUB_WORKSPACE/bin/walrus" >>"$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/prof"
           echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/storage-${{ matrix.backend }}-${{ matrix.test }}-%p-%16m.profraw" >>"$GITHUB_ENV"
 
@@ -255,15 +255,15 @@ jobs:
             curl -fsS "http://127.0.0.1:4443/storage/v1/b?project=test" >/dev/null 2>&1 && break; sleep 1
           done
           AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://wal-rs
+            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://walrus
           curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
-            -H 'Content-Type: application/json' -d '{"name":"wal-rs"}'
+            -H 'Content-Type: application/json' -d '{"name":"walrus"}'
 
       - name: Run ${{ matrix.test }} against ${{ matrix.backend }}
         env:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
-          WALRS_STORAGE_BACKEND: ${{ matrix.backend }}
+          WALRUS_STORAGE_BACKEND: ${{ matrix.backend }}
           MINIO_ENDPOINT: http://127.0.0.1:9000
           FAKE_GCS_ENDPOINT: http://127.0.0.1:4443
         run: ci/${{ matrix.test }}.sh
@@ -282,8 +282,8 @@ jobs:
         with:
           name: logs-storage-${{ matrix.backend }}-${{ matrix.test }}
           path: |
-            /tmp/wal-rs-ci-*/**/*.log
-            /tmp/wal-rs-ci-*/**/log/*
+            /tmp/walrus-ci-*/**/*.log
+            /tmp/walrus-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -302,15 +302,15 @@ jobs:
       # Instrumented binary: the server-side TLS/client-cert handshakes here are
       # the only live cover for that code (vm-test runs over unix sockets, which
       # skip TLS).
-      - name: Fetch instrumented wal-rs
+      - name: Fetch instrumented walrus
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-cov
+          name: walrus-cov
           path: bin
       - name: Prepare binary + coverage env
         run: |
-          chmod +x bin/wal-rs && bin/wal-rs --version
-          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          chmod +x bin/walrus && bin/walrus --version
+          echo "WALRUS_BIN=$GITHUB_WORKSPACE/bin/walrus" >>"$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/prof"
           echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/tlsscram-${{ matrix.test }}-%p-%16m.profraw" >>"$GITHUB_ENV"
 
@@ -339,8 +339,8 @@ jobs:
         with:
           name: logs-tlsscram-${{ matrix.test }}
           path: |
-            /tmp/wal-rs-ci-*/**/*.log
-            /tmp/wal-rs-ci-*/**/log/*
+            /tmp/walrus-ci-*/**/*.log
+            /tmp/walrus-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -356,15 +356,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Fetch instrumented wal-rs
+      - name: Fetch instrumented walrus
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-cov
+          name: walrus-cov
           path: bin
       - name: Prepare binary + coverage env
         run: |
-          chmod +x bin/wal-rs && bin/wal-rs --version
-          echo "WALRS_BIN=$GITHUB_WORKSPACE/bin/wal-rs" >>"$GITHUB_ENV"
+          chmod +x bin/walrus && bin/walrus --version
+          echo "WALRUS_BIN=$GITHUB_WORKSPACE/bin/walrus" >>"$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/prof"
           echo "LLVM_PROFILE_FILE=$RUNNER_TEMP/prof/codec-${{ matrix.codec }}-%p-%16m.profraw" >>"$GITHUB_ENV"
 
@@ -394,8 +394,8 @@ jobs:
         with:
           name: logs-codec-${{ matrix.codec }}
           path: |
-            /tmp/wal-rs-ci-*/**/*.log
-            /tmp/wal-rs-ci-*/**/log/*
+            /tmp/walrus-ci-*/**/*.log
+            /tmp/walrus-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -436,7 +436,7 @@ jobs:
           PG_BIN: /usr/lib/postgresql/17/bin
           # Unused by the cargo tests (they call library functions directly),
           # but lib.sh requires it set; point at the build output.
-          WALRS_BIN: ${{ github.workspace }}/target/debug/wal-rs
+          WALRUS_BIN: ${{ github.workspace }}/target/debug/walrus
         run: |
           cargo llvm-cov clean
           ci/vm_test_cluster.sh \
@@ -483,8 +483,8 @@ jobs:
         with:
           name: logs-vm-test-pg17
           path: |
-            /tmp/wal-rs-ci-*/**/*.log
-            /tmp/wal-rs-ci-*/**/log/*
+            /tmp/walrus-ci-*/**/*.log
+            /tmp/walrus-ci-*/**/log/*
           if-no-files-found: ignore
           retention-days: 14
 
@@ -515,7 +515,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          name: wal-rs-cov
+          name: walrus-cov
           path: cov
       - name: Fetch shell-lane profraw
         continue-on-error: true
@@ -532,11 +532,11 @@ jobs:
           if [ -f vmtest/lcov.info ]; then inputs+=(vmtest/lcov.info); else echo "::warning::no vm-test lcov"; fi
           mkdir -p profraw
           find profraw -name '*.profraw' -type f >profraw.list || true
-          if [ -f cov/wal-rs ] && [ -s profraw.list ]; then
+          if [ -f cov/walrus ] && [ -s profraw.list ]; then
             # failure-mode=all: a SIGTERM-killed lane (daemon) may leave a partial
             # profraw; tolerate individual bad files, fail only if all are bad.
             "$llvmbin/llvm-profdata" merge -sparse --failure-mode=all -f profraw.list -o shell.profdata
-            "$llvmbin/llvm-cov" export --instr-profile shell.profdata --object cov/wal-rs \
+            "$llvmbin/llvm-cov" export --instr-profile shell.profdata --object cov/walrus \
               --ignore-filename-regex '(/\.cargo/registry/|/rustc/|library/std/)' \
               --format lcov >shell.lcov
             inputs+=(shell.lcov)
@@ -562,7 +562,7 @@ jobs:
           # lcov 2.x (noble) genhtml is strict; ignore render-only mapping
           # complaints from llvm-cov data. Extend list if CI flags more.
           genhtml merged.lcov --output-directory html \
-            --prefix "$GITHUB_WORKSPACE" --title 'wal-rs merged coverage' \
+            --prefix "$GITHUB_WORKSPACE" --title 'walrus merged coverage' \
             --legend --quiet --ignore-errors inconsistent,unmapped
       - name: Upload merged coverage
         uses: actions/upload-artifact@v7

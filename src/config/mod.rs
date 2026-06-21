@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn parse_env_int_default_valid_and_malformed() {
-        let key = "WALRS_TEST_PARSE_INT";
+        let key = "WALRUS_TEST_PARSE_INT";
         {
             let _g = EnvGuard::new(&[(key, None)]);
             assert_eq!(parse_env_int(key, 7).unwrap(), 7);
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn parse_env_bool_tokens_and_rejection() {
-        let key = "WALRS_TEST_PARSE_BOOL";
+        let key = "WALRUS_TEST_PARSE_BOOL";
         for t in ["1", "true", "TRUE", "yes", "On"] {
             let _g = EnvGuard::new(&[(key, Some(t))]);
             assert!(parse_env_bool(key, false).unwrap(), "{t:?} should be true");

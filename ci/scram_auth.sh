@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # SCRAM-SHA-256 auth against a live cluster. backup-push connects over TCP with
-# PGPASSWORD, driving wal-rs's SASL/SCRAM client. Asserts the right password
+# PGPASSWORD, driving walrus's SASL/SCRAM client. Asserts the right password
 # authenticates and a wrong one fails with an auth error.
 set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
-PW='wal-rs-secret'
+PW='walrus-secret'
 
 pg_initdb
 pg_replication_on
@@ -29,10 +29,10 @@ pg_start
 psql -p "$PGPORT" -h "$PGHOST" -c "ALTER ROLE \"$PGUSER\" PASSWORD '$PW'" postgres
 
 echo "== correct password: must authenticate =="
-PGHOST=127.0.0.1 PGPASSWORD="$PW" wal-rs backup-push
+PGHOST=127.0.0.1 PGPASSWORD="$PW" walrus backup-push
 
 echo "== wrong password: must fail with an auth error =="
-if PGHOST=127.0.0.1 PGPASSWORD='nope' wal-rs backup-push 2>"$WORKROOT/wrong.err"; then
+if PGHOST=127.0.0.1 PGPASSWORD='nope' walrus backup-push 2>"$WORKROOT/wrong.err"; then
     echo "FAIL: backup-push succeeded with a wrong password"
     exit 1
 fi

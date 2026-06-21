@@ -730,7 +730,7 @@ mod tests {
     }
 
     /// Regression: PG ≥ 15 sets bimg_info bit 0x02 (APPLY) on every FPI.
-    /// Pre-fix wal-rs treated 0x02 as IS_COMPRESSED → the strict
+    /// Pre-fix walrus treated 0x02 as IS_COMPRESSED → the strict
     /// check_image_header path rejected `compressed && image_length ==
     /// BLOCK_SIZE`. Encode a FPI with info=APPLY only, image_length =
     /// BLOCK_SIZE, no hole. With PG-15+ magic the record must parse;

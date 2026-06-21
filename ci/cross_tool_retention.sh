@@ -22,7 +22,7 @@ push_three() {
     local _i
     for _i in 1 2 3; do
         psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
-        if [ "$tool" = "$WALRS_BIN" ]; then wal-rs backup-push; else walg backup-push "$PGDATA"; fi
+        if [ "$tool" = "$WALRUS_BIN" ]; then walrus backup-push; else walg backup-push "$PGDATA"; fi
         psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
         sleep 1
     done
@@ -43,18 +43,18 @@ check_agreement() {
     }
 }
 
-# wal-rs pushes 3 fulls, wal-rs deletes to 2; wal-g must agree
-push_three "$WALRS_BIN"
-[ "$(count_backups "$WALRS_BIN")" -eq 3 ] || { echo "expected 3 backups pre-delete"; exit 1; }
-wal-rs delete retain FULL 2 --confirm
-check_agreement "$WALRS_BIN" "$WALG_BIN" "wal-rs-deletes"
+# walrus pushes 3 fulls, walrus deletes to 2; wal-g must agree
+push_three "$WALRUS_BIN"
+[ "$(count_backups "$WALRUS_BIN")" -eq 3 ] || { echo "expected 3 backups pre-delete"; exit 1; }
+walrus delete retain FULL 2 --confirm
+check_agreement "$WALRUS_BIN" "$WALG_BIN" "walrus-deletes"
 pg_drop
 bucket_reset
 
-# wal-g pushes 3 fulls, wal-g deletes to 2; wal-rs must agree
+# wal-g pushes 3 fulls, wal-g deletes to 2; walrus must agree
 push_three "$WALG_BIN"
 walg delete retain FULL 2 --confirm
-check_agreement "$WALG_BIN" "$WALRS_BIN" "walg-deletes"
+check_agreement "$WALG_BIN" "$WALRUS_BIN" "walg-deletes"
 pg_drop
 
 echo "cross_tool_retention OK"

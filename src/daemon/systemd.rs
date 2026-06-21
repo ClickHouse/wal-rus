@@ -2,7 +2,7 @@
 //!
 //! `NOTIFY_SOCKET` / `WATCHDOG_USEC` are exported by systemd for
 //! `Type=notify` units and absent otherwise, so every entry point here
-//! no-ops when wal-rs is not run under systemd. Mirrors wal-g's
+//! no-ops when walrus is not run under systemd. Mirrors wal-g's
 //! SendSdNotify, sized down to readiness + watchdog keep-alive
 
 use std::ffi::OsStr;
@@ -110,7 +110,7 @@ mod tests {
     fn send_reaches_abstract_namespace_socket() {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::SocketAddr;
-        let name = format!("walrs-sd-test-{}", std::process::id());
+        let name = format!("walrus-sd-test-{}", std::process::id());
         let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let server = UnixDatagram::bind_addr(&addr).unwrap();
         server

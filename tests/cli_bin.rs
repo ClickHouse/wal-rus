@@ -1,4 +1,4 @@
-//! Exercises the `wal-rs` binary end-to-end so `src/main.rs` (runtime
+//! Exercises the `walrus` binary end-to-end so `src/main.rs` (runtime
 //! construction + ExitCode mapping) and `cli::run`'s `Cmd` dispatch arms are
 //! covered. cargo-llvm-cov merges coverage from spawned instrumented children
 //! via LLVM_PROFILE_FILE.
@@ -6,11 +6,11 @@
 use std::path::Path;
 use std::process::Command;
 
-use pgwalrs::pg::WAL_FOLDER;
-use pgwalrs::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, sentinel_key};
+use walrus::pg::WAL_FOLDER;
+use walrus::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, sentinel_key};
 
-fn wal_rs() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wal-rs"));
+fn walrus_bin() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_walrus"));
     // Deterministic regardless of the surrounding CI env: strip every
     // storage selector so the test controls which backend (if any) resolves
     for k in ["WALG_FILE_PREFIX", "WALG_S3_PREFIX", "WALG_GS_PREFIX"] {
@@ -52,7 +52,7 @@ fn seed_store(dir: &Path) {
 fn success_path_returns_exit_success() {
     let dir = tempfile::tempdir().unwrap();
     // Empty fs prefix: wal-show resolves storage, finds nothing, exits 0
-    let status = wal_rs()
+    let status = walrus_bin()
         .env("WALG_FILE_PREFIX", dir.path())
         .arg("wal-show")
         .status()
@@ -63,7 +63,7 @@ fn success_path_returns_exit_success() {
 #[test]
 fn error_path_returns_exit_failure() {
     // No storage configured -> build_storage bails -> ExitCode::FAILURE
-    let status = wal_rs()
+    let status = walrus_bin()
         .args(["wal-fetch", "000000010000000000000001", "/dev/null"])
         .status()
         .unwrap();
@@ -78,7 +78,7 @@ fn dispatch_inspect_and_retention_subcommands() {
     let dir = tempfile::tempdir().unwrap();
     seed_store(dir.path());
     let run = |args: &[&str]| {
-        wal_rs()
+        walrus_bin()
             .env("WALG_FILE_PREFIX", dir.path())
             .args(args)
             .status()
@@ -112,7 +112,7 @@ fn dispatch_wal_and_copy_subcommands() {
     let store = dir.path().join("store");
     std::fs::create_dir_all(&store).unwrap();
     let run = |args: &[&str]| {
-        wal_rs()
+        walrus_bin()
             .env("WALG_FILE_PREFIX", &store)
             .args(args)
             .status()
@@ -179,7 +179,7 @@ fn dispatch_backup_mark_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     seed_store(dir.path());
     let run = |args: &[&str]| {
-        wal_rs()
+        walrus_bin()
             .env("WALG_FILE_PREFIX", dir.path())
             .args(args)
             .status()
@@ -196,7 +196,7 @@ fn dispatch_bail_arms_return_failure() {
     let dir = tempfile::tempdir().unwrap();
     seed_store(dir.path());
     let fail = |args: &[&str]| {
-        !wal_rs()
+        !walrus_bin()
             .env("WALG_FILE_PREFIX", dir.path())
             .args(args)
             .status()

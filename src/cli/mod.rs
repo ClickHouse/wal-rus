@@ -31,7 +31,7 @@ impl From<IncrementFormatArg> for backup::increment::Format {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "wal-rs", version, about = "Rust port of wal-g for PostgreSQL")]
+#[command(name = "walrus", version, about = "Rust port of wal-g for PostgreSQL")]
 pub struct Cli {
     /// Tokio worker threads; 1 = single-threaded runtime. Defaults per
     /// command: backup-push min(cores, WALG_UPLOAD_CONCURRENCY),
@@ -542,16 +542,16 @@ mod tests {
     #[test]
     fn explicit_threads_override_per_command_default() {
         assert_eq!(
-            worker_threads_of(&["wal-rs", "--threads", "3", "wal-show"]),
+            worker_threads_of(&["walrus", "--threads", "3", "wal-show"]),
             3
         );
     }
 
     #[test]
     fn default_commands_stay_single_threaded() {
-        assert_eq!(worker_threads_of(&["wal-rs", "wal-show"]), 1);
+        assert_eq!(worker_threads_of(&["walrus", "wal-show"]), 1);
         assert_eq!(
-            worker_threads_of(&["wal-rs", "wal-fetch", "seg", "/dst"]),
+            worker_threads_of(&["walrus", "wal-fetch", "seg", "/dst"]),
             1
         );
     }
@@ -560,10 +560,10 @@ mod tests {
     fn concurrent_commands_scale_with_cores() {
         // min(cores, concurrency-from-env); both factors are >=1
         for args in [
-            vec!["wal-rs", "backup-push"],
-            vec!["wal-rs", "backup-fetch", "LATEST", "/dst"],
-            vec!["wal-rs", "wal-prefetch", "seg", "/pg_wal"],
-            vec!["wal-rs", "wal-restore", "/dst"],
+            vec!["walrus", "backup-push"],
+            vec!["walrus", "backup-fetch", "LATEST", "/dst"],
+            vec!["walrus", "wal-prefetch", "seg", "/pg_wal"],
+            vec!["walrus", "wal-restore", "/dst"],
         ] {
             assert!(worker_threads_of(&args) >= 1);
         }
