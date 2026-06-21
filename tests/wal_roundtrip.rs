@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pgwalrs::compression::Method;
-use pgwalrs::config::{Settings, StorageSettings};
-use pgwalrs::pg::wal;
-use pgwalrs::storage::fs::FsStorage;
+use walrus::compression::Method;
+use walrus::config::{Settings, StorageSettings};
+use walrus::pg::wal;
+use walrus::storage::fs::FsStorage;
 
 fn pseudo_wal_segment(seed: u8) -> Vec<u8> {
     // 16MB to match default wal_segsize
@@ -190,7 +190,7 @@ async fn history_file_idempotent_overwrite_allowed() {
 
 #[tokio::test]
 async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
-    use pgwalrs::pg::wal::prefetch;
+    use walrus::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -210,7 +210,7 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
     {
         let stage = stage_dir.join(hex);
         std::fs::write(&stage, pseudo_wal_segment((i + 2) as u8)).unwrap();
-        pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
+        walrus::pg::wal::push::handle(&s, store.clone(), &stage)
             .await
             .unwrap();
     }
@@ -226,7 +226,7 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
 
     // Now wal-fetch should promote the staged segment via rename
     let dst = pg_wal.join("000000010000000000000002");
-    pgwalrs::pg::wal::fetch::handle(
+    walrus::pg::wal::fetch::handle(
         &s,
         store,
         "000000010000000000000002",
@@ -244,7 +244,7 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
 
 #[tokio::test]
 async fn prefetch_cleans_stale_already_replayed_segments() {
-    use pgwalrs::pg::wal::prefetch;
+    use walrus::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -259,7 +259,7 @@ async fn prefetch_cleans_stale_already_replayed_segments() {
     let six = "000000010000000000000006";
     let stage = stage_dir.join(six);
     std::fs::write(&stage, six.as_bytes()).unwrap();
-    pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
+    walrus::pg::wal::push::handle(&s, store.clone(), &stage)
         .await
         .unwrap();
 
@@ -284,8 +284,8 @@ async fn prefetch_cleans_stale_already_replayed_segments() {
 
 #[tokio::test]
 async fn wal_fetch_triggers_in_process_prefetch() {
-    use pgwalrs::pg::wal::prefetch;
     use std::time::Duration;
+    use walrus::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -300,7 +300,7 @@ async fn wal_fetch_triggers_in_process_prefetch() {
     for hex in ["000000010000000000000001", "000000010000000000000002"] {
         let stage = stage_dir.join(hex);
         std::fs::write(&stage, hex.as_bytes()).unwrap();
-        pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
+        walrus::pg::wal::push::handle(&s, store.clone(), &stage)
             .await
             .unwrap();
     }
@@ -332,8 +332,8 @@ async fn wal_fetch_triggers_in_process_prefetch() {
 
 #[tokio::test]
 async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
-    use pgwalrs::pg::wal::prefetch;
     use std::time::Duration;
+    use walrus::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -365,7 +365,7 @@ async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
     });
 
     let dst = pg_wal.join(seg);
-    pgwalrs::pg::wal::fetch::handle(&s, store, seg, &dst, wal::fetch::Prefetch::Off)
+    walrus::pg::wal::fetch::handle(&s, store, seg, &dst, wal::fetch::Prefetch::Off)
         .await
         .expect("fetch should reuse the in-flight prefetch, not 404 on empty storage");
     assert_eq!(std::fs::read(&dst).unwrap(), segment);
@@ -374,7 +374,7 @@ async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
 
 #[tokio::test]
 async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
-    use pgwalrs::pg::wal::prefetch;
+    use walrus::pg::wal::prefetch;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -389,7 +389,7 @@ async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
     std::fs::create_dir_all(&stage_dir).unwrap();
     let stage = stage_dir.join(seg);
     std::fs::write(&stage, b"downloaded-bytes").unwrap();
-    pgwalrs::pg::wal::push::handle(&s, store.clone(), &stage)
+    walrus::pg::wal::push::handle(&s, store.clone(), &stage)
         .await
         .unwrap();
 
@@ -399,7 +399,7 @@ async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
     std::fs::write(&running, b"partial").unwrap();
 
     let dst = pg_wal.join(seg);
-    pgwalrs::pg::wal::fetch::handle(&s, store, seg, &dst, wal::fetch::Prefetch::Off)
+    walrus::pg::wal::fetch::handle(&s, store, seg, &dst, wal::fetch::Prefetch::Off)
         .await
         .unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), b"downloaded-bytes");
@@ -411,8 +411,8 @@ async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
 
 #[tokio::test]
 async fn wal_show_groups_segments_and_detects_gaps() {
-    use pgwalrs::pg::wal::show;
-    use pgwalrs::storage::Storage;
+    use walrus::pg::wal::show;
+    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -430,7 +430,7 @@ async fn wal_show_groups_segments_and_detects_gaps() {
     ] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
+        walrus::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
@@ -448,8 +448,8 @@ async fn wal_show_groups_segments_and_detects_gaps() {
 
 #[tokio::test]
 async fn wal_restore_fills_gap_into_local_dir() {
-    use pgwalrs::pg::wal::restore;
-    use pgwalrs::storage::Storage;
+    use walrus::pg::wal::restore;
+    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -469,7 +469,7 @@ async fn wal_restore_fills_gap_into_local_dir() {
     ] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
+        walrus::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
@@ -493,7 +493,7 @@ async fn wal_restore_fills_gap_into_local_dir() {
     for hex in ["000000010000000000000002", "000000010000000000000003"] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
+        walrus::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
@@ -511,9 +511,9 @@ async fn wal_restore_fills_gap_into_local_dir() {
 
 #[tokio::test]
 async fn wal_verify_integrity_detects_gap_after_backup() {
-    use pgwalrs::pg::backup::{format_backup_name, sentinel_key};
-    use pgwalrs::pg::wal::verify;
-    use pgwalrs::storage::Storage;
+    use walrus::pg::backup::{format_backup_name, sentinel_key};
+    use walrus::pg::wal::verify;
+    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -530,15 +530,15 @@ async fn wal_verify_integrity_detects_gap_after_backup() {
     ] {
         let p = stage.join(hex);
         std::fs::write(&p, hex.as_bytes()).unwrap();
-        pgwalrs::pg::wal::push::handle(&s, store.clone(), &p)
+        walrus::pg::wal::push::handle(&s, store.clone(), &p)
             .await
             .unwrap();
     }
     // Build a synthetic sentinel that pins the backup at seg-1's LSN
     let seg_size: u64 = 16 * 1024 * 1024;
     let backup_name = format_backup_name(1, seg_size, seg_size);
-    let v2 = pgwalrs::pg::backup::BackupSentinelDtoV2 {
-        sentinel: pgwalrs::pg::backup::BackupSentinelDto {
+    let v2 = walrus::pg::backup::BackupSentinelDtoV2 {
+        sentinel: walrus::pg::backup::BackupSentinelDto {
             backup_start_lsn: Some(seg_size),
             pg_version: 160003,
             backup_finish_lsn: Some(seg_size + 16),
@@ -550,7 +550,7 @@ async fn wal_verify_integrity_detects_gap_after_backup() {
     };
     let bytes = serde_json::to_vec(&v2).unwrap();
     let len = bytes.len() as u64;
-    let r: pgwalrs::compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+    let r: walrus::compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
     store
         .put(&sentinel_key(&backup_name), r, Some(len))
         .await
@@ -598,8 +598,8 @@ async fn fetch_falls_back_to_uncompressed_when_zstd_missing() {
 }
 
 fn encrypted_settings(path: &str, method: Method) -> Settings {
-    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
     use std::sync::Arc;
+    use walrus::crypto::libsodium::LibsodiumCrypter;
     let mut k = [0u8; 32];
     for (i, b) in k.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(13).wrapping_add(7);
@@ -645,8 +645,8 @@ async fn push_fetch_libsodium_encrypted_roundtrip() {
 
 #[tokio::test]
 async fn fetch_with_wrong_key_fails() {
-    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
     use std::sync::Arc;
+    use walrus::crypto::libsodium::LibsodiumCrypter;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");

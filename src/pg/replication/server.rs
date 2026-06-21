@@ -1,6 +1,6 @@
 //! Walsender server side of the physical replication protocol.
 //!
-//! Pairs with [`super::conn`] (client side) so wal-rs can play either
+//! Pairs with [`super::conn`] (client side) so walrus can play either
 //! role.
 //!
 //! | inbound query | reply |
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn decode_standby_status_roundtrip() {
-        // Mirror what wal-rs builds on the client side.
+        // Mirror what walrus builds on the client side.
         let payload = crate::pg::replication::stream::build_status_update(0x10, 0x08, 0x04);
         let parsed = decode_standby_status(&payload).expect("decode");
         assert_eq!(parsed.write_lsn, 0x10);

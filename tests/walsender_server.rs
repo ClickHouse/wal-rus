@@ -1,4 +1,4 @@
-//! Round-trip test: wire wal-rs's walsender server to
+//! Round-trip test: wire walrus's walsender server to
 //! its own `ReplicationConn` client side via a real TCP socket.
 //!
 //! Validates the wire shapes a PG18 walreceiver needs:
@@ -15,17 +15,17 @@
 use std::time::Duration;
 
 use fallible_iterator::FallibleIterator;
-use pgwalrs::pg::replication::conn::{PgConfig, ReplicationConn};
-use pgwalrs::pg::replication::server::{
-    Identity, WalSenderConn, decode_standby_status, handshake_and_await_start,
-};
-use pgwalrs::pg::replication::stream::{
-    Frame, build_status_update, decode_frame, encode_keepalive_frame, encode_wal_data_frame,
-};
-use pgwalrs::pg::replication::tls::SslMode;
 use postgres_protocol::message::backend::Message;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use walrus::pg::replication::conn::{PgConfig, ReplicationConn};
+use walrus::pg::replication::server::{
+    Identity, WalSenderConn, decode_standby_status, handshake_and_await_start,
+};
+use walrus::pg::replication::stream::{
+    Frame, build_status_update, decode_frame, encode_keepalive_frame, encode_wal_data_frame,
+};
+use walrus::pg::replication::tls::SslMode;
 
 fn test_identity() -> Identity {
     Identity {
@@ -43,7 +43,7 @@ fn client_config(port: u16, sslmode: SslMode) -> PgConfig {
         user: "u".into(),
         password: None,
         database: "u".into(),
-        application_name: "wal-rs-server-test".into(),
+        application_name: "walrus-server-test".into(),
         sslmode,
     }
 }
@@ -95,7 +95,7 @@ async fn protocol_roundtrip_through_tcp() {
         user: "u".into(),
         password: None,
         database: "u".into(),
-        application_name: "wal-rs-server-test".into(),
+        application_name: "walrus-server-test".into(),
         sslmode: SslMode::Disable,
     };
     let mut client = ReplicationConn::connect(&cfg)

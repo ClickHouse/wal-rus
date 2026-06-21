@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Client certificate auth (mutual TLS) over a replication connection. PG's `cert`
-# hba method demands a client cert whose CN maps to the PG user; wal-rs presents
+# hba method demands a client cert whose CN maps to the PG user; walrus presents
 # it from PGSSLCERT/PGSSLKEY. Asserts: a valid client cert succeeds; omitting it
 # fails closed; a cert signed by an untrusted CA is rejected by the server.
 set -euxo pipefail
@@ -14,9 +14,9 @@ mkdir -p "$CERTS"
 # One CA signs both the server cert and the trusted client cert; a second CA
 # mints an untrusted client cert for the negative case.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-    -keyout "$CERTS/ca.key" -out "$CERTS/ca.crt" -subj '/CN=wal-rs-test-ca'
+    -keyout "$CERTS/ca.key" -out "$CERTS/ca.crt" -subj '/CN=walrus-test-ca'
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-    -keyout "$CERTS/rogue-ca.key" -out "$CERTS/rogue-ca.crt" -subj '/CN=wal-rs-rogue-ca'
+    -keyout "$CERTS/rogue-ca.key" -out "$CERTS/rogue-ca.crt" -subj '/CN=walrus-rogue-ca'
 
 # Server cert with SAN=127.0.0.1 so verify-full passes against the IP
 openssl req -newkey rsa:2048 -nodes \
@@ -75,10 +75,10 @@ export PGSSLMODE=verify-full
 export PGSSLROOTCERT="$CERTS/ca.crt"
 
 echo "== valid client cert: must succeed =="
-PGSSLCERT="$CERTS/client.crt" PGSSLKEY="$CERTS/client.key" wal-rs backup-push
+PGSSLCERT="$CERTS/client.crt" PGSSLKEY="$CERTS/client.key" walrus backup-push
 
 echo "== no client cert: must fail closed (server demands one) =="
-if wal-rs backup-push 2>"$WORKROOT/nocert.err"; then
+if walrus backup-push 2>"$WORKROOT/nocert.err"; then
     echo "FAIL: backup-push succeeded without a client cert"
     exit 1
 fi
@@ -86,7 +86,7 @@ grep -qiE 'cert|alert|fatal|auth|ssl|tls|handshake|verif' "$WORKROOT/nocert.err"
     || { echo "FAIL: expected an auth/cert error, got:"; cat "$WORKROOT/nocert.err"; exit 1; }
 
 echo "== client cert from untrusted CA: must fail closed =="
-if PGSSLCERT="$CERTS/rogue.crt" PGSSLKEY="$CERTS/rogue.key" wal-rs backup-push 2>"$WORKROOT/rogue.err"; then
+if PGSSLCERT="$CERTS/rogue.crt" PGSSLKEY="$CERTS/rogue.key" walrus backup-push 2>"$WORKROOT/rogue.err"; then
     echo "FAIL: backup-push succeeded with an untrusted client cert"
     exit 1
 fi

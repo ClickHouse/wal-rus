@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use tokio::net::UnixStream;
 
-use pgwalrs::cli::DaemonOp;
-use pgwalrs::config::{Settings, StorageSettings};
-use pgwalrs::daemon::protocol::{MessageType, read_message, write_message};
-use pgwalrs::storage::fs::FsStorage;
+use walrus::cli::DaemonOp;
+use walrus::config::{Settings, StorageSettings};
+use walrus::daemon::protocol::{MessageType, read_message, write_message};
+use walrus::storage::fs::FsStorage;
 
 fn fs_settings(storage_dir: &std::path::Path) -> Settings {
     Settings {
@@ -38,7 +38,7 @@ async fn daemon_check_and_wal_roundtrip() {
     let restore = dir.path().join("restore");
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::create_dir_all(&restore).unwrap();
-    let socket = dir.path().join("wal-rs.sock");
+    let socket = dir.path().join("walrus.sock");
 
     let segment = "000000010000000000000001";
     let src = stage.join(segment);
@@ -49,7 +49,7 @@ async fn daemon_check_and_wal_roundtrip() {
 
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
-        let _ = pgwalrs::daemon::serve(&socket_for_server, s, store).await;
+        let _ = walrus::daemon::serve(&socket_for_server, s, store).await;
     });
 
     wait_for_socket(&socket).await;
@@ -57,11 +57,11 @@ async fn daemon_check_and_wal_roundtrip() {
     let op_to = Duration::from_secs(60);
     let conn_to = Duration::from_secs(5);
 
-    pgwalrs::daemon::client::run(&socket, DaemonOp::Check, op_to, conn_to)
+    walrus::daemon::client::run(&socket, DaemonOp::Check, op_to, conn_to)
         .await
         .unwrap();
 
-    pgwalrs::daemon::client::run(
+    walrus::daemon::client::run(
         &socket,
         DaemonOp::WalPush {
             wal_filepath: src.clone(),
@@ -73,7 +73,7 @@ async fn daemon_check_and_wal_roundtrip() {
     .unwrap();
 
     let dst: PathBuf = restore.join(segment);
-    pgwalrs::daemon::client::run(
+    walrus::daemon::client::run(
         &socket,
         DaemonOp::WalFetch {
             name: segment.into(),
@@ -97,13 +97,13 @@ async fn daemon_check_and_wal_roundtrip() {
 async fn daemon_closes_connection_on_handler_error() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
-    let socket = dir.path().join("wal-rs.sock");
+    let socket = dir.path().join("walrus.sock");
 
     let s = fs_settings(&storage_dir);
     let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
-        let _ = pgwalrs::daemon::serve(&socket_for_server, s, store).await;
+        let _ = walrus::daemon::serve(&socket_for_server, s, store).await;
     });
     wait_for_socket(&socket).await;
 
@@ -142,7 +142,7 @@ async fn client_operation_timeout_fires() {
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
 
-    let err = pgwalrs::daemon::client::run(
+    let err = walrus::daemon::client::run(
         &socket,
         DaemonOp::Check,
         Duration::from_millis(100),

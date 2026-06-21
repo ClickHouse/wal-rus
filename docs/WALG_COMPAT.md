@@ -2,7 +2,7 @@
 
 Bidirectional bucket interop is the project's acceptance bar: a bucket
 written by wal-g v3.x is listable / fetchable / replayable / verifiable
-/ deletable by wal-rs, and the reverse. CI gates the claim
+/ deletable by walrus, and the reverse. CI gates the claim
 (`ci/cross_tool_{forward,reverse}.sh` against a pinned wal-g
 version in `.github/workflows/pg-compat.yml`; bumping the pin is a
 deliberate one-line change so an interop-breaking wal-g release fails
@@ -41,7 +41,7 @@ the bump PR, not master).
 
 ## Deliberate divergences
 
-| Area | wal-rs behavior |
+| Area | walrus behavior |
 |---|---|
 | OpenPGP (`WALG_PGP_*`) | hard error at startup, never silently plaintext; re-encrypt to libsodium when migrating (see DESIGN.md for rationale) |
 | wal-receive slot (`WALG_SLOTNAME`) | unset/empty runs slotless (no slot created or used); wal-g instead defaults to a `walg` slot. Slotless avoids pinning primary WAL when the archiver lags or dies (server recycles WAL, archive may gap) at the cost of slot retention; set `WALG_SLOTNAME` explicitly to opt into a slot |
@@ -55,12 +55,12 @@ the bump PR, not master).
 
 Compared against wal-g Postgres `CommonAllowedSettings`,
 `PGAllowedSettings`, storage adapters, and `pgx.ParseConfig` environment
-support. Unsupported means wal-rs ignores the variable unless noted
+support. Unsupported means walrus ignores the variable unless noted
 otherwise.
 
 ### Postgres connection
 
-wal-rs parses a subset of libpq-style environment variables. wal-g uses pgx,
+walrus parses a subset of libpq-style environment variables. wal-g uses pgx,
 which accepts more connection variables:
 
 - `PGPASSFILE`
@@ -81,9 +81,9 @@ which accepts more connection variables:
 
 Partial support:
 
-- `PGDATA`: wal-rs uses it only for daemon path resolution, not as
+- `PGDATA`: walrus uses it only for daemon path resolution, not as
   backup-push data directory config
-- `PGHOST`, `PGPORT`: wal-rs supports single host/port only, not pgx
+- `PGHOST`, `PGPORT`: walrus supports single host/port only, not pgx
   multihost semantics
 
 ### Postgres behavior
@@ -285,7 +285,7 @@ File storage alias:
 ### Storage aliases
 
 wal-g storage adapter settings accept exact backend keys first, then
-`WALG_<key>` and `WALE_<key>` compatibility variants. wal-rs does not
+`WALG_<key>` and `WALE_<key>` compatibility variants. walrus does not
 implement this generic alias rule, so aliases like
 `WALG_S3_SKIP_VALIDATION`, `WALE_S3_SKIP_VALIDATION`,
 `WALG_GCS_MAX_RETRIES`, `WALE_GCS_MAX_RETRIES`,

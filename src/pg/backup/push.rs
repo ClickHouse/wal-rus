@@ -155,7 +155,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         }
     }
 
-    let label = format!("wal-rs {}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let label = format!("walrus {}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
     let opts = BaseBackupOpts {
         label: label.clone(),
         fast_checkpoint: args.fast_checkpoint,

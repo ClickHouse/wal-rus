@@ -16,11 +16,11 @@
 
 use std::sync::Arc;
 
-use pgwalrs::config::{Settings, StorageSettings};
-use pgwalrs::pg::backup;
-use pgwalrs::pg::wal;
-use pgwalrs::storage::Storage;
-use pgwalrs::storage::fs::FsStorage;
+use walrus::config::{Settings, StorageSettings};
+use walrus::pg::backup;
+use walrus::pg::wal;
+use walrus::storage::Storage;
+use walrus::storage::fs::FsStorage;
 
 fn settings_for(path: &str) -> Settings {
     Settings {
@@ -102,9 +102,9 @@ async fn backup_push_fetch_against_live_pg() {
     // If the cluster has user tablespaces, redirect them into the temp dir so
     // we don't try to write to /var/lib/postgresql which is postgres-owned
     let resolved = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
-    let sentinel_key = pgwalrs::pg::backup::sentinel_key(&resolved);
+    let sentinel_key = walrus::pg::backup::sentinel_key(&resolved);
     let sentinel_bytes = std::fs::read(storage_dir.join(&sentinel_key)).unwrap();
-    let v2_pre: pgwalrs::pg::backup::BackupSentinelDtoV2 =
+    let v2_pre: walrus::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes).unwrap();
     let mut fetch_args = backup::fetch::FetchArgs::default();
     if let Some(spec) = v2_pre.sentinel.tablespace_spec.as_ref() {
@@ -142,7 +142,7 @@ async fn backup_push_fetch_against_live_pg() {
         }
     }
     let fm_path = fm_path.expect("files_metadata.json missing from backup");
-    let fm: pgwalrs::pg::backup::FilesMetadataDto =
+    let fm: walrus::pg::backup::FilesMetadataDto =
         serde_json::from_slice(&std::fs::read(&fm_path).unwrap()).expect("parse files_metadata");
     assert!(
         fm.files.contains_key("PG_VERSION") || fm.files.values().count() > 0,
@@ -161,7 +161,7 @@ async fn backup_push_fetch_against_live_pg() {
             break;
         }
     }
-    let v2: pgwalrs::pg::backup::BackupSentinelDtoV2 =
+    let v2: walrus::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes.unwrap()).unwrap();
     assert!(
         v2.sentinel.compressed_size > 0,
@@ -216,7 +216,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
         }
     }
     let sentinel_path = sentinel_path.expect("sentinel missing");
-    let v2: pgwalrs::pg::backup::BackupSentinelDtoV2 =
+    let v2: walrus::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&std::fs::read(&sentinel_path).unwrap()).unwrap();
     let spec = match v2.sentinel.tablespace_spec.clone() {
         Some(s) if !s.is_empty() => s,
@@ -257,7 +257,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
 // ── Phase F carry: encrypted live-PG backup roundtrip ─────────────────────
 
 fn encrypted_settings_for(path: &str) -> Settings {
-    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
+    use walrus::crypto::libsodium::LibsodiumCrypter;
     let mut k = [0u8; 32];
     for (i, b) in k.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(7).wrapping_add(11);
@@ -282,7 +282,7 @@ fn default_push_args() -> backup::push::PushArgs {
 }
 
 fn apply_tablespace_remap(
-    spec: &pgwalrs::pg::backup::TablespaceSpec,
+    spec: &walrus::pg::backup::TablespaceSpec,
     restore: &std::path::Path,
     args: &mut backup::fetch::FetchArgs,
 ) {
@@ -297,7 +297,7 @@ fn apply_tablespace_remap(
 
 #[tokio::test]
 async fn encrypted_backup_push_fetch_against_live_pg() {
-    use pgwalrs::crypto::libsodium::LibsodiumCrypter;
+    use walrus::crypto::libsodium::LibsodiumCrypter;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -332,8 +332,8 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
     // Right-key fetch decrypts cleanly + PG_VERSION readable
     let resolved = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
     let sentinel_bytes =
-        std::fs::read(storage_dir.join(pgwalrs::pg::backup::sentinel_key(&resolved))).unwrap();
-    let v2: pgwalrs::pg::backup::BackupSentinelDtoV2 =
+        std::fs::read(storage_dir.join(walrus::pg::backup::sentinel_key(&resolved))).unwrap();
+    let v2: walrus::pg::backup::BackupSentinelDtoV2 =
         serde_json::from_slice(&sentinel_bytes).unwrap();
     let mut fetch_args = backup::fetch::FetchArgs::default();
     if let Some(spec) = v2.sentinel.tablespace_spec.as_ref() {
@@ -365,7 +365,7 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
 
 #[tokio::test]
 async fn retain_full_one_against_live_pg() {
-    use pgwalrs::pg::backup::delete::{DeleteModifier, DeleteOp};
+    use walrus::pg::backup::delete::{DeleteModifier, DeleteOp};
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -391,7 +391,7 @@ async fn retain_full_one_against_live_pg() {
         modifier: DeleteModifier::Full,
         after: None,
     };
-    pgwalrs::pg::backup::delete::handle(store.clone(), op, true)
+    walrus::pg::backup::delete::handle(store.clone(), op, true)
         .await
         .expect("delete retain FULL 1");
 
@@ -409,8 +409,8 @@ async fn retain_full_one_against_live_pg() {
 fn read_sentinel(
     storage_dir: &std::path::Path,
     name: &str,
-) -> pgwalrs::pg::backup::BackupSentinelDtoV2 {
-    let key = pgwalrs::pg::backup::sentinel_key(name);
+) -> walrus::pg::backup::BackupSentinelDtoV2 {
+    let key = walrus::pg::backup::sentinel_key(name);
     serde_json::from_slice(&std::fs::read(storage_dir.join(&key)).unwrap()).unwrap()
 }
 
@@ -503,7 +503,7 @@ async fn delta_chain_against_live_pg() {
 
     // Dedicated table, autovacuum off so its heap stays byte-stable between the
     // delta and the baseline-full backup taken right after it
-    let tbl = "walrs_delta_chain_test";
+    let tbl = "walrus_delta_chain_test";
     psql(&format!("DROP TABLE IF EXISTS {tbl}"));
     psql(&format!(
         "CREATE TABLE {tbl} (id int primary key, v text) WITH (autovacuum_enabled=false)"
@@ -684,7 +684,7 @@ async fn wal_receive_archives_segment_against_live_pg() {
         // transactional=true: commit flushes the record so the walsender
         // streams it promptly. 3-arg form is compatible with PG 13+ (the
         // `flush` arg only exists on PG 16+)
-        psql("SELECT pg_logical_emit_message(true, 'wal-rs', repeat('x', 8 * 1024 * 1024))");
+        psql("SELECT pg_logical_emit_message(true, 'walrus', repeat('x', 8 * 1024 * 1024))");
         psql("SELECT pg_switch_wal()");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -791,7 +791,7 @@ async fn wait_for_coverage(psql: &impl Fn(&str) -> String, tli: u32, target_lsn:
         let cov = psql(&format!(
             "SELECT coalesce(max(end_lsn)::text, '0/0') FROM pg_available_wal_summaries() WHERE tli = {tli}"
         ));
-        let cov_lsn = pgwalrs::pg::backup::parse_pg_lsn(&cov).unwrap_or(0);
+        let cov_lsn = walrus::pg::backup::parse_pg_lsn(&cov).unwrap_or(0);
         if cov_lsn >= target_lsn {
             return;
         }
@@ -806,8 +806,8 @@ async fn wait_for_coverage(psql: &impl Fn(&str) -> String, tli: u32, target_lsn:
 /// Remove a backup's storage objects (sentinel sibling + the per-backup dir)
 /// so a fallback-full produced by a lagging summarizer doesn't pollute LATEST.
 fn delete_backup_files(storage_dir: &std::path::Path, name: &str) {
-    let _ = std::fs::remove_file(storage_dir.join(pgwalrs::pg::backup::sentinel_key(name)));
-    let _ = std::fs::remove_dir_all(storage_dir.join(pgwalrs::pg::BASEBACKUP_FOLDER).join(name));
+    let _ = std::fs::remove_file(storage_dir.join(walrus::pg::backup::sentinel_key(name)));
+    let _ = std::fs::remove_dir_all(storage_dir.join(walrus::pg::BASEBACKUP_FOLDER).join(name));
 }
 
 /// Real PG17 `.summary` files must parse via `read_for_range`, projecting the
@@ -824,7 +824,7 @@ async fn wal_summaries_parse_real_pg_files() {
     psql("ALTER SYSTEM SET summarize_wal = on");
     psql("SELECT pg_reload_conf()");
 
-    let tbl = "walrs_summary_parse_test";
+    let tbl = "walrus_summary_parse_test";
     psql(&format!("DROP TABLE IF EXISTS {tbl}"));
     psql(&format!(
         "CREATE TABLE {tbl} (id int primary key, v text) WITH (autovacuum_enabled=false)"
@@ -838,8 +838,8 @@ async fn wal_summaries_parse_real_pg_files() {
     // record, so a target at the very tip stalls forever on an idle cluster;
     // pg_switch_wal alone doesn't help (it pads to empty space never covered)
     let target =
-        pgwalrs::pg::backup::parse_pg_lsn(&psql("SELECT pg_current_wal_insert_lsn()")).unwrap();
-    psql("SELECT pg_logical_emit_message(true, 'walrs', repeat('m', 262144))");
+        walrus::pg::backup::parse_pg_lsn(&psql("SELECT pg_current_wal_insert_lsn()")).unwrap();
+    psql("SELECT pg_logical_emit_message(true, 'walrus', repeat('m', 262144))");
     psql("CHECKPOINT");
     psql("SELECT pg_switch_wal()");
 
@@ -851,22 +851,18 @@ async fn wal_summaries_parse_real_pg_files() {
 
     // Read the full contiguous summary span on this timeline; it must cover the
     // inserts above
-    let start = pgwalrs::pg::backup::parse_pg_lsn(&psql(&format!(
+    let start = walrus::pg::backup::parse_pg_lsn(&psql(&format!(
         "SELECT coalesce(min(start_lsn)::text, '0/0') FROM pg_available_wal_summaries() WHERE tli = {tli}"
     )))
     .unwrap();
-    let end = pgwalrs::pg::backup::parse_pg_lsn(&psql(&format!(
+    let end = walrus::pg::backup::parse_pg_lsn(&psql(&format!(
         "SELECT coalesce(max(end_lsn)::text, '0/0') FROM pg_available_wal_summaries() WHERE tli = {tli}"
     )))
     .unwrap();
 
-    let map = pgwalrs::pg::wal_summaries::read_for_range(
-        std::path::Path::new(&data_dir),
-        tli,
-        start,
-        end,
-    )
-    .expect("parse real PG WAL summaries");
+    let map =
+        walrus::pg::wal_summaries::read_for_range(std::path::Path::new(&data_dir), tli, start, end)
+            .expect("parse real PG WAL summaries");
     assert!(!map.is_empty(), "summary map should carry changed blocks");
 
     let relpath = psql(&format!("SELECT pg_relation_filepath('{tbl}')"));
@@ -928,7 +924,7 @@ async fn delta_from_summaries_against_live_pg() {
     wait_for_guc(&psql, "summarize_wal", "on").await;
 
     // ── parent full ──
-    let tbl = "walrs_summary_delta_test";
+    let tbl = "walrus_summary_delta_test";
     psql(&format!("DROP TABLE IF EXISTS {tbl}"));
     psql(&format!(
         "CREATE TABLE {tbl} (id int primary key, v text) WITH (autovacuum_enabled=false)"
@@ -987,8 +983,8 @@ async fn delta_from_summaries_against_live_pg() {
     // table heap, so byte-identity with the baseline backup is preserved
     // (see wal_summaries_parse note on the one-record summarizer lag)
     let mutate_lsn =
-        pgwalrs::pg::backup::parse_pg_lsn(&psql("SELECT pg_current_wal_insert_lsn()")).unwrap();
-    psql("SELECT pg_logical_emit_message(true, 'walrs', repeat('m', 262144))");
+        walrus::pg::backup::parse_pg_lsn(&psql("SELECT pg_current_wal_insert_lsn()")).unwrap();
+    psql("SELECT pg_logical_emit_message(true, 'walrus', repeat('m', 262144))");
     psql("CHECKPOINT");
     psql("SELECT pg_switch_wal()");
     let tli: u32 = psql("SELECT timeline_id FROM pg_control_checkpoint()")
@@ -1120,8 +1116,8 @@ async fn tablespace_backup_restore_against_live_pg() {
     // Tablespace location: empty dir outside PGDATA, owned by the PG user (us)
     let ts_src = dir.path().join("tblspc_src");
     std::fs::create_dir_all(&ts_src).unwrap();
-    let ts_name = "walrs_ts_test";
-    let tbl = "walrs_ts_table";
+    let ts_name = "walrus_ts_test";
+    let tbl = "walrus_ts_table";
     psql(&format!("DROP TABLE IF EXISTS {tbl}"));
     psql(&format!("DROP TABLESPACE IF EXISTS {ts_name}"));
     psql(&format!(

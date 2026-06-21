@@ -1,20 +1,20 @@
 [package]
-name = "pgwalrs"
+name = "wal-rus"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Rust port of wal-g for PostgreSQL, optimized for no-overcommit hosts"
 license = "Apache-2.0"
-repository = "https://github.com/ClickHouse/wal-rs"
+repository = "https://github.com/ClickHouse/wal-rus"
 readme = "README.md"
 keywords = ["postgres", "postgresql"]
 
 [[bin]]
-name = "wal-rs"
+name = "walrus"
 path = "src/main.rs"
 
 [lib]
-name = "pgwalrs"
+name = "walrus"
 path = "src/lib.rs"
 
 [dependencies]

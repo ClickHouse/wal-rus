@@ -57,7 +57,7 @@ pub enum IncrementError {
 
 /// Serializes as `"wi1"` / `"native"`, matching the `--increment-format` CLI
 /// value names. Recorded per-backup in the sentinel; absent fields read as
-/// `Wi1` (wal-g sentinels and pre-field wal-rs backups)
+/// `Wi1` (wal-g sentinels and pre-field walrus backups)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {

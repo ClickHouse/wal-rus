@@ -47,7 +47,7 @@ impl PgConfig {
             user,
             password,
             database,
-            application_name: "wal-rs".into(),
+            application_name: "walrus".into(),
             sslmode,
         })
     }
@@ -622,12 +622,12 @@ mod tests {
         // <host>/.s.PGSQL.<port>. With a bogus directory, connect must fail
         // with the unix-prefixed context (proves dispatch, no TCP attempt)
         let cfg = PgConfig {
-            host: "/nonexistent/wal-rs-unix-test".into(),
+            host: "/nonexistent/walrus-unix-test".into(),
             port: 5432,
             user: "u".into(),
             password: None,
             database: "u".into(),
-            application_name: "wal-rs-test".into(),
+            application_name: "walrus-test".into(),
             sslmode: SslMode::Prefer,
         };
         let err = ReplicationConn::connect(&cfg).await.err().unwrap();
@@ -685,7 +685,7 @@ mod tests {
             user: "u".into(),
             password: password.map(str::to_string),
             database: "u".into(),
-            application_name: "wal-rs-auth-test".into(),
+            application_name: "walrus-auth-test".into(),
             sslmode: SslMode::Disable,
         }
     }

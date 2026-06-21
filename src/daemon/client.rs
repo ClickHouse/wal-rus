@@ -1,4 +1,4 @@
-//! Connect to a wal-rs/wal-g daemon and send a single op
+//! Connect to a walrus/wal-g daemon and send a single op
 //!
 //! Timeouts mirror wal-g's `walg-daemon-client`: a dial deadline
 //! (`-connection-timeout`) around the socket connect and an operation

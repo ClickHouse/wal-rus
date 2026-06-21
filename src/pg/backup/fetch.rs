@@ -198,7 +198,7 @@ async fn fetch_incremented_set(storage: &DynStorage, name: &str) -> Result<HashS
 /// Reduce a tar-entry / metadata path to its safe relative form, dropping
 /// absolute-root, drive-prefix, `.` and `..` components. Both the extraction
 /// path and the incremented-file lookup must agree on this, since wal-g and
-/// wal-rs disagree on the leading slash
+/// walrus disagree on the leading slash
 fn strip_to_relative(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut rel = PathBuf::new();

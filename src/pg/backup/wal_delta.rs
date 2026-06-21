@@ -13,7 +13,7 @@
 //! their layout is free to differ from wal-g — here it also carries the per-head
 //! page magic so the boundary-record re-parse picks the right FPI bit layout.
 //!
-//! wal-rs records in a separate pass over the on-disk segment after upload
+//! walrus records in a separate pass over the on-disk segment after upload
 //! (wal-g tees the upload stream); the local file is page-cached so the reread
 //! is cheap, and it keeps recording off the compress/encrypt/retry upload path.
 //! Concurrent archives (daemon `WALG_UPLOAD_CONCURRENCY`) serialize on a

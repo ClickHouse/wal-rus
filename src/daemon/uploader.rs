@@ -1,13 +1,13 @@
 //! Standing background WAL uploader for the daemon archive path.
 //!
 //! PG's archiver is serial — it runs `archive_command` for one segment, waits
-//! for success, then the next — so wal-rs's per-connection `wal-push` is
+//! for success, then the next — so walrus's per-connection `wal-push` is
 //! serial too and `WALG_UPLOAD_CONCURRENCY` is a no-op here: the archiver
 //! falls behind a high WAL rate. wal-g closes the gap with a per-invocation
 //! `BgUploader` (wal-g `internal/databases/postgres/bguploader.go`) that scans
 //! `archive_status/` and uploads look-ahead segments concurrently.
 //!
-//! Because the wal-rs daemon is one long-lived process, bookkeeping stays
+//! Because the walrus daemon is one long-lived process, bookkeeping stays
 //! in-memory: a shared `inflight` map dedups foreground pushes against
 //! background look-ahead, replacing wal-g's on-disk `ArchiveStatusManager`
 //! marker directory. Look-ahead uploads run in detached driver tasks, so they

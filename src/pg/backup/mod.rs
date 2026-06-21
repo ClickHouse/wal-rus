@@ -1,6 +1,6 @@
 //! Base backup objects: storage layout, name parsing, sentinel & metadata DTOs
 //!
-//! Wire format mirrors wal-g so wal-rs and wal-g can share buckets
+//! Wire format mirrors wal-g so walrus and wal-g can share buckets
 
 use std::collections::HashMap;
 
@@ -328,7 +328,7 @@ pub struct BackupSentinelDto {
     pub increment_count: Option<i32>,
     /// Wire format of this backup's increment files. Omitted (= `Wi1`) for
     /// full backups & wal-g-compatible `wi1` deltas; present only for native.
-    /// Absent on read defaults to `Wi1` (wal-g & pre-field wal-rs sentinels)
+    /// Absent on read defaults to `Wi1` (wal-g & pre-field walrus sentinels)
     #[serde(
         rename = "IncrementFormat",
         default,
@@ -623,7 +623,7 @@ mod tests {
         let j = serde_json::to_string(&s).unwrap();
         assert!(!j.contains("IncrementFormat"), "{j}");
 
-        // Absent field reads as wi1 (wal-g & pre-field wal-rs sentinels)
+        // Absent field reads as wi1 (wal-g & pre-field walrus sentinels)
         let back: BackupSentinelDto = serde_json::from_str(&j).unwrap();
         assert_eq!(back.increment_format, Format::Wi1);
 
