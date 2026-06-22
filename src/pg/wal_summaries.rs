@@ -25,6 +25,7 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use roaring::RoaringBitmap;
 use thiserror::Error;
 
 use crate::pg::backup::delta::PagedFileDeltaMap;
@@ -121,14 +122,13 @@ struct RelForkKey {
 struct RelForkState {
     /// Set of changed block numbers in this rel/fork. Ranges past the
     /// observed limit_block get pruned via `prune_above`
-    blocks: std::collections::BTreeSet<u32>,
+    blocks: RoaringBitmap,
 }
 
 impl RelForkState {
-    /// wal-g semantics: remove everything `>= limit`. BTreeSet::split_off
-    /// returns the upper portion `[limit..)`, discarding it via `_`
+    /// wal-g semantics: remove everything `>= limit` (the PR's `RemoveRange`)
     fn prune_above(&mut self, limit: u32) {
-        let _ = self.blocks.split_off(&limit);
+        self.blocks.remove_range(limit..);
     }
 }
 
@@ -601,7 +601,7 @@ mod tests {
             fork_num: MAIN_FORK_NUM,
         };
         let st = state.get(&key).unwrap();
-        let got: Vec<u32> = st.blocks.iter().copied().collect();
+        let got: Vec<u32> = st.blocks.iter().collect();
         assert_eq!(got, vec![10, 20, 30]);
     }
 
@@ -633,7 +633,7 @@ mod tests {
             fork_num: MAIN_FORK_NUM,
         };
         let st = state.get(&key).unwrap();
-        let got: Vec<u32> = st.blocks.iter().copied().collect();
+        let got: Vec<u32> = st.blocks.iter().collect();
         assert_eq!(got, vec![0, 1, 15, 16, 17]);
     }
 
@@ -671,7 +671,7 @@ mod tests {
             fork_num: MAIN_FORK_NUM,
         };
         let st = state.get(&key).unwrap();
-        let got: Vec<u32> = st.blocks.iter().copied().collect();
+        let got: Vec<u32> = st.blocks.iter().collect();
         assert_eq!(got, vec![5, 10]);
     }
 
