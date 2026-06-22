@@ -25,7 +25,7 @@ mod types;
 pub use parse::{ExtractError, ParseError, extract_block_locations, parse_record_from_bytes};
 pub use state::{
     ParsePageError, ReadLocationsError, WalParser, extract_locations_from_wal_file,
-    read_locations_from, write_locations_to,
+    read_locations_from, write_location_tuples, write_locations_to,
 };
 pub use types::{
     BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_COMPRESS_LZ4, BKP_IMAGE_COMPRESS_MASK_PG15,

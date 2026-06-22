@@ -29,11 +29,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::compression;
 use crate::config::Settings;
 use crate::pg::WAL_FOLDER;
-use crate::pg::backup::delta::DeltaFile;
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::walparser::{
     BlockLocation, WAL_PAGE_SIZE, WalParser, XLP_PAGE_MAGIC_PG14, extract_block_locations,
-    parse_record_from_bytes,
+    parse_record_from_bytes, write_location_tuples, write_locations_to,
 };
 use crate::storage::DynStorage;
 
@@ -332,20 +331,25 @@ async fn save_part(folder: &Path, group_name: &str, part: &PartFile) -> Result<(
         .context("write part file")
 }
 
-async fn load_local_delta(folder: &Path, group_name: &str) -> Result<DeltaFile> {
-    match tokio::fs::read(local_delta_path(folder, group_name)).await {
-        Ok(buf) => Ok(DeltaFile::load(buf.as_slice()).context("decode local delta file")?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DeltaFile::new(WalParser::new())),
-        Err(e) => Err(e).context("read local delta file"),
+/// Append a segment's location tuples to the running `<group>` working file.
+/// Append-only: the file accumulates raw tuples across the group, so recording
+/// holds at most one segment's locations rather than the whole group's
+async fn append_local_delta(folder: &Path, group_name: &str, locs: &[BlockLocation]) -> Result<()> {
+    if locs.is_empty() {
+        return Ok(());
     }
-}
-
-async fn save_local_delta(folder: &Path, group_name: &str, delta: &DeltaFile) -> Result<()> {
-    let mut buf = Vec::with_capacity(delta.serialized_len());
-    delta.save(&mut buf).context("encode local delta file")?;
-    tokio::fs::write(local_delta_path(folder, group_name), &buf)
+    use tokio::io::AsyncWriteExt;
+    let mut buf = Vec::with_capacity(locs.len() * 16);
+    write_location_tuples(&mut buf, locs).context("encode location tuples")?;
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(local_delta_path(folder, group_name))
         .await
-        .context("write local delta file")
+        .context("open local delta file")?;
+    f.write_all(&buf).await.context("append local delta file")?;
+    f.flush().await.context("flush local delta file")?;
+    Ok(())
 }
 
 async fn remove_group_files(folder: &Path, group_name: &str) {
@@ -361,17 +365,47 @@ async fn remove_group_files(folder: &Path, group_name: &str) {
     }
 }
 
-async fn upload_delta(
+/// Finalize the working file (append boundary-record tuples, the terminator,
+/// then the parser seed) and stream it to the bucket compressed+encrypted.
+/// Reads from the on-disk file rather than a buffer, so the group's locations
+/// are never held in memory
+async fn finalize_and_upload(
     settings: &Settings,
     storage: &DynStorage,
+    folder: &Path,
     group_name: &str,
-    delta: &DeltaFile,
+    combined: &[BlockLocation],
+    parser: &WalParser,
 ) -> Result<()> {
-    let mut buf = Vec::with_capacity(delta.serialized_len());
-    delta.save(&mut buf).context("encode delta sidecar")?;
+    use tokio::io::AsyncWriteExt;
+    // tuples + all-zero terminator + parser state, mirroring wal-g's DeltaFile
+    let mut tail = Vec::new();
+    write_locations_to(&mut tail, combined).context("encode boundary tuples")?;
+    parser.save(&mut tail).context("encode parser state")?;
+    let path = local_delta_path(folder, group_name);
+    {
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .context("open local delta file")?;
+        f.write_all(&tail)
+            .await
+            .context("finalize local delta file")?;
+        f.flush().await.context("flush local delta file")?;
+    }
+
+    let size = tokio::fs::metadata(&path)
+        .await
+        .context("stat local delta file")?
+        .len();
+    let file = tokio::fs::File::open(&path)
+        .await
+        .context("reopen local delta file")?;
     let method = settings.compression;
     let key = delta_storage_key(group_name, method);
-    let reader: compression::AsyncReader = Box::pin(std::io::Cursor::new(buf));
+    let reader: compression::AsyncReader = Box::pin(file);
     let compressed = compression::encode(method, reader, settings.compression_level);
     let body = settings.encrypt(compressed);
     storage
@@ -380,8 +414,7 @@ async fn upload_delta(
         .with_context(|| format!("put {key}"))?;
     tracing::info!(
         target = "wal_push",
-        "uploaded delta sidecar {key} ({} location(s))",
-        delta.locations.len()
+        "uploaded delta sidecar {key} ({size} bytes)"
     );
     Ok(())
 }
@@ -434,8 +467,7 @@ pub async fn record_segment(
     part.heads[pos] = Some(rec.trailing_head.clone());
     part.head_magics[pos] = Some(rec.page_magic);
 
-    let mut delta = load_local_delta(&folder, &group_name).await?;
-    delta.locations.extend(rec.locations);
+    append_local_delta(&folder, &group_name, &rec.locations).await?;
 
     // Last segment of the group also seeds the next group's prev_head
     if pos == WAL_FILES_IN_DELTA as usize - 1 {
@@ -447,18 +479,17 @@ pub async fn record_segment(
     }
 
     if part.is_complete() {
-        delta.locations.extend(part.combine()?);
+        let combined = part.combine()?;
         // Resume point for the consumer's cross-group stitching
         let last_head = part.heads[WAL_FILES_IN_DELTA as usize - 1]
             .clone()
             .unwrap_or_default();
-        delta.wal_parser = WalParser::from_current_record_head(last_head);
-        upload_delta(settings, storage, &group_name, &delta).await?;
+        let parser = WalParser::from_current_record_head(last_head);
+        finalize_and_upload(settings, storage, &folder, &group_name, &combined, &parser).await?;
         remove_group_files(&folder, &group_name).await;
         tracing::debug!(target = "wal_push", "delta group {group_name} complete");
     } else {
         save_part(&folder, &group_name, &part).await?;
-        save_local_delta(&folder, &group_name, &delta).await?;
     }
     Ok(())
 }

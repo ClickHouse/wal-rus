@@ -156,10 +156,20 @@ capped at 64 steps + visited-set against cyclic sentinels; only the
 leaf's tablespace `Spec` is applied (it's a property of pgdata, not
 LSN).
 
-In-memory delta map is `BTreeMap<RelFileNode, BTreeSet<u32>>` rather
-than wal-g's RoaringBitmap: stdlib, on-disk format is a flat tuple list
-either way, typical deltas touch < 1 % of pages. Swappable if profiles
-disagree.
+In-memory delta map is `BTreeMap<RelFileNode, RoaringBitmap>`, matching
+wal-g's `map[RelFileNode]*roaring.Bitmap`. A `BTreeSet<u32>` costs a flat
+~13 B/block regardless of density, so a large-rewrite delta (VACUUM FULL,
+CREATE INDEX, bulk load: 100 GiB rel ≈ 13 M blocks) balloons to ~160 MB
+resident; roaring run/bitmap-compresses dense rewrites to ~1.6 MB and
+keeps sparse OLTP deltas comparable. The on-disk format is a flat tuple
+list either way, so it costs nothing in interop.
+
+The sidecar (`<group>_delta`) is never materialized as a struct: the
+running working file accumulates location tuples append-only across the
+group's 16 segments, then completion appends the boundary-record tuples,
+terminator, and parser seed and streams the file to the bucket. The map
+build folds each sidecar's tuples back in one at a time. So neither the
+sidecar write nor the map read holds a whole group's locations in memory.
 
 Walparser operates on byte slices rather than wal-g's reader-of-reader
 chains; one segment is 16 MiB and already in memory. wal summaries
@@ -227,7 +237,10 @@ server-requested-reply keepalives.
 
 Recurring theme: prefer hand-rolling small fixed formats over pulling
 crates. No `regex` (summary filenames + tablespace prefixes are trivial
-decodes), no roaring, no aws-sdk. `quick-xml` parses S3 list + multipart
-responses (pull-parser does charset decode + entity unescape, replacing
-earlier hand-rolled string extraction). Single crypto stack on aws-lc-rs
+decodes), no aws-sdk. `roaring` is the one earned exception (+`bytemuck`,
+both pure-Rust leaves): a stdlib `BTreeSet` can't compress dense deltas,
+so it broke the no-overcommit budget by ~100x on large rewrites (see
+Delta backups). `quick-xml` parses S3 list + multipart responses
+(pull-parser does charset decode + entity unescape, replacing earlier
+hand-rolled string extraction). Single crypto stack on aws-lc-rs
 (rustls provider + GCS RS256), no transitive ring.

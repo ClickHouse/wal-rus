@@ -23,10 +23,11 @@
 //! `BLOCKS_IN_REL_FILE` + intra-segment offset)
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use roaring::RoaringBitmap;
 use thiserror::Error;
 use tokio_util::io::SyncIoBridge;
 
@@ -39,7 +40,6 @@ use crate::pg::backup::{BackupSentinelDtoV2, increment, name_from_sentinel_key};
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::walparser::{
     BlockLocation, ParsePageError, RelFileNode, WalParser, extract_locations_from_wal_file,
-    read_locations_from, write_locations_to,
 };
 use crate::storage::DynStorage;
 
@@ -69,11 +69,12 @@ pub enum DeltaError {
 }
 
 /// In-memory delta map: which blocks of which relfiles changed?
-/// `BTreeSet<u32>` per rel keeps memory bounded for sparse-delta workloads
-/// (typical delta backup touches < 1% of pages)
+/// `RoaringBitmap` per rel run/bitmap-compresses dense rewrites (VACUUM FULL,
+/// CREATE INDEX, bulk load) that balloon a `BTreeSet<u32>` to ~13 B/block;
+/// sparse OLTP deltas stay comparable. Matches wal-g's `map[RelFileNode]*roaring.Bitmap`
 #[derive(Debug, Default, Clone)]
 pub struct PagedFileDeltaMap {
-    by_rel: BTreeMap<RelFileNode, BTreeSet<u32>>,
+    by_rel: BTreeMap<RelFileNode, RoaringBitmap>,
 }
 
 impl PagedFileDeltaMap {
@@ -86,7 +87,7 @@ impl PagedFileDeltaMap {
     }
 
     pub fn len(&self) -> usize {
-        self.by_rel.values().map(|s| s.len()).sum()
+        self.by_rel.values().map(|s| s.len() as usize).sum()
     }
 
     pub fn add_location(&mut self, loc: BlockLocation) {
@@ -111,7 +112,7 @@ impl PagedFileDeltaMap {
         let seg_id = get_rel_file_id_from(path)?;
         let lo = seg_id as u32 * BLOCKS_IN_REL_FILE;
         let hi = lo.saturating_add(BLOCKS_IN_REL_FILE);
-        let shifted: BTreeSet<u32> = blocks.range(lo..hi).map(|&b| b - lo).collect();
+        let shifted: BTreeSet<u32> = blocks.range(lo..hi).map(|b| b - lo).collect();
         Ok(Some(shifted))
     }
 
@@ -120,7 +121,7 @@ impl PagedFileDeltaMap {
     pub fn locations(&self) -> Vec<BlockLocation> {
         let mut out = Vec::with_capacity(self.len());
         for (rel, blocks) in &self.by_rel {
-            for &b in blocks {
+            for b in blocks {
                 out.push(BlockLocation {
                     rel: *rel,
                     block_no: b,
@@ -131,44 +132,11 @@ impl PagedFileDeltaMap {
     }
 }
 
-/// On-disk delta file: aggregated block locations + parser state for the
-/// cross-segment record stitching
-pub struct DeltaFile {
-    pub locations: Vec<BlockLocation>,
-    pub wal_parser: WalParser,
-}
-
-impl DeltaFile {
-    pub fn new(wal_parser: WalParser) -> Self {
-        Self {
-            locations: Vec::new(),
-            wal_parser,
-        }
-    }
-
-    /// wal-g `DeltaFile.Save`: write tuples (zero-terminated) then parser state
-    pub fn save<W: Write>(&self, mut w: W) -> Result<(), DeltaError> {
-        write_locations_to(&mut w, &self.locations)?;
-        self.wal_parser.save(&mut w)?;
-        Ok(())
-    }
-
-    /// Serialized byte length, for `Vec::with_capacity`. Must track `save`:
-    /// 16-byte tuples + 16-byte terminal sentinel + u32 parser len + parser data
-    pub fn serialized_len(&self) -> usize {
-        self.locations.len() * 16 + 16 + 4 + self.wal_parser.current_record_data().len()
-    }
-
-    pub fn load<R: Read>(mut r: R) -> Result<Self, DeltaError> {
-        let locations = read_locations_from(&mut r)
-            .map_err(|e| DeltaError::Io(io::Error::other(e.to_string())))?;
-        let wal_parser = WalParser::load(&mut r)?;
-        Ok(Self {
-            locations,
-            wal_parser,
-        })
-    }
-}
+// On-disk sidecar format (wal-g `DeltaFile`): location tuples, all-zero
+// terminator, then `WalParser` state (u32 len + bytes). Never materialized as
+// a struct — `wal_delta::record_segment` writes it append-only and
+// `fold_sidecar_into_map` streams it tuple-by-tuple, so neither side holds the
+// whole group's locations in memory
 
 // ─── path → RelFileNode parsing ─────────────────────────────────────────────
 
@@ -566,19 +534,18 @@ async fn build_delta_map_from_sidecars(
     let mut g = first_used_delta;
     while g < last_complete_group {
         let name = delta_group_name(timeline, g, seg_size);
-        let df = get_delta_file(settings, storage, &name, compression)
+        delta = fold_sidecar_into_map(settings, storage, &name, compression, delta)
             .await
-            .with_context(|| format!("delta sidecar {name}"))?;
-        delta.add_locations(df.locations);
+            .with_context(|| format!("delta sidecar {name}"))?
+            .0;
         g += n;
     }
     // Last complete group: its locations + parser seed for the tail walk
     let last_name = delta_group_name(timeline, last_complete_group, seg_size);
-    let last_df = get_delta_file(settings, storage, &last_name, compression)
+    let (d, mut parser) = fold_sidecar_into_map(settings, storage, &last_name, compression, delta)
         .await
         .with_context(|| format!("delta sidecar {last_name}"))?;
-    delta.add_locations(last_df.locations);
-    let mut parser = last_df.wal_parser;
+    delta = d;
 
     // Trailing partial group: raw WAL from the group start up to end_lsn
     let tail_first = first_not_used_delta;
@@ -593,27 +560,58 @@ async fn build_delta_map_from_sidecars(
     Ok(delta)
 }
 
-/// Fetch + decode a `<group>_delta` sidecar from `wal_005/` into a `DeltaFile`
-async fn get_delta_file(
+/// Fetch a `<group>_delta` sidecar from `wal_005/` and fold its location tuples
+/// straight into `map`, returning the trailing `WalParser` state. Streams 16-byte
+/// tuples through a `SyncIoBridge` so the group's locations are never collected
+/// into a `Vec` — they land in the roaring map a tuple at a time
+async fn fold_sidecar_into_map(
     settings: &crate::config::Settings,
     storage: &DynStorage,
     group_name: &str,
     compression: compression::Method,
-) -> Result<DeltaFile> {
-    use tokio::io::AsyncReadExt;
+    map: PagedFileDeltaMap,
+) -> Result<(PagedFileDeltaMap, WalParser)> {
     let key = delta_storage_key(group_name, compression);
     let r = storage
         .get(&key)
         .await
         .with_context(|| format!("get {key}"))?;
     let decrypted = settings.decrypt(r);
-    let mut decoded = compression::decode(compression, decrypted);
-    let mut buf = Vec::new();
-    decoded
-        .read_to_end(&mut buf)
+    let decoded = compression::decode(compression, decrypted);
+    tokio::task::spawn_blocking(move || fold_sidecar_stream(decoded, map))
         .await
-        .with_context(|| format!("read {key}"))?;
-    DeltaFile::load(buf.as_slice()).with_context(|| format!("decode {key}"))
+        .context("join sidecar fold")?
+        .with_context(|| format!("decode {key}"))
+}
+
+/// Sync side of [`fold_sidecar_into_map`]: read tuples until the all-zero
+/// terminator (or EOF), then the parser state
+fn fold_sidecar_stream(
+    decoded: compression::AsyncReader,
+    mut map: PagedFileDeltaMap,
+) -> Result<(PagedFileDeltaMap, WalParser)> {
+    let mut r = SyncIoBridge::new(decoded);
+    let mut buf = [0u8; 16];
+    loop {
+        match r.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok((map, WalParser::new()));
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("read sidecar tuple")),
+        }
+        let loc = BlockLocation::new(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        );
+        if loc.is_terminal() {
+            let parser = WalParser::load(&mut r).context("load sidecar parser state")?;
+            return Ok((map, parser));
+        }
+        map.add_location(loc);
+    }
 }
 
 /// Full raw-WAL walk of `[start_lsn, end_lsn)`: parse every segment. Fallback
@@ -835,26 +833,27 @@ mod tests {
     }
 
     #[test]
-    fn delta_file_round_trip() {
-        let wp = WalParser::new();
+    fn sidecar_format_round_trip() {
+        // Bytes the streaming writer emits: tuples + terminator + parser state
+        use crate::pg::walparser::{read_locations_from, write_locations_to};
         let mut buf = Vec::new();
-        wp.save(&mut buf).unwrap();
-        let wp_reloaded = WalParser::load(buf.as_slice()).unwrap();
+        write_locations_to(
+            &mut buf,
+            &[
+                BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 7),
+                BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16386, 0),
+            ],
+        )
+        .unwrap();
+        WalParser::new().save(&mut buf).unwrap();
 
-        let mut df = DeltaFile::new(wp_reloaded);
-        df.locations
-            .push(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 7));
-        df.locations
-            .push(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16386, 0));
-
-        let mut out = Vec::new();
-        df.save(&mut out).unwrap();
-
-        let df2 = DeltaFile::load(out.as_slice()).unwrap();
-        assert_eq!(df2.locations.len(), 2);
-        assert_eq!(df2.locations[0].block_no, 7);
-        assert_eq!(df2.locations[1].block_no, 0);
-        assert!(df2.wal_parser.current_record_data().is_empty());
+        let mut cur = buf.as_slice();
+        let locs = read_locations_from(&mut cur).unwrap();
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0].block_no, 7);
+        assert_eq!(locs[1].block_no, 0);
+        let wp = WalParser::load(&mut cur).unwrap();
+        assert!(wp.current_record_data().is_empty());
     }
 
     #[test]
@@ -922,18 +921,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_delta_file_reads_sidecar() {
+    async fn fold_sidecar_into_map_reads_blocks() {
+        use crate::pg::walparser::write_locations_to;
         use crate::storage::fs::FsStorage;
         let dir = tempfile::tempdir().unwrap();
         let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
         let settings = crate::config::Settings::default();
         let method = compression::Method::None;
 
-        let mut df = DeltaFile::new(WalParser::new());
-        df.locations
-            .push(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 7));
+        // Sidecar bytes: one tuple + terminator + parser state
         let mut raw = Vec::new();
-        df.save(&mut raw).unwrap();
+        write_locations_to(
+            &mut raw,
+            &[BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 7)],
+        )
+        .unwrap();
+        WalParser::new().save(&mut raw).unwrap();
 
         let group = delta_group_name(1, 0, DEFAULT_WAL_SEG_SIZE);
         let key = delta_storage_key(&group, method);
@@ -941,10 +944,17 @@ mod tests {
         let r: crate::compression::AsyncReader = Box::pin(std::io::Cursor::new(raw));
         storage.put(&key, r, Some(len)).await.unwrap();
 
-        let got = get_delta_file(&settings, &storage, &group, method)
-            .await
-            .unwrap();
-        assert_eq!(got.locations.len(), 1);
-        assert_eq!(got.locations[0].block_no, 7);
+        let (map, parser) = fold_sidecar_into_map(
+            &settings,
+            &storage,
+            &group,
+            method,
+            PagedFileDeltaMap::new(),
+        )
+        .await
+        .unwrap();
+        let blocks = map.blocks_for("base/16384/16385").unwrap().unwrap();
+        assert_eq!(blocks.into_iter().collect::<Vec<_>>(), vec![7u32]);
+        assert!(parser.current_record_data().is_empty());
     }
 }

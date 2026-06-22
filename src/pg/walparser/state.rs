@@ -456,15 +456,22 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadStatu
 
 // ─── delta file BlockLocation list I/O (wal-g block_location_writer/reader) ─
 
-/// Write a list of locations as 16-byte LE u32×4 tuples + an all-zero
-/// terminator. Format consumed by wal-g's `ReadLocationsFrom`
-pub fn write_locations_to<W: Write>(mut w: W, locations: &[BlockLocation]) -> io::Result<()> {
+/// Write locations as 16-byte LE u32×4 tuples, no terminator. Lets a sidecar
+/// be built by appending segment fragments before the terminator is written
+pub fn write_location_tuples<W: Write>(mut w: W, locations: &[BlockLocation]) -> io::Result<()> {
     for loc in locations {
         w.write_all(&loc.rel.spc_node.to_le_bytes())?;
         w.write_all(&loc.rel.db_node.to_le_bytes())?;
         w.write_all(&loc.rel.rel_node.to_le_bytes())?;
         w.write_all(&loc.block_no.to_le_bytes())?;
     }
+    Ok(())
+}
+
+/// Write a list of locations as 16-byte LE u32×4 tuples + an all-zero
+/// terminator. Format consumed by wal-g's `ReadLocationsFrom`
+pub fn write_locations_to<W: Write>(mut w: W, locations: &[BlockLocation]) -> io::Result<()> {
+    write_location_tuples(&mut w, locations)?;
     w.write_all(&[0u8; 16])?;
     Ok(())
 }
