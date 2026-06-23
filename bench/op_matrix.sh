@@ -13,6 +13,10 @@
 # Skipped cells: pgbackrest has no wal-receive equivalent; backup-delta-summaries
 # is walrus-only (no wal-g / pgbackrest WAL-summary delta). Override OPS / TOOLS
 # via env. Counterpart of matrix.sh (archive path).
+#
+# backup-delta-chain (DELTA_MAX_STEPS-deep chain + leaf restore) is omitted from
+# the default sweep — it churns once per step, so its cost scales with depth. Opt
+# in with OPS="backup-send backup-delta-chain" (backup-send must precede it).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"

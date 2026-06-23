@@ -8,6 +8,7 @@
 //! EC2 metadata service (see [`super::creds`])
 
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -20,6 +21,8 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::Client;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -29,6 +32,13 @@ use crate::retry::{RetryPolicy, with_retry};
 
 const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
 const PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// Parts kept in flight across every concurrent multipart upload, capped by a
+/// per-backend permit pool. Shared so a single stream and an N-way fan-out
+/// converge on the same aggregate in-flight budget: deep enough to hide per-part
+/// network RTT behind compression, bounded so resident part buffers stay at
+/// MAX_INFLIGHT_PARTS × PART_SIZE regardless of stream count
+const MAX_INFLIGHT_PARTS: usize = 8;
 
 /// Path component encoding per SigV4 spec
 /// Same set as URL path-segment, but '/' kept literal
@@ -60,6 +70,8 @@ pub struct S3Storage {
     client: Client,
     base: String,
     retry_policy: RetryPolicy,
+    /// In-flight part budget shared across all concurrent multipart uploads
+    part_permits: Arc<Semaphore>,
 }
 
 impl S3Storage {
@@ -79,11 +91,25 @@ impl S3Storage {
             client,
             base,
             retry_policy,
+            part_permits: Arc::new(Semaphore::new(MAX_INFLIGHT_PARTS)),
         })
     }
 
     fn full_key(&self, key: &str) -> String {
         super::join_prefix_key(&self.cfg.prefix, key)
+    }
+
+    /// Cheap clone of the request context (shared `Client`, copied config, same
+    /// permit pool) so a per-part PUT can run as its own `'static` task instead
+    /// of borrowing `&self`
+    fn worker(&self) -> S3Storage {
+        S3Storage {
+            cfg: self.cfg.clone(),
+            client: self.client.clone(),
+            base: self.base.clone(),
+            retry_policy: self.retry_policy,
+            part_permits: self.part_permits.clone(),
+        }
     }
 
     /// Server-side copy identity: same endpoint/region + same credential.
@@ -188,6 +214,42 @@ impl S3Storage {
         .await
     }
 
+    /// PUT one already-buffered part, retrying transients in place (the buffer
+    /// is owned so the body replays without re-reading source). Returns the
+    /// part's ETag for the completion manifest
+    async fn put_one_part(
+        &self,
+        key_full: &str,
+        part_no: u32,
+        upload_id: &str,
+        chunk: Bytes,
+    ) -> Result<String> {
+        let part_no_str = part_no.to_string();
+        with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self
+                .signed_request(
+                    "PUT",
+                    key_full,
+                    &[
+                        ("partNumber", part_no_str.as_str()),
+                        ("uploadId", upload_id),
+                    ],
+                    chunk.clone(),
+                    &[],
+                )
+                .await?;
+            let resp = check_status(resp).await?;
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| StorageError::InvalidResponse("missing ETag".into()))?
+                .to_string();
+            Ok::<String, StorageError>(etag)
+        })
+        .await
+    }
+
     async fn put_multipart(&self, key: &str, mut body: AsyncReader) -> Result<()> {
         // initiate
         let init_resp = self
@@ -205,14 +267,29 @@ impl S3Storage {
             StorageError::InvalidResponse("missing UploadId in CreateMultipartUpload".into())
         })?;
 
-        let mut parts: Vec<(u32, String)> = Vec::new();
+        // Pipeline parts: fill one PART_SIZE buffer (reads stay sequential, so
+        // byte boundaries match the serial path), spawn its PUT under a shared
+        // in-flight permit, then read the next part while prior PUTs run. The
+        // permit pool overlaps compression with several concurrent PUTs and
+        // bounds aggregate in-flight parts across streams. PUTs finish out of
+        // order, so collected ETags are sorted by partNumber before completion
+        let ctx = Arc::new(self.worker());
+        let key_full = Arc::new(self.full_key(key));
+        let upload_id = Arc::new(upload_id);
+        let mut join: JoinSet<Result<(u32, String)>> = JoinSet::new();
         let mut part_no: u32 = 0;
+        let mut read_result: Result<()> = Ok(());
 
-        loop {
+        'read: loop {
             let mut buf = BytesMut::with_capacity(PART_SIZE);
             while buf.len() < PART_SIZE {
-                if body.read_buf(&mut buf).await? == 0 {
-                    break;
+                match body.read_buf(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        read_result = Err(e.into());
+                        break 'read;
+                    }
                 }
             }
             let filled = buf.len();
@@ -220,76 +297,63 @@ impl S3Storage {
                 break;
             }
             part_no += 1;
-            let part_no_str = part_no.to_string();
             let chunk = buf.freeze();
 
-            // Per-part retry: chunk is already buffered, so transient failures
-            // (5xx, transport) replay the same body without re-reading source
-            let key_full = self.full_key(key);
-            let result = with_retry(&self.retry_policy, StorageError::is_transient, || async {
-                let resp = self
-                    .signed_request(
-                        "PUT",
-                        &key_full,
-                        &[
-                            ("partNumber", part_no_str.as_str()),
-                            ("uploadId", upload_id.as_str()),
-                        ],
-                        chunk.clone(),
-                        &[],
-                    )
-                    .await?;
-                let resp = check_status(resp).await?;
-                let etag = resp
-                    .headers()
-                    .get("etag")
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| StorageError::InvalidResponse("missing ETag".into()))?
-                    .to_string();
-                Ok::<String, StorageError>(etag)
-            })
-            .await;
-
-            let etag = match result {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = self.abort_multipart(key, &upload_id).await;
-                    return Err(e);
+            // Acquire before spawning so reading backpressures once the budget
+            // is exhausted, capping resident part buffers
+            let permit = match self.part_permits.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    read_result = Err(StorageError::Config("part permit pool closed".into()));
+                    break;
                 }
             };
-            parts.push((part_no, etag));
+            let ctx = ctx.clone();
+            let key_full = key_full.clone();
+            let upload_id = upload_id.clone();
+            join.spawn(async move {
+                let _permit = permit;
+                let etag = ctx
+                    .put_one_part(&key_full, part_no, &upload_id, chunk)
+                    .await?;
+                Ok((part_no, etag))
+            });
 
             if filled < PART_SIZE {
                 break;
             }
         }
 
-        if parts.is_empty() {
-            // empty body, send a single empty part
-            part_no += 1;
-            let resp = self
-                .signed_request(
-                    "PUT",
-                    &self.full_key(key),
-                    &[
-                        ("partNumber", part_no.to_string().as_str()),
-                        ("uploadId", upload_id.as_str()),
-                    ],
-                    Bytes::new(),
-                    &[],
-                )
-                .await?;
-            let resp = check_status(resp).await?;
-            let etag = resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("\"d41d8cd98f00b204e9800998ecf8427e\"")
-                .to_string();
-            parts.push((part_no, etag));
+        // Drain finished PUTs; on the first failure (read error or part PUT)
+        // stop collecting, cancel the siblings still in flight, then abort the
+        // whole upload so no parts outlive the aborted multipart
+        let mut parts: Vec<(u32, String)> = Vec::with_capacity(part_no as usize);
+        let mut first_err = read_result.err();
+        if first_err.is_none() {
+            while let Some(joined) = join.join_next().await {
+                match joined {
+                    Ok(Ok(pe)) => parts.push(pe),
+                    Ok(Err(e)) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                    Err(je) => {
+                        first_err = Some(StorageError::Transport(format!(
+                            "multipart part task: {je}"
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            join.shutdown().await;
+            let _ = self.abort_multipart(key, &upload_id).await;
+            return Err(e);
         }
 
-        // complete
+        // CompleteMultipartUpload lists every part sorted by partNumber
+        parts.sort_by_key(|(n, _)| *n);
         let mut xml = String::from("<CompleteMultipartUpload>");
         for (n, etag) in &parts {
             xml.push_str(&format!(
@@ -390,43 +454,50 @@ impl Storage for S3Storage {
         let client = self.client.clone();
         let base = self.base.clone();
         let retry_policy = self.retry_policy;
+        let part_permits = self.part_permits.clone();
 
         let s = stream::unfold(
             (Some(String::new()), full_prefix, cfg, client, base),
-            move |(token, prefix, cfg, client, base)| async move {
-                let token = token?;
-                let s = S3Storage {
-                    cfg: cfg.clone(),
-                    client: client.clone(),
-                    base: base.clone(),
-                    retry_policy,
-                };
-                let q: [(&str, &str); _] = [
-                    ("list-type", "2"),
-                    ("prefix", prefix.as_str()),
-                    ("continuation-token", token.as_str()),
-                ];
-                let q = if token.is_empty() { &q[..2] } else { &q[..] };
-                let resp = match s.signed_request("GET", "", q, Bytes::new(), &[]).await {
-                    Ok(r) => r,
-                    Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
-                };
-                let resp = match check_status(resp).await {
-                    Ok(r) => r,
-                    Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
-                };
-                let body = match resp.text().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Some((Err(e.into()), (None, prefix, cfg, client, base)));
+            move |(token, prefix, cfg, client, base)| {
+                // list only issues GETs; the reconstructed handle shares the
+                // real permit pool but never reaches the multipart path
+                let part_permits = part_permits.clone();
+                async move {
+                    let token = token?;
+                    let s = S3Storage {
+                        cfg: cfg.clone(),
+                        client: client.clone(),
+                        base: base.clone(),
+                        retry_policy,
+                        part_permits,
+                    };
+                    let q: [(&str, &str); _] = [
+                        ("list-type", "2"),
+                        ("prefix", prefix.as_str()),
+                        ("continuation-token", token.as_str()),
+                    ];
+                    let q = if token.is_empty() { &q[..2] } else { &q[..] };
+                    let resp = match s.signed_request("GET", "", q, Bytes::new(), &[]).await {
+                        Ok(r) => r,
+                        Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
+                    };
+                    let resp = match check_status(resp).await {
+                        Ok(r) => r,
+                        Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
+                    };
+                    let body = match resp.text().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Some((Err(e.into()), (None, prefix, cfg, client, base)));
+                        }
+                    };
+                    match parse_list_v2(&body, &cfg.prefix) {
+                        Ok((objects, next)) => {
+                            let next_state = (next, prefix, cfg, client, base);
+                            Some((Ok(objects), next_state))
+                        }
+                        Err(e) => Some((Err(e), (None, prefix, cfg, client, base))),
                     }
-                };
-                match parse_list_v2(&body, &cfg.prefix) {
-                    Ok((objects, next)) => {
-                        let next_state = (next, prefix, cfg, client, base);
-                        Some((Ok(objects), next_state))
-                    }
-                    Err(e) => Some((Err(e), (None, prefix, cfg, client, base))),
                 }
             },
         )
@@ -1036,12 +1107,11 @@ mod tests {
                     if key.contains("boom") && part >= 2 {
                         return Resp::new(503).body(b"<Error/>".to_vec());
                     }
-                    let id = req.query("uploadId").unwrap().to_string();
-                    u.lock()
-                        .unwrap()
-                        .entry(id)
-                        .or_default()
-                        .insert(part, req.body.clone());
+                    // late parts of an aborted upload must not resurrect it
+                    let id = req.query("uploadId").unwrap();
+                    if let Some(parts) = u.lock().unwrap().get_mut(id) {
+                        parts.insert(part, req.body.clone());
+                    }
                     Resp::new(200).header("etag", &format!("\"etag-{part}\""))
                 }
                 "PUT" if req.headers.contains_key("x-amz-copy-source") => {
@@ -1201,5 +1271,106 @@ mod tests {
             .await;
         assert!(matches!(err, Err(StorageError::Http { status: 503, .. })));
         assert!(uploads.lock().unwrap().is_empty(), "abort must clean up");
+    }
+
+    /// Pipelined multipart keeps several part PUTs in flight, so they finish
+    /// out of order; CompleteMultipartUpload must still list every part
+    /// ascending by partNumber with its matching ETag (S3 rejects unsorted
+    /// manifests). Force part 1 to land last via a one-shot transient — its
+    /// retry backoff outlasts the other parts' PUTs — then assert the captured
+    /// completion XML is sorted and the bytes survive the reorder.
+    #[tokio::test]
+    async fn multipart_completion_orders_parts_by_number() {
+        use crate::storage::test_http::{Req, Resp, payload, read_all, reader, serve};
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let parts: Arc<Mutex<BTreeMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let complete_xml: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let part1_failed = Arc::new(AtomicBool::new(false));
+
+        let (p, cx, pf) = (parts.clone(), complete_xml.clone(), part1_failed.clone());
+        let base = serve(move |req: &Req| match req.method.as_str() {
+            "POST" if req.has_query("uploads") => Resp::new(200).body(
+                b"<InitiateMultipartUploadResult><UploadId>u1</UploadId></InitiateMultipartUploadResult>"
+                    .to_vec(),
+            ),
+            "PUT" if req.has_query("partNumber") => {
+                let part: u32 = req.query("partNumber").unwrap().parse().unwrap();
+                // fail part 1's first attempt once; its retry backoff lands it
+                // last in completion order, forcing the sort to do real work
+                if part == 1 && !pf.swap(true, Ordering::SeqCst) {
+                    return Resp::new(503).body(b"<Error/>".to_vec());
+                }
+                p.lock().unwrap().insert(part, req.body.clone());
+                Resp::new(200).header("etag", &format!("\"e{part}\""))
+            }
+            "POST" if req.has_query("uploadId") => {
+                *cx.lock().unwrap() = Some(String::from_utf8_lossy(&req.body).into_owned());
+                Resp::new(200).body(b"<CompleteMultipartUploadResult/>".to_vec())
+            }
+            "GET" => {
+                let buf: Vec<u8> = p.lock().unwrap().values().flatten().copied().collect();
+                Resp::new(200).body(buf)
+            }
+            _ => Resp::new(400),
+        })
+        .await;
+
+        let cfg = S3Config {
+            bucket: "bkt".into(),
+            prefix: "p".into(),
+            region: "us-east-1".into(),
+            creds: CredentialSource::Static(Credentials {
+                access_key: "AKID".into(),
+                secret_key: "sek".into(),
+                session_token: None,
+                expires_at: None,
+            }),
+            endpoint: Some(base),
+            force_path_style: true,
+        };
+        // base_delay long enough that part 1's retry completes well after the
+        // sub-ms loopback PUTs of parts 2..5
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(80),
+            max_delay: Duration::from_millis(80),
+            jitter: false,
+        };
+        let s = S3Storage::with_retry_policy(cfg, policy).unwrap();
+
+        let big = payload(33 * 1024 * 1024); // 5 parts: 8,8,8,8,1 MiB
+        s.put("big.zst", reader(&big), Some(big.len() as u64))
+            .await
+            .unwrap();
+
+        let xml = complete_xml
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("completion sent");
+        let nums: Vec<u32> = xml
+            .split("<PartNumber>")
+            .skip(1)
+            .filter_map(|s| s.split("</PartNumber>").next())
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        assert_eq!(
+            nums,
+            vec![1, 2, 3, 4, 5],
+            "parts must be sorted by partNumber: {xml}"
+        );
+        for n in 1..=5u32 {
+            assert!(
+                xml.contains(&format!(
+                    "<PartNumber>{n}</PartNumber><ETag>\"e{n}\"</ETag>"
+                )),
+                "part {n} etag mapping wrong in {xml}"
+            );
+        }
+        // bytes survive the out-of-order pipeline
+        assert_eq!(read_all(s.get("big.zst").await.unwrap()).await, big);
     }
 }

@@ -349,6 +349,86 @@ async fn fetch_recreates_tablespace_symlinks() {
     assert_eq!(std::fs::read(target.join("PG_VERSION")).unwrap(), b"16");
 }
 
+/// A part carrying its own `pg_tblspc/<oid>` symlink entry must not override
+/// the sentinel-restored link: the sentinel target (which honors
+/// --tablespace-mapping) is authoritative, and recreating the link mid-restore
+/// would race the concurrent data fan-out. Regression for the archived link
+/// target clobbering a mapped relocation
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_ignores_archived_tablespace_symlink_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let restore = dir.path().join("restore");
+    let sentinel_target = dir.path().join("ts_target");
+    let archived_target = dir.path().join("archived_ts");
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+
+    let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
+
+    let mut spec = TablespaceSpec::new(restore.to_string_lossy());
+    spec.add(16384, sentinel_target.to_string_lossy());
+    let mut sentinel = make_sentinel_v2(restore.to_str().unwrap());
+    sentinel.sentinel.tablespace_spec = Some(spec);
+    put_bytes(
+        store.clone(),
+        &sentinel_key(&backup_name),
+        serde_json::to_vec(&sentinel).unwrap(),
+    )
+    .await;
+
+    // Part has BOTH an archived symlink entry pointing at the backup-time
+    // location AND the file beneath it. The symlink entry must be ignored
+    let tar_bytes = {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            link.set_link_name(&archived_target).unwrap();
+            link.set_path("pg_tblspc/16384").unwrap();
+            link.set_cksum();
+            b.append(&link, std::io::empty()).unwrap();
+
+            let mut file = tar::Header::new_gnu();
+            file.set_size(2);
+            file.set_mode(0o644);
+            file.set_path("pg_tblspc/16384/PG_VERSION").unwrap();
+            file.set_cksum();
+            b.append(&file, &b"16"[..]).unwrap();
+            b.finish().unwrap();
+        }
+        buf
+    };
+    put_bytes(store.clone(), &tar_part_key(&backup_name, 1, ""), tar_bytes).await;
+
+    fetch_mod::handle(
+        &test_settings(),
+        store as Arc<dyn Storage>,
+        &backup_name,
+        &restore,
+    )
+    .await
+    .unwrap();
+
+    let link = restore.join("pg_tblspc/16384");
+    let md = std::fs::symlink_metadata(&link).unwrap();
+    assert!(md.file_type().is_symlink(), "expected symlink at {link:?}");
+    // Link must still point at the sentinel target, not the archived one
+    assert_eq!(std::fs::read_link(&link).unwrap(), sentinel_target);
+    assert!(
+        !archived_target.exists(),
+        "archived target must never be materialized"
+    );
+    // File lands through the sentinel link
+    assert_eq!(
+        std::fs::read(sentinel_target.join("PG_VERSION")).unwrap(),
+        b"16"
+    );
+}
+
 #[tokio::test]
 async fn show_round_trip_and_mark_flips_permanent() {
     use walrus::pg::backup::show as show_mod;

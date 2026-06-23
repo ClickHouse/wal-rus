@@ -10,22 +10,25 @@
 //! into its own part (wal-g matches this behavior; mirrors a real PG tar
 //! that occasionally carries multi-GB segment files)
 //!
-//! The streamer runs as `spawn_blocking` because `tar::Archive` /
-//! `tar::Builder` are sync. Async input is bridged via `SyncIoBridge`;
-//! per-part output flows over an mpsc of `Bytes` that the caller reads as
-//! an `AsyncRead` (see `ChannelReader`)
+//! The streamer runs as a `tokio::spawn` task over `astral-tokio-tar`'s async
+//! `Archive` / `Builder`; per-part output flows over an mpsc of `Bytes` that
+//! the caller reads as an `AsyncRead` (see `ChannelReader`)
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Read, Write};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use tokio::io::AsyncRead;
+use futures::StreamExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::io::SyncIoBridge;
+use tokio_tar::{Archive, Builder, Header};
+use tokio_util::sync::PollSender;
 
 use crate::pg::backup::delta::{self as delta_mod, PG_PAGE_SIZE, PagedFileDeltaMap};
 use crate::pg::backup::increment::{
@@ -125,32 +128,29 @@ where
     R: AsyncRead + Send + Unpin + 'static,
 {
     let (parts_tx, parts_rx) = mpsc::channel::<Result<Part>>(opts.queue_depth.max(1));
-    let handle = tokio::task::spawn_blocking(move || -> Result<StreamerResult> {
-        let sync_input = SyncIoBridge::new(input);
-        run_blocking(sync_input, opts, parts_tx)
-    });
+    let handle = tokio::spawn(run_async(input, opts, parts_tx));
     (parts_rx, handle)
 }
 
-fn run_blocking<R: Read>(
+async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
     input: R,
     opts: StreamerOpts,
     parts_tx: mpsc::Sender<Result<Part>>,
 ) -> Result<StreamerResult> {
-    let mut archive = tar::Archive::new(input);
+    let mut archive = Archive::new(input);
     let mut entries = archive.entries().context("open tar entries")?;
 
     let mut result = StreamerResult::default();
     let mut file_no = opts.starting_file_no;
-    let mut tee_builder: Option<tar::Builder<Vec<u8>>> = if opts.tee_names.is_empty() {
+    let mut tee_builder: Option<Builder<Vec<u8>>> = if opts.tee_names.is_empty() {
         None
     } else {
-        Some(tar::Builder::new(Vec::new()))
+        Some(Builder::new(Vec::new()))
     };
 
     let mut current: Option<PartCtx> = None;
 
-    for entry in entries.by_ref() {
+    while let Some(entry) = entries.next().await {
         let mut entry = entry.context("read tar entry")?;
         let header = entry.header().clone();
         let orig_path = entry
@@ -199,11 +199,11 @@ fn run_blocking<R: Read>(
             && ctx.bytes_written() > 0
             && ctx.bytes_written().saturating_add(out_body_size) > opts.max_tar_size
         {
-            finalize_part(current.take().unwrap())?;
+            finalize_part(current.take().unwrap()).await?;
         }
         if current.is_none() {
             file_no += 1;
-            current = Some(start_part(file_no, &parts_tx)?);
+            current = Some(start_part(file_no, &parts_tx).await?);
         }
         let ctx = current.as_mut().unwrap();
 
@@ -230,6 +230,7 @@ fn run_blocking<R: Read>(
                 let body = IncrementBodyReader::new(header_bytes, &mut entry, blocks, entry_size);
                 ctx.builder
                     .append_data(&mut new_hdr, &mapped, body)
+                    .await
                     .context("append increment to current part")?;
                 (true, false)
             }
@@ -237,18 +238,24 @@ fn run_blocking<R: Read>(
                 if tee_match {
                     // Tee path: buffer in memory (only used for small files like pg_control)
                     let mut buf = Vec::with_capacity(entry_size as usize);
-                    entry.read_to_end(&mut buf).context("read tee entry")?;
+                    entry
+                        .read_to_end(&mut buf)
+                        .await
+                        .context("read tee entry")?;
                     ctx.builder
-                        .append_data(&mut new_hdr, &mapped, std::io::Cursor::new(&buf))
+                        .append_data(&mut new_hdr, &mapped, &buf[..])
+                        .await
                         .context("append to current part")?;
                     if let Some(tb) = tee_builder.as_mut() {
                         let mut tee_hdr = header.clone();
-                        tb.append_data(&mut tee_hdr, &mapped, std::io::Cursor::new(&buf))
+                        tb.append_data(&mut tee_hdr, &mapped, &buf[..])
+                            .await
                             .context("append to tee tar")?;
                     }
                 } else {
                     ctx.builder
                         .append_data(&mut new_hdr, &mapped, &mut entry)
+                        .await
                         .context("append to current part")?;
                 }
                 (false, false)
@@ -274,10 +281,11 @@ fn run_blocking<R: Read>(
     }
 
     if let Some(ctx) = current.take() {
-        finalize_part(ctx)?;
+        finalize_part(ctx).await?;
     }
-    if let Some(tb) = tee_builder.take() {
-        let buf = tb.into_inner().context("finish tee tar")?;
+    if let Some(mut tb) = tee_builder.take() {
+        tb.finish().await.context("finish tee tar")?;
+        let buf = tb.into_inner().await.context("into_inner tee tar")?;
         if !buf.is_empty() {
             result.tee_bytes = Some(Bytes::from(buf));
         }
@@ -288,7 +296,7 @@ fn run_blocking<R: Read>(
 }
 
 /// Outcome of the delta-mode lookup for one entry
-enum DeltaClass {
+pub(crate) enum DeltaClass {
     /// Not a paged file (or no delta map): pass body through unchanged
     Passthrough,
     /// Paged file whose changed-block set intersects the file: emit increment
@@ -301,7 +309,11 @@ enum DeltaClass {
     Skip,
 }
 
-fn classify_for_delta(ctx: &Option<DeltaContext>, path: &str, entry_size: u64) -> DeltaClass {
+pub(crate) fn classify_for_delta(
+    ctx: &Option<DeltaContext>,
+    path: &str,
+    entry_size: u64,
+) -> DeltaClass {
     let Some(ctx) = ctx.as_ref() else {
         return DeltaClass::Passthrough;
     };
@@ -357,25 +369,41 @@ fn classify_for_delta(ctx: &Option<DeltaContext>, path: &str, entry_size: u64) -
     }
 }
 
-/// `Read` impl that emits a pre-encoded increment header followed by the
+/// `AsyncRead` impl that emits a pre-encoded increment header followed by the
 /// subset of input pages whose block numbers appear in `blocks`. Reads the
-/// input strictly forward — for each emitted page, skips intervening pages
-/// by `read_exact` into a scratch buffer
-struct IncrementBodyReader<'a, R: Read> {
+/// input strictly forward — pages before each target are read & discarded
+enum IncrementPhase {
+    Header,
+    /// load the next target page (skipping intervening pages first)
+    Load,
+    /// emit the page currently buffered in `page_buf`
+    Emit,
+    Done,
+}
+
+pub(crate) struct IncrementBodyReader<'a, R> {
     header: Vec<u8>,
     header_pos: usize,
     input: &'a mut R,
     blocks: Vec<u32>,
     next_idx: usize,
+    /// next block index still to be read off the input
     cur_block: u32,
-    page_buf: Vec<u8>,
-    page_pos: usize,
-    page_filled: bool,
-    _entry_size: u64,
+    page_buf: [u8; PG_PAGE_SIZE as usize],
+    /// bytes filled into `page_buf` while loading the current page
+    fill: usize,
+    /// emit cursor into `page_buf`
+    emit_pos: usize,
+    phase: IncrementPhase,
 }
 
-impl<'a, R: Read> IncrementBodyReader<'a, R> {
-    fn new(header: Vec<u8>, input: &'a mut R, blocks: Vec<u32>, entry_size: u64) -> Self {
+impl<'a, R: AsyncRead + Unpin> IncrementBodyReader<'a, R> {
+    pub(crate) fn new(
+        header: Vec<u8>,
+        input: &'a mut R,
+        blocks: Vec<u32>,
+        _entry_size: u64,
+    ) -> Self {
         Self {
             header,
             header_pos: 0,
@@ -383,54 +411,86 @@ impl<'a, R: Read> IncrementBodyReader<'a, R> {
             blocks,
             next_idx: 0,
             cur_block: 0,
-            page_buf: vec![0u8; PG_PAGE_SIZE as usize],
-            page_pos: 0,
-            page_filled: false,
-            _entry_size: entry_size,
+            page_buf: [0u8; PG_PAGE_SIZE as usize],
+            fill: 0,
+            emit_pos: 0,
+            phase: IncrementPhase::Header,
         }
     }
 }
 
-impl<'a, R: Read> Read for IncrementBodyReader<'a, R> {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
-        // Phase 1: emit header bytes
-        if self.header_pos < self.header.len() {
-            let n = (self.header.len() - self.header_pos).min(out.len());
-            out[..n].copy_from_slice(&self.header[self.header_pos..self.header_pos + n]);
-            self.header_pos += n;
-            return Ok(n);
-        }
-        // Phase 2: emit current page
-        if self.page_filled {
-            let blcksz = PG_PAGE_SIZE as usize;
-            let n = (blcksz - self.page_pos).min(out.len());
-            out[..n].copy_from_slice(&self.page_buf[self.page_pos..self.page_pos + n]);
-            self.page_pos += n;
-            if self.page_pos == blcksz {
-                self.page_filled = false;
-                self.next_idx += 1;
+impl<'a, R: AsyncRead + Unpin> AsyncRead for IncrementBodyReader<'a, R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        let page = PG_PAGE_SIZE as usize;
+        loop {
+            match me.phase {
+                IncrementPhase::Header => {
+                    if me.header_pos < me.header.len() {
+                        let n = (me.header.len() - me.header_pos).min(out.remaining());
+                        if n == 0 {
+                            return Poll::Ready(Ok(()));
+                        }
+                        out.put_slice(&me.header[me.header_pos..me.header_pos + n]);
+                        me.header_pos += n;
+                        return Poll::Ready(Ok(()));
+                    }
+                    me.phase = IncrementPhase::Load;
+                }
+                IncrementPhase::Load => {
+                    if me.next_idx >= me.blocks.len() {
+                        me.phase = IncrementPhase::Done;
+                        continue;
+                    }
+                    let target = me.blocks[me.next_idx];
+                    // fill page_buf with one full page from the input
+                    while me.fill < page {
+                        let mut rb = ReadBuf::new(&mut me.page_buf[me.fill..]);
+                        match Pin::new(&mut *me.input).poll_read(cx, &mut rb) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Ready(Ok(())) => {
+                                let got = rb.filled().len();
+                                if got == 0 {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "increment input ended mid-page",
+                                    )));
+                                }
+                                me.fill += got;
+                            }
+                        }
+                    }
+                    me.fill = 0;
+                    if me.cur_block < target {
+                        // intervening page: discard & advance
+                        me.cur_block += 1;
+                        continue;
+                    }
+                    me.emit_pos = 0;
+                    me.phase = IncrementPhase::Emit;
+                }
+                IncrementPhase::Emit => {
+                    let n = (page - me.emit_pos).min(out.remaining());
+                    if n == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    out.put_slice(&me.page_buf[me.emit_pos..me.emit_pos + n]);
+                    me.emit_pos += n;
+                    if me.emit_pos == page {
+                        me.next_idx += 1;
+                        me.cur_block += 1;
+                        me.phase = IncrementPhase::Load;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                IncrementPhase::Done => return Poll::Ready(Ok(())),
             }
-            return Ok(n);
         }
-        // Phase 3: load the next target page
-        if self.next_idx >= self.blocks.len() {
-            return Ok(0);
-        }
-        let target = self.blocks[self.next_idx];
-        // Skip pages before target by reading & discarding
-        while self.cur_block < target {
-            self.input.read_exact(&mut self.page_buf)?;
-            self.cur_block += 1;
-        }
-        self.input.read_exact(&mut self.page_buf)?;
-        self.cur_block += 1;
-        self.page_filled = true;
-        self.page_pos = 0;
-        // Tail-recurse via loop semantics: the next read() call will pump out
-        Read::read(self, out)
     }
 }
 
@@ -441,45 +501,39 @@ fn _bind_increment(_: increment::IncrementHeader) {}
 
 struct PartCtx {
     file_no: u32,
-    builder: tar::Builder<CountingWriter<BlockingSender>>,
-    bytes_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    builder: Builder<PartWriter>,
+    bytes_counter: Arc<AtomicU64>,
 }
 
 impl PartCtx {
     fn bytes_written(&self) -> u64 {
-        self.bytes_counter
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.bytes_counter.load(Ordering::Relaxed)
     }
 }
 
-fn start_part(file_no: u32, parts_tx: &mpsc::Sender<Result<Part>>) -> Result<PartCtx> {
+async fn start_part(file_no: u32, parts_tx: &mpsc::Sender<Result<Part>>) -> Result<PartCtx> {
     let (byte_tx, byte_rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
     let reader = ChannelReader::new(byte_rx);
     parts_tx
-        .blocking_send(Ok(Part { file_no, reader }))
+        .send(Ok(Part { file_no, reader }))
+        .await
         .map_err(|_| anyhow!("parts consumer dropped"))?;
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let writer = CountingWriter {
-        inner: BlockingSender {
-            tx: byte_tx,
-            scratch: Vec::with_capacity(CHUNK_BYTES),
-        },
-        counter: counter.clone(),
-    };
+    let counter = Arc::new(AtomicU64::new(0));
+    let writer = PartWriter::new(byte_tx, counter.clone());
     Ok(PartCtx {
         file_no,
-        builder: tar::Builder::new(writer),
+        builder: Builder::new(writer),
         bytes_counter: counter,
     })
 }
 
-fn finalize_part(ctx: PartCtx) -> Result<()> {
-    // tar::Builder::into_inner writes the two trailing zero blocks then
-    // returns the inner writer
-    let writer = ctx.builder.into_inner().context("finish tar part")?;
-    let CountingWriter { mut inner, .. } = writer;
-    inner.flush().context("flush part")?;
-    drop(inner); // drop sender → ChannelReader sees EOF
+async fn finalize_part(ctx: PartCtx) -> Result<()> {
+    // finish writes the two trailing zero blocks; shutdown flushes the tail
+    // chunk, then dropping the writer closes the channel → ChannelReader EOF
+    let mut builder = ctx.builder;
+    builder.finish().await.context("finish tar part")?;
+    let mut writer = builder.into_inner().await.context("into_inner tar part")?;
+    writer.shutdown().await.context("flush part")?;
     Ok(())
 }
 
@@ -487,75 +541,85 @@ fn strip_dotslash(s: &str) -> &str {
     s.strip_prefix("./").unwrap_or(s)
 }
 
-fn header_mtime(h: &tar::Header) -> DateTime<Utc> {
+fn header_mtime(h: &Header) -> DateTime<Utc> {
     let secs = h.mtime().unwrap_or(0) as i64;
     DateTime::<Utc>::from_timestamp(secs, 0)
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }
 
-/// Sync writer that pushes its writes through a tokio mpsc as `Bytes`.
-/// `blocking_send` parks the writer thread when the channel is full —
-/// that's the backpressure
-struct BlockingSender {
-    tx: mpsc::Sender<std::io::Result<Bytes>>,
+fn broken_pipe() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "part consumer dropped")
+}
+
+/// Async writer that pushes coalesced chunks through a tokio mpsc as `Bytes`.
+/// `PollSender::poll_reserve` parks the task when the channel is full — that's
+/// the backpressure. `counter` tracks total tar bytes for rotation budgeting
+pub(crate) struct PartWriter {
+    sink: PollSender<std::io::Result<Bytes>>,
     scratch: Vec<u8>,
+    counter: Arc<AtomicU64>,
 }
 
-impl Write for BlockingSender {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Coalesce small writes into a single channel send to avoid per-512-byte
-        // tar block traffic across the channel
-        self.scratch.extend_from_slice(buf);
-        if self.scratch.len() >= CHUNK_BYTES {
-            self.flush_scratch()?;
+impl PartWriter {
+    pub(crate) fn new(tx: mpsc::Sender<std::io::Result<Bytes>>, counter: Arc<AtomicU64>) -> Self {
+        Self {
+            sink: PollSender::new(tx),
+            scratch: Vec::with_capacity(CHUNK_BYTES),
+            counter,
         }
-        Ok(buf.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.flush_scratch()
-    }
-}
-
-impl BlockingSender {
-    fn flush_scratch(&mut self) -> std::io::Result<()> {
+    /// Send the buffered scratch as one `Bytes` chunk, swapping in a fresh
+    /// buffer. Avoids the per-CHUNK_BYTES memcpy that `Bytes::copy_from_slice`
+    /// would do
+    fn flush_chunk(&mut self, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         if self.scratch.is_empty() {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         }
-        // Move the scratch Vec into a Bytes owner, swap in a fresh
-        // buffer for the next chunk. Avoids the per-CHUNK_BYTES memcpy
-        // that `Bytes::copy_from_slice` does
+        match self.sink.poll_reserve(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(_)) => return Poll::Ready(Err(broken_pipe())),
+            Poll::Ready(Ok(())) => {}
+        }
         let chunk = Bytes::from(std::mem::replace(
             &mut self.scratch,
             Vec::with_capacity(CHUNK_BYTES),
         ));
-        self.tx.blocking_send(Ok(chunk)).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "part consumer dropped")
-        })
+        self.sink.send_item(Ok(chunk)).map_err(|_| broken_pipe())?;
+        Poll::Ready(Ok(()))
     }
 }
 
-impl Drop for BlockingSender {
-    fn drop(&mut self) {
-        // Best-effort flush of any tail bytes before EOF
-        let _ = self.flush_scratch();
+impl AsyncWrite for PartWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        // Flush the pending chunk before growing scratch past the threshold.
+        // Re-poll re-enters here without re-buffering `buf` (extend happens once,
+        // after the flush completes Ready)
+        if me.scratch.len() >= CHUNK_BYTES {
+            match me.flush_chunk(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        me.scratch.extend_from_slice(buf);
+        me.counter.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        Poll::Ready(Ok(buf.len()))
     }
-}
 
-struct CountingWriter<W: Write> {
-    inner: W,
-    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.counter
-            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(n)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().flush_chunk(cx)
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        // Flush tail bytes; dropping the writer (and its PollSender) closes the
+        // channel so the ChannelReader sees EOF
+        self.get_mut().flush_chunk(cx)
     }
 }
 
@@ -567,6 +631,10 @@ pub fn tablespace_prefix(oid: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Test fixtures build & inspect archives with the sync `tar` crate; the
+    // `Read` import drives `read_to_end` on those sync entries
+    use std::io::Read as _;
+
     use super::*;
     use tokio::io::AsyncReadExt;
 

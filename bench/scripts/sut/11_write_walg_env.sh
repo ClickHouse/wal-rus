@@ -14,7 +14,11 @@
 set -euo pipefail
 
 BUCKET="${BUCKET:-${1:-}}"
-UPLOAD_CONCURRENCY="${UPLOAD_CONCURRENCY:-${2:-16}}"
+UPLOAD_CONCURRENCY="${UPLOAD_CONCURRENCY:-${2:-4}}"
+# backup-fetch / wal-fetch download fan-out; defaults to upload concurrency so a
+# single concurrency sweep tunes both directions (override DOWNLOAD_CONCURRENCY
+# to decouple).
+DOWNLOAD_CONCURRENCY="${DOWNLOAD_CONCURRENCY:-${UPLOAD_CONCURRENCY}}"
 ENV_FILE="${ENV_FILE:-/etc/postgresql/wal-g.env}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 COMPRESSION_METHOD="${WALG_COMPRESSION_METHOD:-lz4}"
@@ -81,7 +85,7 @@ if [[ -z "${ACCESS_KEY}" || -z "${SECRET_KEY}" ]]; then
   exit 1
 fi
 
-echo "=== Writing ${ENV_FILE} (UPLOAD_CONCURRENCY=${UPLOAD_CONCURRENCY}) ==="
+echo "=== Writing ${ENV_FILE} (UPLOAD_CONCURRENCY=${UPLOAD_CONCURRENCY} DOWNLOAD_CONCURRENCY=${DOWNLOAD_CONCURRENCY}) ==="
 install -d -o postgres -g postgres -m 0755 "$(dirname "${ENV_FILE}")"
 umask 077
 tmp="$(mktemp)"
@@ -90,6 +94,7 @@ WALG_S3_PREFIX=${WALG_S3_PREFIX}
 AWS_REGION=${AWS_REGION}
 WALG_COMPRESSION_METHOD=${COMPRESSION_METHOD}
 WALG_UPLOAD_CONCURRENCY=${UPLOAD_CONCURRENCY}
+WALG_DOWNLOAD_CONCURRENCY=${DOWNLOAD_CONCURRENCY}
 PGHOST=/var/run/postgresql
 PGDATA=/dat/18/data
 AWS_ACCESS_KEY_ID=${ACCESS_KEY}

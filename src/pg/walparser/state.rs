@@ -298,7 +298,7 @@ pub fn extract_locations_from_wal_file<R: Read>(
     mut r: R,
 ) -> Result<Vec<BlockLocation>, ExtractError> {
     let mut out = Vec::new();
-    let mut page_buf = vec![0u8; WAL_PAGE_SIZE as usize];
+    let mut page_buf = [0u8; WAL_PAGE_SIZE as usize];
     loop {
         match read_exact_or_eof(&mut r, &mut page_buf)? {
             ReadStatus::Eof => return Ok(out),
