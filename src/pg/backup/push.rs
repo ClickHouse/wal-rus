@@ -8,7 +8,7 @@
 //! The data dir's `global/pg_control` is teed into a separate `pg_control.tar`
 //! so `backup-fetch` can apply it last (matches wal-g's restore ordering)
 //!
-//! `--pgdata` is optional; absent it, the sentinel records the PG-reported
+//! Local PGDATA is optional; absent it, the sentinel records the PG-reported
 //! `data_directory` and we never touch the local filesystem
 
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::mpsc;
 
-use crate::compression::{self, AsyncReader};
+use crate::compression::{self, AsyncBufReader, AsyncReader};
 use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::backup::delta::{self, PrevBackupInfo};
@@ -35,7 +35,8 @@ use crate::pg::backup::{
 };
 use crate::pg::replication::PgConfig;
 use crate::pg::replication::base_backup::{
-    BackupEvent, BaseBackupOpts, ChannelReader, Tablespace, run_base_backup,
+    BackupEvent, BaseBackupOpts, ChannelReader, Tablespace, max_rate_kib_from_bytes,
+    run_base_backup,
 };
 use crate::pg::replication::conn::ReplicationConn;
 use crate::storage::DynStorage;
@@ -66,6 +67,15 @@ pub struct PushArgs {
 }
 
 pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) -> Result<()> {
+    // A local PGDATA directory selects the filesystem source (wal-g
+    // semantics): walks the data dir & packs parts concurrently. Without a
+    // readable local pgdata, fall through to the single-stream BASE_BACKUP path
+    if let Some(pgdata) = args.pgdata.as_deref()
+        && super::fs_push::is_pgdata_dir(pgdata)
+    {
+        return super::fs_push::handle(settings, storage, args).await;
+    }
+
     let start_time = chrono::Utc::now();
 
     // Resolve a delta parent if WALG_DELTA_MAX_STEPS > 0 (or --delta-from-
@@ -149,18 +159,25 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         }
         if parent.is_some() && args.pgdata.is_none() {
             bail!(
-                "--delta-from-wal-summaries requires --pgdata: WAL summaries live on \
+                "--delta-from-wal-summaries requires local PGDATA: WAL summaries live on \
                  the PG host filesystem & cannot be read remotely"
             );
         }
     }
 
     let label = format!("walrus {}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let max_rate_kib = max_rate_kib_from_bytes(settings.disk_rate_limit);
+    if let Some(rate) = max_rate_kib {
+        tracing::info!(
+            target = "backup_push",
+            "BASE_BACKUP rate limited to {rate} kB/s (WALG_DISK_RATE_LIMIT)",
+        );
+    }
     let opts = BaseBackupOpts {
         label: label.clone(),
         fast_checkpoint: args.fast_checkpoint,
         no_verify_checksums: args.no_verify_checksums,
-        max_rate_kib: None,
+        max_rate_kib,
         // wal-g push uploads tablespaces separately and ships WAL via
         // `wal-push`; inlining the segments would duplicate them
         wal: false,
@@ -352,9 +369,12 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                     let cfg = settings.clone();
                     uploads
                         .spawn(async move {
-                            let reader: AsyncReader = Box::pin(part.reader);
-                            let compressed =
-                                compression::encode(cfg.compression, reader, cfg.compression_level);
+                            let reader: AsyncBufReader = Box::pin(part.reader);
+                            let compressed = compression::encode_buffered(
+                                cfg.compression,
+                                reader,
+                                cfg.compression_level,
+                            );
                             let encrypted = cfg.encrypt(compressed);
                             let counter = Arc::new(AtomicU64::new(0));
                             let counting = wrap_counted_reader(encrypted, counter.clone());
@@ -411,6 +431,94 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     let start_lsn = start_lsn.ok_or_else(|| anyhow!("no start LSN received"))?;
     let end_lsn = end_lsn.ok_or_else(|| anyhow!("no end LSN received"))?;
 
+    // Build TablespaceSpec from non-default tablespaces. Mirrors wal-g
+    let user_tablespaces: Vec<&Tablespace> =
+        tablespace_list.iter().filter(|t| !t.is_default()).collect();
+    let tablespace_spec = if user_tablespaces.is_empty() {
+        None
+    } else {
+        let mut spec = TablespaceSpec::new(&data_directory);
+        for t in &user_tablespaces {
+            spec.add(t.oid, &t.location);
+        }
+        Some(spec)
+    };
+
+    finalize_backup(Finalize {
+        settings,
+        storage: &storage,
+        backup_name,
+        start_lsn,
+        end_lsn,
+        pg_version,
+        system_identifier,
+        uncompressed_size,
+        compressed_size,
+        data_directory,
+        tablespace_spec,
+        tablespace_count: tablespace_list.len(),
+        all_files,
+        tar_file_sets,
+        pg_control_tee,
+        parent: parent.as_ref(),
+        delta_context: delta_context.as_ref(),
+        args: &args,
+        start_time,
+        part_count: file_no,
+    })
+    .await
+}
+
+/// Inputs to [`finalize_backup`], shared by the BASE_BACKUP & filesystem paths
+pub(crate) struct Finalize<'a> {
+    pub settings: &'a Settings,
+    pub storage: &'a DynStorage,
+    pub backup_name: String,
+    pub start_lsn: u64,
+    pub end_lsn: u64,
+    pub pg_version: i32,
+    pub system_identifier: u64,
+    pub uncompressed_size: i64,
+    pub compressed_size: i64,
+    pub data_directory: String,
+    pub tablespace_spec: Option<TablespaceSpec>,
+    pub tablespace_count: usize,
+    pub all_files: std::collections::HashMap<String, FileDescription>,
+    pub tar_file_sets: std::collections::HashMap<String, Vec<String>>,
+    pub pg_control_tee: Option<Bytes>,
+    pub parent: Option<&'a PrevBackupInfo>,
+    pub delta_context: Option<&'a DeltaContext>,
+    pub args: &'a PushArgs,
+    pub start_time: chrono::DateTime<chrono::Utc>,
+    pub part_count: u32,
+}
+
+/// Upload pg_control tee, files_metadata.json, sentinel & metadata. Prints the
+/// backup name on success. Common tail for both backup-push source paths
+pub(crate) async fn finalize_backup(f: Finalize<'_>) -> Result<()> {
+    let Finalize {
+        settings,
+        storage,
+        backup_name,
+        start_lsn,
+        end_lsn,
+        pg_version,
+        system_identifier,
+        uncompressed_size,
+        mut compressed_size,
+        data_directory,
+        tablespace_spec,
+        tablespace_count,
+        all_files,
+        tar_file_sets,
+        pg_control_tee,
+        parent,
+        delta_context,
+        args,
+        start_time,
+        part_count,
+    } = f;
+
     // Upload pg_control.tar as a tee so restore can apply it last
     if let Some(bytes) = pg_control_tee {
         let ext = settings.compression.extension();
@@ -438,26 +546,13 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         compressed_size += put_counter.load(Ordering::Relaxed) as i64;
     }
 
-    // Build TablespaceSpec from non-default tablespaces. Mirrors wal-g
-    let user_tablespaces: Vec<&Tablespace> =
-        tablespace_list.iter().filter(|t| !t.is_default()).collect();
-    let tablespace_spec = if user_tablespaces.is_empty() {
-        None
-    } else {
-        let mut spec = TablespaceSpec::new(&data_directory);
-        for t in &user_tablespaces {
-            spec.add(t.oid, &t.location);
-        }
-        Some(spec)
-    };
-
     // Emit files_metadata.json sidecar
     let files_meta = FilesMetadataDto {
         files: all_files,
         tar_file_sets,
         databases_by_names: Default::default(),
     };
-    upload_json(&storage, &files_metadata_key(&backup_name), &files_meta).await?;
+    upload_json(storage, &files_metadata_key(&backup_name), &files_meta).await?;
 
     let hostname = hostname().unwrap_or_default();
     let finish_time = chrono::Utc::now();
@@ -468,7 +563,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
     // must claim FULL — otherwise restore would walk a chain whose
     // increments don't exist
     let (incr_from_lsn, incr_from_name, incr_full_name, incr_count, incr_format) =
-        match (parent.as_ref(), delta_context.as_ref()) {
+        match (parent, delta_context) {
             (Some(p), Some(ctx)) => (
                 Some(p.start_lsn),
                 Some(p.name.clone()),
@@ -523,14 +618,14 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         user_data: args.user_data.clone(),
     };
 
-    upload_json(&storage, &metadata_key(&backup_name), &meta).await?;
-    upload_json(&storage, &sentinel_key(&backup_name), &v2).await?;
+    upload_json(storage, &metadata_key(&backup_name), &meta).await?;
+    upload_json(storage, &sentinel_key(&backup_name), &v2).await?;
 
     tracing::info!(
         target = "backup_push",
         "wrote {backup_name} ({} parts, {} tablespace(s), {} bytes uncompressed, {} bytes compressed)",
-        file_no,
-        tablespace_list.len(),
+        part_count,
+        tablespace_count,
         uncompressed_size,
         compressed_size,
     );
@@ -619,7 +714,7 @@ fn wrap_with_counter(input: AsyncReader) -> (CounterHandle, AsyncReader) {
     (CounterHandle(counter), Box::pin(r))
 }
 
-fn wrap_counted_reader(input: AsyncReader, counter: Arc<AtomicU64>) -> AsyncReader {
+pub(crate) fn wrap_counted_reader(input: AsyncReader, counter: Arc<AtomicU64>) -> AsyncReader {
     Box::pin(CountingReader {
         inner: input,
         counter,
@@ -642,15 +737,16 @@ fn resolve_increment_full_name(p: &PrevBackupInfo) -> String {
     }
 }
 
-/// PG17 wal-summaries → delta map. Returns an error if --pgdata is absent
+/// PG17 wal-summaries → delta map. Returns an error if local PGDATA is absent
 /// since the summaries live on the server's filesystem
-fn build_delta_map_from_summaries(
+pub(crate) fn build_delta_map_from_summaries(
     pgdata: Option<&std::path::Path>,
     timeline: u32,
     first_used_lsn: u64,
     first_not_used_lsn: u64,
 ) -> Result<crate::pg::backup::delta::PagedFileDeltaMap> {
-    let pgdata = pgdata.ok_or_else(|| anyhow!("--delta-from-wal-summaries requires --pgdata"))?;
+    let pgdata =
+        pgdata.ok_or_else(|| anyhow!("--delta-from-wal-summaries requires local PGDATA"))?;
     let map = crate::pg::wal_summaries::read_for_range(
         pgdata,
         timeline,
@@ -671,9 +767,9 @@ mod tests {
 
     #[test]
     fn delta_map_from_summaries_requires_pgdata() {
-        // Summaries live on the PG host filesystem; without --pgdata the map
+        // Summaries live on the PG host filesystem; without local PGDATA the map
         // can't be read, so the wrapper must bail before touching disk
         let err = build_delta_map_from_summaries(None, 1, 0x100, 0x200).unwrap_err();
-        assert!(format!("{err:#}").contains("--pgdata"), "{err:#}");
+        assert!(format!("{err:#}").contains("PGDATA"), "{err:#}");
     }
 }

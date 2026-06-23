@@ -41,7 +41,7 @@ roaring = "0.11"
 aws-lc-rs = "1"
 quick-xml = "0.40"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-tar = "0.4"
+astral-tokio-tar = "0.6"
 postgres-protocol = "0.6"
 fallible-iterator = "0.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
@@ -50,9 +50,11 @@ rustls-pki-types = "1"
 rustls-pemfile = "2"
 webpki-roots = "1"
 dryoc = { version = "0.8", default-features = false, features = ["u64_backend"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+tar = "0.4"
 
 [features]
 # Enabled only on the VM test runner: hits a real PG cluster at PGPORT

@@ -876,7 +876,7 @@ async fn wal_summaries_parse_real_pg_files() {
 }
 
 /// End-to-end `--delta-from-wal-summaries`: the `summarize_wal=off` and
-/// missing-`--pgdata` preconditions must abort, and the success path must
+/// missing local PGDATA preconditions must abort, and success path must
 /// reconstruct byte-for-byte against a non-delta backup of the same state.
 #[tokio::test]
 async fn delta_from_summaries_against_live_pg() {
@@ -952,7 +952,7 @@ async fn delta_from_summaries_against_live_pg() {
     let mut s_delta = s.clone();
     s_delta.delta.max_steps = 1;
 
-    // ── precondition bail: summaries live on the host fs, so --pgdata is
+    // ── precondition bail: summaries live on host fs, so local PGDATA is
     //    required once a delta parent is in play ──
     let pgdata_err = backup::push::handle(
         &s_delta,
@@ -964,9 +964,9 @@ async fn delta_from_summaries_against_live_pg() {
         },
     )
     .await
-    .expect_err("--delta-from-wal-summaries without --pgdata must abort");
+    .expect_err("--delta-from-wal-summaries without local PGDATA must abort");
     assert!(
-        format!("{pgdata_err:#}").contains("--pgdata"),
+        format!("{pgdata_err:#}").contains("PGDATA"),
         "{pgdata_err:#}"
     );
 

@@ -10,34 +10,44 @@ the bump PR, not master).
 
 ## Shared on-bucket format
 
-- Key layout version `005`: `wal_005/<segment>[.<ext>]`,
-  `basebackups_005/<name>/tar_partitions/part_NNN.tar.<ext>`,
-  `pg_control.tar.<ext>` tee, sentinel at
-  `basebackups_005/<name>_backup_stop_sentinel.json` (one level above
-  the per-backup dir, same asymmetry as wal-g)
-- Sentinel mirrors `BackupSentinelDtoV2` field-for-field, PascalCase
-  keys, `Spec` for tablespaces; every Option field tolerant-deserializes
-  so sentinels from either tool parse
-- `files_metadata.json` schema (`Files`, `TarFileSets`)
-- Delta naming `base_<24hex>_D_<parent_24hex>`; chain discovered via
-  sentinel `IncrementFrom`, format detected per-file by magic byte, no
-  sentinel format flag (wal-g convention)
-- `wi1` increment format and PG17 native INCREMENTAL format
-  (magic `0xd3ae1f0d`); native layout verified field-by-field against
-  postgres source (`src/common/blkreftable.c`,
-  `src/backend/backup/basebackup.c`,
-  `src/bin/pg_combinebackup/reconstruct.c`)
-- libsodium framing: 24-byte secretstream header, 8 KiB plaintext
-  chunks, 17-byte per-chunk overhead, explicit FINAL chunk on close;
-  a wire-format pin test fails on any drift
-- Prefetch dir layout `pg_wal/.wal-g/prefetch/{running/,}` so a sidecar
-  can run either tool against the same pg_wal
-- Daemon Unix-socket protocol byte format (Check / WalPush / WalFetch)
-- `delete` mode + modifier vocabulary (`before` / `retain` /
-  `everything` / `target` / `garbage`; `FULL`, `FIND_FULL`, `FORCE`,
-  `ARCHIVES`, `BACKUPS`, `--after`), permanent-backup WAL reservation,
-  `--confirm` gate
-- Env vars follow `WALG_*` / `PG*` / `AWS_*` / `GOOGLE_*` naming
+The on-bucket format is wal-g's verbatim, so this doc covers only the
+gaps. Matched without further note: key layout `005`, the
+`BackupSentinelDtoV2` sentinel (PascalCase, tolerant-deserialized so
+either tool's sentinels parse), `files_metadata.json`, delta naming
+(`base_<24hex>_D_<parent_24hex>`, chain via sentinel `IncrementFrom`,
+format magic-detected per file), `wi1` and PG17 native INCREMENTAL
+payloads, libsodium secretstream framing, prefetch dir layout, the
+daemon Unix-socket protocol, the `delete` mode + modifier vocabulary,
+and `WALG_*` / `PG*` / `AWS_*` / `GOOGLE_*` env naming.
+
+## Delta page selection
+
+Both tools emit byte-identical `wi1` / native increments (see above), so a
+delta produced by either restores under either. They diverge only in how the
+producer decides *which* blocks an increment carries.
+
+wal-g defaults to a full scan (`WALG_USE_WAL_DELTA` is false by default): it
+reads every page of every paged relation and ships a page only if the page is
+new (`pd_upper == 0`) or its header LSN is at or past the increment-base LSN
+(`incremental_page_reader.go:SelectNewValidPage`, a predicate lifted from
+PostgreSQL's own page-validity checks and refined on pgsql-hackers). This is
+self-validating: it needs no WAL and re-derives "changed" from each page's own
+header, so a gap in the archived WAL cannot silently drop a changed block.
+Setting `WALG_USE_WAL_DELTA=true` switches wal-g to instead trust a WAL-derived
+changed-block bitmap (file-size gated, no per-page LSN recheck), warning and
+falling back to the full scan when the bitmap can't be loaded
+(`WALG_FORCE_WAL_DELTA` forbids that fallback).
+
+walrus implements only the map-trusting path. `classify_for_delta` ships
+exactly the blocks the changed-block map reports, filtered to blocks within the
+current file size, with no page-LSN recheck. The map is built from WAL
+`<group>_delta` sidecars (raw-WAL walk when a sidecar is missing) or from
+`pg_walsummary` under `--delta-from-wal-summaries`; if it can't be built, walrus
+produces a full backup rather than a scan-based delta. So for walrus
+`WALG_USE_WAL_DELTA` only governs sidecar recording during wal-push, not
+selection — backup-push always selects blocks from a WAL/summary map regardless
+— and a walrus delta is correct only if that map is complete, whereas wal-g's
+default would still catch a missed block by its page LSN.
 
 ## Deliberate divergences
 
@@ -82,7 +92,8 @@ which accepts more connection variables:
 Partial support:
 
 - `PGDATA`: walrus uses it only for daemon path resolution, not as
-  backup-push data directory config
+  backup-push data directory config. `backup-push <PGDATA>` positional
+  syntax matches wal-g CLI behavior
 - `PGHOST`, `PGPORT`: walrus supports single host/port only, not pgx
   multihost semantics
 
@@ -209,78 +220,11 @@ GCE/GKE metadata-server auth is not implemented.
 
 ### Storage backends not implemented
 
-Azure:
-
-- `WALG_AZ_PREFIX`
-- `WALE_AZ_PREFIX`
-- `AZURE_STORAGE_ACCOUNT`
-- `AZURE_STORAGE_ACCESS_KEY`
-- `AZURE_STORAGE_SAS_TOKEN`
-- `AZURE_CLIENT_ID`
-- `AZURE_TENANT_ID`
-- `AZURE_CLIENT_SECRET`
-- `AZURE_ENVIRONMENT_NAME`
-- `AZURE_ENDPOINT_SUFFIX`
-- `AZURE_BUFFER_SIZE`
-- `WALG_AZURE_BUFFER_SIZE`
-- `AZURE_MAX_BUFFERS`
-- `WALG_AZURE_MAX_BUFFERS`
-- `AZURE_TRY_TIMEOUT`
-- `AZURE_BLOB_STORE_API_VERSION`
-
-Alicloud OSS:
-
-- `WALG_OSS_PREFIX`
-- `WALE_OSS_PREFIX`
-- `OSS_ACCESS_KEY_ID`
-- `OSS_ACCESS_KEY_SECRET`
-- `OSS_SESSION_TOKEN`
-- `OSS_ENDPOINT`
-- `OSS_REGION`
-- `OSS_ROLE_ARN`
-- `OSS_ROLE_SESSION_NAME`
-- `OSS_SKIP_VALIDATION`
-- `OSS_MAX_RETRIES`
-- `OSS_CONNECT_TIMEOUT`
-- `OSS_UPLOAD_PART_SIZE`
-- `OSS_COPY_PART_SIZE`
-
-Swift:
-
-- `WALG_SWIFT_PREFIX`
-- `WALE_SWIFT_PREFIX`
-- `OS_AUTH_URL`
-- `OS_USERNAME`
-- `OS_PASSWORD`
-- `OS_TENANT_NAME`
-- `OS_REGION_NAME`
-
-SSH storage:
-
-- `WALG_SSH_PREFIX`
-- `WALE_SSH_PREFIX`
-- `SSH_PORT`
-- `SSH_USERNAME`
-- `SSH_PASSWORD`
-- `SSH_PRIVATE_KEY_PATH`
-
-File storage alias:
-
-- `WALE_FILE_PREFIX`
-
-### Failover storage
-
-- `WALG_FAILOVER_STORAGES`
-- `WALG_FAILOVER_STORAGES_CHECK`
-- `WALG_FAILOVER_STORAGES_CHECK_TIMEOUT`
-- `WALG_FAILOVER_STORAGES_CHECK_SIZE`
-- `WALG_FAILOVER_STORAGES_CACHE_LIFETIME`
-- `WALG_FAILOVER_STORAGES_CACHE_EMA_ALIVE_LIMIT`
-- `WALG_FAILOVER_STORAGES_CACHE_EMA_DEAD_LIMIT`
-- `WALG_FAILOVER_STORAGES_CACHE_EMA_ALPHA_ALIVE_MAX`
-- `WALG_FAILOVER_STORAGES_CACHE_EMA_ALPHA_ALIVE_MIN`
-- `WALG_FAILOVER_STORAGES_CACHE_EMA_ALPHA_DEAD_MAX`
-- `WALG_FAILOVER_STORAGES_CACHE_EMA_ALPHA_DEAD_MIN`
+Azure, Alicloud OSS, Swift, and SSH backends are absent (see the
+divergence table), so all their env vars (`WALG_AZ_PREFIX` / `AZURE_*`,
+`WALG_OSS_PREFIX` / `OSS_*`, `WALG_SWIFT_PREFIX` / `OS_*`,
+`WALG_SSH_PREFIX` / `SSH_*`), the `WALE_FILE_PREFIX` file alias, and
+failover storages (`WALG_FAILOVER_STORAGES*`) are unsupported.
 
 ### Storage aliases
 

@@ -9,11 +9,11 @@
 //! as `AsyncReader` for `Storage::put`
 
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use postgres_protocol::message::backend::Message;
 use std::pin::Pin;
 use std::task::{Context as TaskCtx, Poll};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncBufRead, AsyncRead};
 use tokio::sync::mpsc;
 
 use crate::pg::backup::parse_pg_lsn;
@@ -31,6 +31,22 @@ pub struct BaseBackupOpts {
     /// downstream standby reaches consistent recovery from the tar
     /// alone, no `restore_command` needed for the bootstrap window
     pub wal: bool,
+}
+
+/// PG `BASE_BACKUP ... MAX_RATE` accepts kB/s within these bounds
+/// (src/include/backup/basebackup.h). Out-of-range is a protocol error, not a
+/// clamp, so callers must pre-clamp
+const MAX_RATE_LOWER_KIB: i64 = 32;
+const MAX_RATE_UPPER_KIB: i64 = 1_048_576;
+
+/// Convert a bytes/sec budget (WALG_DISK_RATE_LIMIT) into a `MAX_RATE` argument
+/// in kB/s. None when unset (0)
+pub fn max_rate_kib_from_bytes(bytes_per_sec: u64) -> Option<i32> {
+    if bytes_per_sec == 0 {
+        return None;
+    }
+    let kib = (bytes_per_sec / 1024) as i64;
+    Some(kib.clamp(MAX_RATE_LOWER_KIB, MAX_RATE_UPPER_KIB) as i32)
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +151,34 @@ impl AsyncRead for ChannelReader {
         let chunk = self.leftover.split_to(n);
         buf.put_slice(&chunk);
         Poll::Ready(Ok(()))
+    }
+}
+
+/// Feed leftover `Bytes` slice directly, skipping a per-read memcpy
+impl AsyncBufRead for ChannelReader {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<std::io::Result<&[u8]>> {
+        let this = self.get_mut();
+        // Same empty-payload guard as poll_read: an empty CopyData frame must
+        // not be reported as EOF (empty slice ≡ EOF for AsyncBufRead callers)
+        while this.leftover.is_empty() {
+            if this.closed {
+                return Poll::Ready(Ok(&[]));
+            }
+            match this.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    this.closed = true;
+                    return Poll::Ready(Ok(&[]));
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(Some(Ok(b))) => this.leftover = b,
+            }
+        }
+        Poll::Ready(Ok(&this.leftover))
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        self.get_mut().leftover.advance(amt);
     }
 }
 
@@ -486,6 +530,7 @@ async fn expect_ready_for_query(conn: &mut ReplicationConn) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt as _BufReadExt;
     use tokio::io::AsyncReadExt as _ReadExt;
 
     /// Regression: PG can send empty CopyData frames (eg sparse-file padding
@@ -508,6 +553,33 @@ mod tests {
 
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(&out, b"hello world!");
+    }
+
+    /// Same empty-payload guard, but on the AsyncBufRead path the codec uses.
+    /// Drives partial `consume` so leftover tail survives across fill_buf.
+    #[tokio::test]
+    async fn channel_reader_bufread_skips_empty_payloads() {
+        let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(16);
+        let mut reader = ChannelReader::new(rx);
+
+        tokio::spawn(async move {
+            tx.send(Ok(Bytes::from_static(b"hello "))).await.unwrap();
+            tx.send(Ok(Bytes::new())).await.unwrap();
+            tx.send(Ok(Bytes::from_static(b"world"))).await.unwrap();
+            tx.send(Ok(Bytes::from_static(b"!"))).await.unwrap();
+        });
+
+        let mut out = Vec::new();
+        loop {
+            let chunk = reader.fill_buf().await.unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            // consume one byte at a time to exercise the leftover tail
+            out.push(chunk[0]);
+            reader.consume(1);
+        }
         assert_eq!(&out, b"hello world!");
     }
 
@@ -653,6 +725,23 @@ mod tests {
     #[test]
     fn quotes_label_with_apostrophe() {
         assert_eq!(quote_pg_str("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn max_rate_kib_conversion() {
+        // unset → no MAX_RATE
+        assert_eq!(max_rate_kib_from_bytes(0), None);
+        // 8 MiB/s → 8192 kB/s (wal-g divides bytes by 1024)
+        assert_eq!(max_rate_kib_from_bytes(8 * 1024 * 1024), Some(8192));
+        // below PG's 32 kB/s floor clamps up rather than degrading to unlimited
+        assert_eq!(max_rate_kib_from_bytes(1), Some(32));
+        assert_eq!(max_rate_kib_from_bytes(31 * 1024), Some(32));
+        assert_eq!(max_rate_kib_from_bytes(32 * 1024), Some(32));
+        // above PG's 1 GiB/s ceiling clamps down (effectively unlimited anyway)
+        assert_eq!(
+            max_rate_kib_from_bytes(2 * 1024 * 1024 * 1024),
+            Some(1_048_576)
+        );
     }
 
     use bytes::{BufMut, BytesMut};

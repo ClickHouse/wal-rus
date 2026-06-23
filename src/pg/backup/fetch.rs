@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
+use tokio_tar::Archive;
 use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
@@ -331,108 +332,133 @@ async fn unpack_part(
     let throttled = settings.throttle_network(body);
     let decrypted = settings.decrypt(throttled);
     let decoded = compression::decode(method, decrypted);
-    let dst: PathBuf = dst.to_path_buf();
 
-    let res: std::io::Result<()> = tokio::task::spawn_blocking(move || {
-        let sync_r = SyncIoBridge::new(decoded);
-        let mut archive = tar::Archive::new(sync_r);
-        unpack_manual(&mut archive, &dst, &incremented)
-    })
-    .await
-    .context("tar unpack join")?;
-    res.with_context(|| format!("unpack {key}"))?;
+    let mut archive = Archive::new(decoded);
+    let mut entries = archive.entries().context("open tar entries")?;
+    while let Some(entry) = entries.next().await {
+        let entry = entry.context("read tar entry")?;
+        unpack_entry(entry, dst, &incremented)
+            .await
+            .with_context(|| format!("unpack {key}"))?;
+    }
     tracing::info!(target = "backup_fetch", "unpacked {key}");
     Ok(())
 }
 
-/// Manual tar extraction without the `tar` crate's "stays inside dst"
-/// canonicalization check. PG restores legitimately need to follow
-/// `pg_tblspc/<oid>` symlinks that point outside `dst` — the safe-extract
-/// behavior in `tar::Archive::unpack` refuses that
-fn unpack_manual<R: std::io::Read>(
-    archive: &mut tar::Archive<R>,
+/// Restore one tar entry. PG restores legitimately follow `pg_tblspc/<oid>`
+/// symlinks pointing outside `dst`, so we skip the tar crate's "stays inside
+/// dst" canonicalization. File bodies bridge to a `spawn_blocking` apply path
+/// because `apply_increment_in_place` needs `Seek`
+async fn unpack_entry<R>(
+    entry: tokio_tar::Entry<R>,
     dst: &Path,
     incremented: &HashSet<String>,
-) -> std::io::Result<()> {
-    use std::io::Write;
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        // Skip absolute / parent-dir traversals
-        let rel = strip_to_relative(&path);
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        let target = dst.join(&rel);
-        let header = entry.header().clone();
-        let etype = header.entry_type();
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if etype.is_dir() {
-            match std::fs::create_dir(&target) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
-            }
-        } else if etype.is_symlink() {
-            #[cfg(unix)]
-            {
-                let link = header.link_name()?.ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "symlink without target")
-                })?;
-                // best-effort overwrite
-                let _ = std::fs::remove_file(&target);
-                std::os::unix::fs::symlink(link.as_ref(), &target)?;
-            }
-        } else if etype.is_file() || etype.is_hard_link() {
-            // ignore hard links to keep this simple; PG basebackup doesn't emit any
-            let path_key = rel.to_string_lossy().into_owned();
-            if incremented.contains(&path_key) {
-                // Increment path: apply onto whatever the earlier chain step
-                // left in place. The target must already exist (chain root
-                // wrote the full file). open() in r+w (not truncate)
-                let mut f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&target)
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("apply increment {path_key}: open target: {e}"),
-                        )
-                    })?;
-                let (final_size, _, _) =
-                    apply_increment_in_place(&mut entry, &mut f).map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("apply increment {path_key}: {e}"),
-                        )
-                    })?;
-                f.set_len(final_size)?;
-                f.flush()?;
-            } else {
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&target)?;
-                std::io::copy(&mut entry, &mut f)?;
-                f.flush()?;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(mode) = header.mode() {
-                    let _ =
-                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
-                }
-            }
-        }
-        // entry types we don't restore: hard links, fifo, char/block devices —
-        // none appear in a PG basebackup
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let path = entry.path().context("entry path")?.into_owned();
+    // Skip absolute / parent-dir traversals
+    let rel = strip_to_relative(&path);
+    if rel.as_os_str().is_empty() {
+        return Ok(());
     }
+    let target = dst.join(&rel);
+    let header = entry.header().clone();
+    let etype = header.entry_type();
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if etype.is_dir() {
+        return tokio::fs::create_dir(&target).await.or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e.into())
+            }
+        });
+    }
+    if etype.is_symlink() {
+        // pg_tblspc/<oid> links are restored up-front from the sentinel
+        // TablespaceSpec (mapping-aware) before any part unpacks. Recreating
+        // them from a part entry would race the concurrent data fan-out — its
+        // remove+recreate window vs another part materializing the link's
+        // pg_tblspc/<oid>/... contents — and would clobber a
+        // --tablespace-mapping relocation with the archived (backup-time)
+        // target. PG basebackup emits symlinks only under pg_tblspc, so the
+        // sentinel link is authoritative; skip the entry
+        if rel.parent() == Some(Path::new("pg_tblspc")) {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            let link = header
+                .link_name()
+                .context("symlink target")?
+                .ok_or_else(|| anyhow!("symlink without target"))?;
+            // best-effort overwrite
+            let _ = tokio::fs::remove_file(&target).await;
+            tokio::fs::symlink(link.as_ref(), &target).await?;
+        }
+        return Ok(());
+    }
+    // ignore fifo, char/block devices — none appear in a PG basebackup. Hard
+    // links are treated like regular files (basebackup emits none)
+    if !(etype.is_file() || etype.is_hard_link()) {
+        return Ok(());
+    }
+
+    let path_key = rel.to_string_lossy().into_owned();
+    let is_increment = incremented.contains(&path_key);
+    let target = target.clone();
+    let mode = header.mode().ok();
+    let bridge = SyncIoBridge::new(entry);
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut bridge = bridge;
+        if is_increment {
+            // Increment path: apply onto whatever the earlier chain step left
+            // in place. The target must already exist (chain root wrote the
+            // full file). open() in r+w (not truncate)
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&target)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("apply increment {path_key}: open target: {e}"),
+                    )
+                })?;
+            let (final_size, _, _) =
+                apply_increment_in_place(&mut bridge, &mut f).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("apply increment {path_key}: {e}"),
+                    )
+                })?;
+            f.set_len(final_size)?;
+            f.flush()?;
+        } else {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&target)?;
+            std::io::copy(&mut bridge, &mut f)?;
+            f.flush()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(mode) = mode {
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .context("unpack file join")??;
     Ok(())
 }
 

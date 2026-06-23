@@ -274,7 +274,7 @@ where
     R: Read,
     W: io::Write + io::Seek,
 {
-    let mut page = vec![0u8; PG_PAGE_SIZE as usize];
+    let mut page = [0u8; PG_PAGE_SIZE as usize];
     for &block_no in blocks {
         increment.read_exact(&mut page)?;
         target.seek(io::SeekFrom::Start(block_no as u64 * PG_PAGE_SIZE))?;
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn wi1_apply_writes_at_block_offsets() {
-        let mut target = Cursor::new(vec![0u8; PG_PAGE_SIZE as usize * 3]);
+        let mut target = Cursor::new([0u8; PG_PAGE_SIZE as usize * 3]);
         let mut inc = Vec::new();
         write_increment_header(&mut inc, PG_PAGE_SIZE * 3, &[1]).unwrap();
         inc.extend(std::iter::repeat_n(0xAA, PG_PAGE_SIZE as usize));
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(fmt, Format::Wi1);
 
         target.seek(SeekFrom::Start(0)).unwrap();
-        let mut b = vec![0u8; PG_PAGE_SIZE as usize];
+        let mut b = [0u8; PG_PAGE_SIZE as usize];
         target.read_exact(&mut b).unwrap();
         assert!(b.iter().all(|&x| x == 0));
         target.read_exact(&mut b).unwrap();
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn wi1_trailing_data_rejected() {
-        let mut target = Cursor::new(vec![0u8; PG_PAGE_SIZE as usize * 2]);
+        let mut target = Cursor::new([0u8; PG_PAGE_SIZE as usize * 2]);
         let mut inc = Vec::new();
         write_increment_header(&mut inc, PG_PAGE_SIZE * 2, &[0]).unwrap();
         inc.extend(std::iter::repeat_n(0xCC, PG_PAGE_SIZE as usize));
@@ -395,14 +395,14 @@ mod tests {
         // block body for block 1
         inc.extend(std::iter::repeat_n(0xBB, PG_PAGE_SIZE as usize));
 
-        let mut target = Cursor::new(vec![0xAA; PG_PAGE_SIZE as usize * 5]);
+        let mut target = Cursor::new([0xAA; PG_PAGE_SIZE as usize * 5]);
         let (size, n, fmt) = apply_increment_in_place(&mut Cursor::new(inc), &mut target).unwrap();
         assert_eq!(size, PG_PAGE_SIZE * 5);
         assert_eq!(n, 1);
         assert_eq!(fmt, Format::Native);
 
         target.seek(SeekFrom::Start(PG_PAGE_SIZE)).unwrap();
-        let mut buf = vec![0u8; PG_PAGE_SIZE as usize];
+        let mut buf = [0u8; PG_PAGE_SIZE as usize];
         target.read_exact(&mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0xBB));
     }
@@ -416,7 +416,7 @@ mod tests {
         inc.extend(std::iter::repeat_n(0x11, PG_PAGE_SIZE as usize));
         inc.extend(std::iter::repeat_n(0x22, PG_PAGE_SIZE as usize));
 
-        let mut target = Cursor::new(vec![0u8; PG_PAGE_SIZE as usize * 4]);
+        let mut target = Cursor::new([0u8; PG_PAGE_SIZE as usize * 4]);
         let (size, _, _) = apply_increment_in_place(&mut Cursor::new(inc), &mut target).unwrap();
         assert_eq!(size, PG_PAGE_SIZE * 3);
     }
@@ -428,7 +428,7 @@ mod tests {
         write_native_increment_header(&mut inc, 10, &[]).unwrap();
         assert_eq!(inc.len(), 12);
 
-        let mut target = Cursor::new(vec![0u8; PG_PAGE_SIZE as usize * 10]);
+        let mut target = Cursor::new([0u8; PG_PAGE_SIZE as usize * 10]);
         let (size, n, fmt) = apply_increment_in_place(&mut Cursor::new(inc), &mut target).unwrap();
         assert_eq!(size, PG_PAGE_SIZE * 10);
         assert_eq!(n, 0);
@@ -442,14 +442,14 @@ mod tests {
         write_native_increment_header(&mut inc, 1, &blocks).unwrap();
         inc.extend(std::iter::repeat_n(0xCC, PG_PAGE_SIZE as usize));
         inc.push(0x42);
-        let mut target = Cursor::new(vec![0u8; PG_PAGE_SIZE as usize]);
+        let mut target = Cursor::new([0u8; PG_PAGE_SIZE as usize]);
         let err = apply_increment_in_place(&mut Cursor::new(inc), &mut target).unwrap_err();
         assert!(matches!(err, IncrementError::UnexpectedTrailing));
     }
 
     #[test]
     fn apply_rejects_unknown_magic() {
-        let mut target = Cursor::new(vec![0u8; PG_PAGE_SIZE as usize]);
+        let mut target = Cursor::new([0u8; PG_PAGE_SIZE as usize]);
         let buf = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00];
         let err = apply_increment_in_place(&mut Cursor::new(buf), &mut target).unwrap_err();
         assert!(matches!(err, IncrementError::BadMagic(_)));

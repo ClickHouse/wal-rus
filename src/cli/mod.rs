@@ -106,13 +106,14 @@ pub enum Cmd {
         #[arg(long)]
         target_user_data: Option<String>,
     },
-    /// Take a streaming base backup via the replication BASE_BACKUP protocol
+    /// Take a base backup
     ///
     /// Uses libpq env vars (PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE).
-    /// Without --pgdata, the sentinel records the server-reported data_directory.
+    /// With PGDATA, reads local filesystem like wal-g. Without PGDATA, streams
+    /// through replication BASE_BACKUP and records server-reported data_directory.
     BackupPush {
-        /// Optional path to local PostgreSQL data directory (sentinel only)
-        #[arg(long)]
+        /// Optional path to local PostgreSQL data directory
+        #[arg(value_name = "PGDATA")]
         pgdata: Option<PathBuf>,
         /// Mark this backup as permanent
         #[arg(long)]
@@ -533,6 +534,18 @@ mod tests {
         use backup::increment::Format;
         assert_eq!(Format::from(IncrementFormatArg::Wi1), Format::Wi1);
         assert_eq!(Format::from(IncrementFormatArg::Native), Format::Native);
+    }
+
+    #[test]
+    fn backup_push_accepts_positional_pgdata() {
+        let cli = Cli::parse_from(["walrus", "backup-push", "/dat/18/data", "--full"]);
+        match cli.cmd {
+            Cmd::BackupPush { pgdata, full, .. } => {
+                assert_eq!(pgdata, Some(PathBuf::from("/dat/18/data")));
+                assert!(full);
+            }
+            _ => panic!("expected backup-push"),
+        }
     }
 
     fn worker_threads_of(args: &[&str]) -> usize {

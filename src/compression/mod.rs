@@ -6,16 +6,18 @@
 use std::pin::Pin;
 
 use async_compression::Level;
+use async_compression::lz4::{BlockSize, EncoderParams};
 use async_compression::tokio::bufread::{
     BrotliDecoder, BrotliEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
     LzmaEncoder, ZstdDecoder, ZstdEncoder,
 };
 use thiserror::Error;
-use tokio::io::{AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
 
-const BUF_CAPACITY: usize = 64 * 1024;
+const BUF_CAPACITY: usize = 256 * 1024;
 
 pub type AsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
+pub type AsyncBufReader = Pin<Box<dyn AsyncBufRead + Send + Unpin>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -73,35 +75,35 @@ pub enum CompressionError {
 pub fn encode(method: Method, input: AsyncReader, level: i32) -> AsyncReader {
     match method {
         Method::None => input,
-        Method::Zstd => {
-            let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
-            Box::pin(ZstdEncoder::with_quality(buffered, Level::Precise(level)))
-        }
-        Method::Brotli => {
-            let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
-            Box::pin(BrotliEncoder::with_quality(
-                buffered,
-                Level::Precise(brotli_quality(level)),
-            ))
-        }
-        Method::Lz4 => {
-            let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
-            Box::pin(Lz4Encoder::new(buffered))
-        }
-        Method::Lzma => {
-            let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
-            Box::pin(LzmaEncoder::with_quality(
-                buffered,
-                Level::Precise(lzma_preset(level)),
-            ))
-        }
-        Method::Gz => {
-            let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
-            Box::pin(GzipEncoder::with_quality(
-                buffered,
-                Level::Precise(gzip_level(level)),
-            ))
-        }
+        _ => encode_buffered(
+            method,
+            Box::pin(BufReader::with_capacity(BUF_CAPACITY, input)),
+            level,
+        ),
+    }
+}
+
+pub fn encode_buffered(method: Method, input: AsyncBufReader, level: i32) -> AsyncReader {
+    match method {
+        Method::None => Box::pin(input),
+        Method::Zstd => Box::pin(ZstdEncoder::with_quality(input, Level::Precise(level))),
+        Method::Brotli => Box::pin(BrotliEncoder::with_quality(
+            input,
+            Level::Precise(brotli_quality(level)),
+        )),
+        Method::Lz4 => Box::pin(Lz4Encoder::with_quality_and_params(
+            input,
+            Level::Precise(level),
+            EncoderParams::default().block_size(BlockSize::Max256KB),
+        )),
+        Method::Lzma => Box::pin(LzmaEncoder::with_quality(
+            input,
+            Level::Precise(lzma_preset(level)),
+        )),
+        Method::Gz => Box::pin(GzipEncoder::with_quality(
+            input,
+            Level::Precise(gzip_level(level)),
+        )),
     }
 }
 
@@ -192,6 +194,19 @@ mod tests {
     #[tokio::test]
     async fn gz_roundtrip() {
         roundtrip(Method::Gz).await;
+    }
+
+    #[tokio::test]
+    async fn encode_buffered_matches_encode() {
+        // encode_buffered feeds the codec an AsyncBufRead directly (no internal
+        // BufReader); output must still decode back to the original
+        let original = payload();
+        let buffered: AsyncBufReader = Box::pin(Cursor::new(original.clone()));
+        let enc = encode_buffered(Method::Lz4, buffered, 3);
+        let mut dec = decode(Method::Lz4, enc);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, original);
     }
 
     #[tokio::test]

@@ -60,7 +60,7 @@ pub enum StorageSettings {
 }
 
 impl Default for Settings {
-    /// Convenience defaults: single-worker fs pipeline at zstd-3, no throttling
+    /// Convenience defaults: single-worker fs pipeline at lz4, no throttling
     /// or encryption. Production constructs via [`Settings::from_env`]; this
     /// lets tests vary only the fields they exercise via `..Default::default()`
     fn default() -> Self {
@@ -68,7 +68,7 @@ impl Default for Settings {
             storage: StorageSettings::Fs {
                 path: String::new(),
             },
-            compression: compression::Method::Zstd,
+            compression: compression::Method::Lz4,
             compression_level: 3,
             upload_concurrency: 1,
             upload_queue: 1,
@@ -88,11 +88,11 @@ impl Settings {
     pub fn from_env() -> Result<Self> {
         let storage = detect_storage()?;
         let compression = match std::env::var("WALG_COMPRESSION_METHOD").ok().as_deref() {
-            None => compression::Method::Zstd,
+            None => compression::Method::Lz4,
             Some(s) => compression::Method::from_name(s)
                 .ok_or_else(|| anyhow!("unsupported WALG_COMPRESSION_METHOD={s}"))?,
         };
-        let compression_level = parse_env_int("WALG_COMPRESSION_LEVEL", 3)? as i32;
+        let compression_level = parse_env_int("WALG_COMPRESSION_LEVEL", 1)? as i32;
         let upload_concurrency = upload_concurrency_from_env()?;
         let upload_queue = parse_env_int("WALG_UPLOAD_QUEUE", 2)?.max(1) as usize;
         let download_concurrency = download_concurrency_from_env()?;

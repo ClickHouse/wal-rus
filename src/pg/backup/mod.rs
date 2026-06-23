@@ -12,6 +12,7 @@ pub mod copy;
 pub mod delete;
 pub mod delta;
 pub mod fetch;
+pub mod fs_push;
 pub mod increment;
 pub mod list;
 pub mod push;

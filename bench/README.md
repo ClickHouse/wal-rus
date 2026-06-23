@@ -3,8 +3,8 @@
 Reproducible single-host benchmark comparing three PostgreSQL 18 WAL archivers on
 **throughput** and **memory** under heavy write load:
 
-- **walrus** (this repo, Rust) — serial wal-push daemon
-- **wal-g** (Go) — fan-out daemon (`WALG_UPLOAD_CONCURRENCY`)
+- **walrus** (this repo, Rust) — look-ahead fan-out daemon (`WALG_UPLOAD_CONCURRENCY`; pre-uploads `concurrency-1` segments, streaming per-upload, no full-segment buffer)
+- **wal-g** (Go) — fan-out daemon (same `WALG_UPLOAD_CONCURRENCY`)
 - **pgbackrest** (C) — daemonless; PG forks `archive-push`, async `process-max` workers
 
 All three are driven identically: PG `archive_command` → the tool's own client → S3.
@@ -118,7 +118,7 @@ daemon (~27 MB for walrus; wal-g's fan-out daemon adds more baseline).
 
 | OP | walrus / wal-g | pgbackrest | measures |
 |---|---|---|---|
-| `backup-send` | `backup-push --full` | `backup --type=full` | full base backup → S3 |
+| `backup-send` | `backup-push <PGDATA> --full` | `backup --type=full` | full base backup → S3 |
 | `backup-fetch` | `backup-fetch <dst> LATEST` | `restore` | restore ← S3 |
 | `backup-delta` | `backup-push` (delta, `wi1`) | `backup --type=incr` | delta backup → S3 |
 | `backup-delta-summaries` | `backup-push --delta-from-wal-summaries` | — (walrus-only) | delta from PG17 WAL summaries → S3 |
@@ -174,7 +174,9 @@ Notes:
 ## Config knobs
 
 See `config.env.example`. Common ones: `UPLOAD_CONCURRENCY` (wal-g concurrency /
-pgbackrest `process-max`), `SCALE` (pgbench DB size), `CHURN_ROWS`, `BURST_SECONDS`,
+pgbackrest `process-max`; also seeds `WALG_DOWNLOAD_CONCURRENCY` so `backup-fetch`
+scales with the same knob — set `DOWNLOAD_CONCURRENCY` to decouple), `SCALE`
+(pgbench DB size), `CHURN_ROWS`, `BURST_SECONDS`,
 `BURST_WORKERS`. `matrix.sh` honors `DAEMONS` (and `RUN_ID`). Operation benchmarks add
 `RESTORE_DIR`, `WAL_RECV_DIR`, `WAL_RECEIVE_SECONDS`, `DELTA_CHURN_SECONDS`,
 `DELTA_MAX_STEPS`, `DELTA_ORIGIN`; `op_matrix.sh` honors `OPS`, `TOOLS` (and
