@@ -58,6 +58,18 @@ buffer up to the single-PUT cap and skip multipart's
 create/upload/complete trio when they fit, so a compressed 16 MiB
 segment lands in one PUT.
 
+Credentials resolve as a small chain (`storage/creds.rs`): explicit
+static keys (`AWS_ACCESS_KEY_ID`/`_SECRET_ACCESS_KEY`, optional
+`AWS_SESSION_TOKEN`), else the EC2 metadata service (IMDS). IMDS uses
+IMDSv2 (token PUT then authenticated GET, falling back to unauthenticated
+v1 if the token is refused), caching temporary creds and refetching 5 min
+before expiry; the lock spans the fetch so concurrent signers single-flight.
+Set `AWS_EC2_METADATA_DISABLED` to force the static-only path,
+`AWS_EC2_METADATA_SERVICE_ENDPOINT` to override the link-local address.
+Rotating IMDS keys would break the key-based server-side-copy identity, so
+IMDS folds to a constant identity. Profile/shared-credentials files and STS
+web-identity (`AWS_WEB_IDENTITY_TOKEN_FILE`) are not implemented.
+
 ### GCS
 
 Service-account JWT (RS256 via aws-lc-rs) exchanged for OAuth bearer,

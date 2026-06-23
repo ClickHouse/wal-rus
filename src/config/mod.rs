@@ -275,19 +275,7 @@ fn s3_config_from_env(
         .or_else(|| std::env::var("AWS_REGION").ok())
         .or_else(|| std::env::var("WALG_S3_REGION").ok())
         .unwrap_or_else(|| "us-east-1".into());
-    let access_key = src
-        .map(|c| c.access_key.clone())
-        .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok())
-        .or_else(|| std::env::var("AWS_ACCESS_KEY").ok())
-        .ok_or_else(|| anyhow!("AWS_ACCESS_KEY_ID not set"))?;
-    let secret_key = src
-        .map(|c| c.secret_key.clone())
-        .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok())
-        .or_else(|| std::env::var("AWS_SECRET_KEY").ok())
-        .ok_or_else(|| anyhow!("AWS_SECRET_ACCESS_KEY not set"))?;
-    let session_token = src
-        .and_then(|c| c.session_token.clone())
-        .or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
+    let creds = s3_credentials(src)?;
     let endpoint = src
         .and_then(|c| c.endpoint.clone())
         .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
@@ -300,12 +288,43 @@ fn s3_config_from_env(
         bucket,
         prefix,
         region,
-        access_key,
-        secret_key,
-        session_token,
+        creds,
         endpoint,
         force_path_style,
     })
+}
+
+/// Pick a credential source: inherit `src`, else explicit static env keys,
+/// else the EC2 metadata service. IMDS is skipped (surfacing the missing-keys
+/// error) when AWS_EC2_METADATA_DISABLED is set. One static key without the
+/// other is a hard error rather than a silent IMDS fallback
+fn s3_credentials(src: Option<&s3::S3Config>) -> Result<s3::CredentialSource> {
+    if let Some(c) = src {
+        return Ok(c.creds.clone());
+    }
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+        .ok()
+        .or_else(|| std::env::var("AWS_ACCESS_KEY").ok());
+    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .ok()
+        .or_else(|| std::env::var("AWS_SECRET_KEY").ok());
+    match (access_key, secret_key) {
+        (Some(access_key), Some(secret_key)) => Ok(s3::CredentialSource::Static(s3::Credentials {
+            access_key,
+            secret_key,
+            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            expires_at: None,
+        })),
+        (None, None) if parse_env_bool("AWS_EC2_METADATA_DISABLED", false)? => {
+            Err(anyhow!("AWS_ACCESS_KEY_ID not set and IMDS disabled"))
+        }
+        (None, None) => Ok(s3::CredentialSource::Imds(Arc::new(
+            s3::ImdsProvider::from_env().map_err(|e| anyhow!("{e}"))?,
+        ))),
+        _ => Err(anyhow!(
+            "incomplete static credentials: set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+        )),
+    }
 }
 
 impl DeltaSettings {
@@ -465,6 +484,13 @@ mod tests {
     // serialize env-touching tests so they can't observe each other's writes
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn static_creds(c: &s3::S3Config) -> &s3::Credentials {
+        match &c.creds {
+            s3::CredentialSource::Static(cr) => cr,
+            other => panic!("expected static creds, got {other:?}"),
+        }
+    }
+
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         saved: Vec<(String, Option<String>)>,
@@ -551,8 +577,8 @@ mod tests {
                 assert_eq!(c.bucket, "bkt");
                 assert_eq!(c.prefix, "pre/fix");
                 assert_eq!(c.region, "eu-west-2");
-                assert_eq!(c.access_key, "AKIA_ALIAS");
-                assert_eq!(c.secret_key, "secret_alias");
+                assert_eq!(static_creds(&c).access_key, "AKIA_ALIAS");
+                assert_eq!(static_creds(&c).secret_key, "secret_alias");
                 assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
                 assert!(c.force_path_style);
             }
@@ -696,9 +722,12 @@ mod tests {
             bucket: "srcb".into(),
             prefix: "srcp".into(),
             region: "ap-south-1".into(),
-            access_key: "AKIASRC".into(),
-            secret_key: "secretsrc".into(),
-            session_token: Some("toksrc".into()),
+            creds: s3::CredentialSource::Static(s3::Credentials {
+                access_key: "AKIASRC".into(),
+                secret_key: "secretsrc".into(),
+                session_token: Some("toksrc".into()),
+                expires_at: None,
+            }),
             endpoint: Some("http://ceph:7480".into()),
             force_path_style: true,
         });
@@ -707,9 +736,9 @@ mod tests {
                 assert_eq!(c.bucket, "dstb");
                 assert_eq!(c.prefix, "dst");
                 assert_eq!(c.region, "ap-south-1");
-                assert_eq!(c.access_key, "AKIASRC");
-                assert_eq!(c.secret_key, "secretsrc");
-                assert_eq!(c.session_token.as_deref(), Some("toksrc"));
+                assert_eq!(static_creds(&c).access_key, "AKIASRC");
+                assert_eq!(static_creds(&c).secret_key, "secretsrc");
+                assert_eq!(static_creds(&c).session_token.as_deref(), Some("toksrc"));
                 assert_eq!(c.endpoint.as_deref(), Some("http://ceph:7480"));
                 assert!(c.force_path_style);
             }
@@ -753,15 +782,16 @@ mod tests {
                     assert_eq!(c.bucket, "mybkt");
                     assert_eq!(c.prefix, "walg");
                     assert_eq!(c.region, "us-west-1");
-                    assert_eq!(c.access_key, "AKID");
-                    assert_eq!(c.secret_key, "SEKRIT");
+                    assert_eq!(static_creds(&c).access_key, "AKID");
+                    assert_eq!(static_creds(&c).secret_key, "SEKRIT");
                     // no endpoint -> path style defaults off
                     assert!(!c.force_path_style);
                 }
                 other => panic!("expected S3, got {other:?}"),
             }
         }
-        // s3 prefix but missing credentials -> error
+        // s3 prefix, no static keys -> IMDS credential source (no network here,
+        // the provider only builds its client)
         {
             let _g = EnvGuard::new(&[
                 ("WALG_FILE_PREFIX", None),
@@ -771,6 +801,26 @@ mod tests {
                 ("AWS_ACCESS_KEY", None),
                 ("AWS_SECRET_ACCESS_KEY", None),
                 ("AWS_SECRET_KEY", None),
+                ("AWS_EC2_METADATA_DISABLED", None),
+            ]);
+            match detect_storage().unwrap() {
+                StorageSettings::S3(c) => {
+                    assert!(matches!(c.creds, s3::CredentialSource::Imds(_)));
+                }
+                other => panic!("expected S3, got {other:?}"),
+            }
+        }
+        // s3 prefix, no static keys, IMDS disabled -> error
+        {
+            let _g = EnvGuard::new(&[
+                ("WALG_FILE_PREFIX", None),
+                ("WALG_S3_PREFIX", Some("s3://mybkt")),
+                ("WALG_GS_PREFIX", None),
+                ("AWS_ACCESS_KEY_ID", None),
+                ("AWS_ACCESS_KEY", None),
+                ("AWS_SECRET_ACCESS_KEY", None),
+                ("AWS_SECRET_KEY", None),
+                ("AWS_EC2_METADATA_DISABLED", Some("true")),
             ]);
             assert!(detect_storage().is_err());
         }
@@ -821,9 +871,12 @@ mod tests {
                 bucket: "b".into(),
                 prefix: "p".into(),
                 region: "us-east-1".into(),
-                access_key: "AKID".into(),
-                secret_key: "sek".into(),
-                session_token: None,
+                creds: s3::CredentialSource::Static(s3::Credentials {
+                    access_key: "AKID".into(),
+                    secret_key: "sek".into(),
+                    session_token: None,
+                    expires_at: None,
+                }),
                 endpoint: None,
                 force_path_style: false,
             }),
