@@ -1,0 +1,4 @@
+# Resolve `. "$SCRIPT_DIR/lib.sh"` style sources relative to each script's own
+# directory so shellcheck follows them (clears SC1091) instead of guessing CWD.
+external-sources=true
+source-path=SCRIPTDIR

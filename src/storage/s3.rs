@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use aws_lc_rs::{digest, hmac};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -205,24 +205,21 @@ impl S3Storage {
 
         let mut parts: Vec<(u32, String)> = Vec::new();
         let mut part_no: u32 = 0;
-        let mut buf = vec![0u8; PART_SIZE];
 
         loop {
-            // fill buf up to PART_SIZE or EOF
-            let mut filled = 0usize;
-            while filled < buf.len() {
-                let n = body.read(&mut buf[filled..]).await?;
-                if n == 0 {
+            let mut buf = BytesMut::with_capacity(PART_SIZE);
+            while buf.len() < PART_SIZE {
+                if body.read_buf(&mut buf).await? == 0 {
                     break;
                 }
-                filled += n;
             }
+            let filled = buf.len();
             if filled == 0 && part_no > 0 {
                 break;
             }
             part_no += 1;
             let part_no_str = part_no.to_string();
-            let chunk = Bytes::copy_from_slice(&buf[..filled]);
+            let chunk = buf.freeze();
 
             // Per-part retry: chunk is already buffered, so transient failures
             // (5xx, transport) replay the same body without re-reading source

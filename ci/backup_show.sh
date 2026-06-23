@@ -16,14 +16,9 @@ walrus backup-push
 
 walrus backup-show LATEST
 walrus backup-show LATEST --json \
-    | python3 -c '
-import sys, json
-o = json.load(sys.stdin)
-assert "name" in o, o
-assert "sentinel" in o, o
-s = o["sentinel"]
-# PascalCase keys mirror wal-g on-disk format
-for k in ("Version", "StartTime", "FinishTime", "Hostname", "IsPermanent", "PgVersion"):
-    assert k in s, (k, s)
-print("backup_show OK")
-'
+    | jq -er '
+        (["name","sentinel"] - keys) as $top
+        | (.sentinel | ["Version","StartTime","FinishTime","Hostname","IsPermanent","PgVersion"] - keys) as $sub
+        | if ($top|length) > 0 then error("missing keys: \($top)")
+          elif ($sub|length) > 0 then error("missing sentinel keys: \($sub)")
+          else "backup_show OK" end'
