@@ -1,0 +1,15 @@
+# local config (secrets) + run artifacts + python caches
+/config.env
+/results/
+/.venv/
+__pycache__/
+
+# rust build artifacts
+/tools/target/
+
+# terraform state + generated SSH key + run log (never commit)
+/terraform/.terraform/
+/terraform/*.tfstate
+/terraform/*.tfstate.*
+/terraform/walrus_bench_key.pem
+/terraform/apply.log

@@ -19,7 +19,11 @@ pgbench -p "$PGPORT" -h "$PGHOST" -i -s 1 postgres
 psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
 sleep 2
 
-WAL=$(ls "$PGDATA/pg_wal" | grep -E '^[0-9A-F]{24}$' | head -n1)
+WAL=""
+for f in "$PGDATA"/pg_wal/*; do
+    name=$(basename "$f")
+    [[ $name =~ ^[0-9A-F]{24}$ ]] && { WAL=$name; break; }
+done
 [ -n "$WAL" ] || { echo "no WAL segment found"; exit 1; }
 
 SOCKET="$WORKROOT/wal-daemon.sock"

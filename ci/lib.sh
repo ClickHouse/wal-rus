@@ -17,7 +17,8 @@ export PATH="$PG_BIN:$PATH"
 WORKROOT=$(mktemp -d -t walrus-ci-XXXXXX)
 export PGDATA="$WORKROOT/pgdata"
 export PGHOST="$WORKROOT/run"
-export PGUSER="$(id -un)"
+PGUSER="$(id -un)"
+export PGUSER
 export PGDATABASE=postgres
 export PGPORT=55435
 
@@ -44,7 +45,8 @@ storage_init() {
     s3)
         : "${MINIO_ENDPOINT:?set MINIO_ENDPOINT, e.g. http://127.0.0.1:9000}"
         local bucket="${WALRUS_S3_BUCKET:-walrus}"
-        export WALG_S3_PREFIX="s3://$bucket/$(basename "$WORKROOT")"
+        WALG_S3_PREFIX="s3://$bucket/$(basename "$WORKROOT")"
+        export WALG_S3_PREFIX
         export AWS_ENDPOINT_URL="$MINIO_ENDPOINT"
         export WALG_S3_FORCE_PATH_STYLE=true
         export AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -55,7 +57,8 @@ storage_init() {
     gcs)
         : "${FAKE_GCS_ENDPOINT:?set FAKE_GCS_ENDPOINT, e.g. http://127.0.0.1:4443}"
         local bucket="${WALRUS_GS_BUCKET:-walrus}"
-        export WALG_GS_PREFIX="gs://$bucket/$(basename "$WORKROOT")"
+        WALG_GS_PREFIX="gs://$bucket/$(basename "$WORKROOT")"
+        export WALG_GS_PREFIX
         export WALG_GS_ENDPOINT="$FAKE_GCS_ENDPOINT"
         WALG_ARCHIVE_ENV="WALG_GS_PREFIX=$WALG_GS_PREFIX WALG_GS_ENDPOINT=$WALG_GS_ENDPOINT"
         ;;

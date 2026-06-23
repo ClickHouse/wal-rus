@@ -22,7 +22,7 @@ walrus backup-list
 permanent_of() {
     # is_permanent is exposed as snake_case in backup-list --json
     walrus backup-list --json \
-        | python3 -c 'import sys,json; b=json.load(sys.stdin)[0]; print("true" if b["is_permanent"] else "false")'
+        | jq -r 'if .[0].is_permanent then "true" else "false" end'
 }
 
 initial=$(permanent_of)

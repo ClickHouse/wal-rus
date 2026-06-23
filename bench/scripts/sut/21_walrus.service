@@ -1,0 +1,16 @@
+[Unit]
+Description=walrus (wal-rs) WAL archive daemon (benchmark)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/postgresql/wal-g.env
+ExecStart=/usr/local/bin/walrus daemon --socket /tmp/wal-g
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
