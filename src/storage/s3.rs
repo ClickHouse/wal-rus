@@ -4,7 +4,8 @@
 //!
 //! Env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 //! AWS_REGION (default us-east-1), AWS_ENDPOINT_URL or WALG_S3_ENDPOINT,
-//! WALG_S3_FORCE_PATH_STYLE
+//! WALG_S3_FORCE_PATH_STYLE. Without static keys, credentials come from the
+//! EC2 metadata service (see [`super::creds`])
 
 use std::io::Cursor;
 use std::time::{Duration, SystemTime};
@@ -22,6 +23,7 @@ use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 use url::Url;
 
+pub use super::creds::{CredentialSource, Credentials, ImdsProvider};
 use super::{AsyncReader, CopySource, ObjectMeta, ObjectStream, Result, Storage, StorageError};
 use crate::retry::{RetryPolicy, with_retry};
 
@@ -48,9 +50,7 @@ pub struct S3Config {
     pub bucket: String,
     pub prefix: String,
     pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
-    pub session_token: Option<String>,
+    pub creds: CredentialSource,
     pub endpoint: Option<String>,
     pub force_path_style: bool,
 }
@@ -94,7 +94,7 @@ impl S3Storage {
         format!(
             "s3:{}:{}",
             self.cfg.endpoint.as_deref().unwrap_or(&self.cfg.region),
-            self.cfg.access_key,
+            self.cfg.creds.identity(),
         )
     }
 
@@ -139,8 +139,10 @@ impl S3Storage {
         extra_headers: &[(&str, &str)],
     ) -> Result<reqwest::Response> {
         let url = self.build_url(key_path, query)?;
+        let creds = self.cfg.creds.get().await?;
         let signed = s3_signing_headers(
-            &self.cfg,
+            &creds,
+            &self.cfg.region,
             method,
             url.as_str(),
             extra_headers,
@@ -540,7 +542,8 @@ fn sha256_hex(data: &[u8]) -> String {
 /// wire from the URL authority. `extra_headers` are signed but returned by
 /// the caller, not here.
 fn s3_signing_headers(
-    cfg: &S3Config,
+    creds: &Credentials,
+    region: &str,
     method: &str,
     url: &str,
     extra_headers: &[(&str, &str)],
@@ -556,7 +559,7 @@ fn s3_signing_headers(
     let dt: DateTime<Utc> = time.into();
     let amz_date = dt.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = dt.format("%Y%m%d").to_string();
-    let scope = format!("{date_stamp}/{}/s3/aws4_request", cfg.region);
+    let scope = format!("{date_stamp}/{region}/s3/aws4_request");
 
     // headers to sign: auto headers + caller extras, lowercased, value-trimmed
     let mut signed: Vec<(String, String)> = vec![
@@ -564,7 +567,7 @@ fn s3_signing_headers(
         ("x-amz-content-sha256".into(), UNSIGNED_PAYLOAD.into()),
         ("x-amz-date".into(), amz_date.clone()),
     ];
-    if let Some(tok) = &cfg.session_token {
+    if let Some(tok) = &creds.session_token {
         signed.push(("x-amz-security-token".into(), tok.clone()));
     }
     for (k, v) in extra_headers {
@@ -603,17 +606,17 @@ fn s3_signing_headers(
     );
 
     let k_date = hmac_sha256(
-        format!("AWS4{}", cfg.secret_key).as_bytes(),
+        format!("AWS4{}", creds.secret_key).as_bytes(),
         date_stamp.as_bytes(),
     );
-    let k_region = hmac_sha256(k_date.as_ref(), cfg.region.as_bytes());
+    let k_region = hmac_sha256(k_date.as_ref(), region.as_bytes());
     let k_service = hmac_sha256(k_region.as_ref(), b"s3");
     let k_signing = hmac_sha256(k_service.as_ref(), b"aws4_request");
     let signature = hex::encode(hmac_sha256(k_signing.as_ref(), string_to_sign.as_bytes()));
 
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-        cfg.access_key
+        creds.access_key
     );
 
     let mut out = vec![
@@ -624,7 +627,7 @@ fn s3_signing_headers(
         ("x-amz-date".to_string(), amz_date),
         ("authorization".to_string(), authorization),
     ];
-    if let Some(tok) = &cfg.session_token {
+    if let Some(tok) = &creds.session_token {
         out.push(("x-amz-security-token".to_string(), tok.clone()));
     }
     Ok(out)
@@ -762,14 +765,23 @@ mod tests {
     #[allow(unused_imports)]
     use tokio::io::AsyncRead;
 
+    const TEST_REGION: &str = "us-east-1";
+
+    fn test_creds() -> Credentials {
+        Credentials {
+            access_key: "AKIDEXAMPLE".into(),
+            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            session_token: None,
+            expires_at: None,
+        }
+    }
+
     fn test_cfg() -> S3Config {
         S3Config {
             bucket: "bkt".into(),
             prefix: "p".into(),
-            region: "us-east-1".into(),
-            access_key: "AKIDEXAMPLE".into(),
-            secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
-            session_token: None,
+            region: TEST_REGION.into(),
+            creds: CredentialSource::Static(test_creds()),
             endpoint: None,
             force_path_style: false,
         }
@@ -781,7 +793,8 @@ mod tests {
         // here, cryptographic parity in signing_matches_aws_sigv4_golden.
         let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_440_938_160); // 20150830T123600Z
         let headers = s3_signing_headers(
-            &test_cfg(),
+            &test_creds(),
+            TEST_REGION,
             "GET",
             "https://bkt.s3.us-east-1.amazonaws.com/p/a.zst",
             &[],
@@ -826,7 +839,8 @@ mod tests {
     #[test]
     fn signing_a_url_with_query_succeeds() {
         let headers = s3_signing_headers(
-            &test_cfg(),
+            &test_creds(),
+            TEST_REGION,
             "GET",
             "https://bkt.s3.us-east-1.amazonaws.com/?list-type=2&continuation-token=1%2Fa%2Bb%3D",
             &[],
@@ -842,10 +856,11 @@ mod tests {
 
     #[test]
     fn signing_includes_session_token() {
-        let mut cfg = test_cfg();
-        cfg.session_token = Some("FwoTOKEN".into());
+        let mut creds = test_creds();
+        creds.session_token = Some("FwoTOKEN".into());
         let headers = s3_signing_headers(
-            &cfg,
+            &creds,
+            TEST_REGION,
             "GET",
             "https://bkt.s3.us-east-1.amazonaws.com/p/a.zst",
             &[],
@@ -920,21 +935,21 @@ mod tests {
     #[test]
     fn signing_matches_aws_sigv4_golden() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_440_938_160);
-        let auth = |cfg: &S3Config, m: &str, u: &str, eh: &[(&str, &str)]| {
-            s3_signing_headers(cfg, m, u, eh, t)
+        let auth = |creds: &Credentials, m: &str, u: &str, eh: &[(&str, &str)]| {
+            s3_signing_headers(creds, TEST_REGION, m, u, eh, t)
                 .unwrap()
                 .into_iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
                 .map(|(_, v)| v)
                 .unwrap()
         };
-        let mut tok = test_cfg();
+        let mut tok = test_creds();
         tok.session_token = Some("FwoTOKEN".into());
 
         let cred = "Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request";
         assert_eq!(
             auth(
-                &test_cfg(),
+                &test_creds(),
                 "GET",
                 "https://bkt.s3.us-east-1.amazonaws.com/p/a.zst",
                 &[]
@@ -956,7 +971,7 @@ mod tests {
         );
         assert_eq!(
             auth(
-                &test_cfg(),
+                &test_creds(),
                 "GET",
                 "https://bkt.s3.us-east-1.amazonaws.com/?list-type=2&continuation-token=1%2Fa%2Bb%3D",
                 &[],
@@ -967,7 +982,7 @@ mod tests {
         );
         assert_eq!(
             auth(
-                &test_cfg(),
+                &test_creds(),
                 "POST",
                 "https://bkt.s3.us-east-1.amazonaws.com/p/a.zst?uploadId=xyz",
                 &[("content-type", "application/xml")],
@@ -978,7 +993,7 @@ mod tests {
         );
         assert_eq!(
             auth(
-                &test_cfg(),
+                &test_creds(),
                 "PUT",
                 "https://bkt.s3.us-east-1.amazonaws.com/p/a.zst",
                 &[("x-amz-copy-source", "/bkt/p/b.zst")],
@@ -1129,9 +1144,12 @@ mod tests {
             bucket: "bkt".into(),
             prefix: "p".into(),
             region: "us-east-1".into(),
-            access_key: "AKID".into(),
-            secret_key: "sek".into(),
-            session_token: None,
+            creds: CredentialSource::Static(Credentials {
+                access_key: "AKID".into(),
+                secret_key: "sek".into(),
+                session_token: None,
+                expires_at: None,
+            }),
             endpoint: Some(base),
             force_path_style: true,
         };

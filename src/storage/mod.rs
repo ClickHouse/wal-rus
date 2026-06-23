@@ -11,6 +11,7 @@ use futures::Stream;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
+pub mod creds;
 pub mod fs;
 pub mod gcs;
 pub mod retrying;
