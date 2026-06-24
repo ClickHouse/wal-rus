@@ -464,7 +464,7 @@ fn parse_env_int(key: &str, default: i64) -> Result<i64> {
     }
 }
 
-fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
+pub(crate) fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
     match std::env::var(key) {
         Err(_) => Ok(default),
         Ok(v) => match v.to_ascii_lowercase().as_str() {

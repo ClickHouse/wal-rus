@@ -57,6 +57,14 @@ fn align(lsn: u64, seg_size: u64) -> u64 {
     lsn - (lsn % seg_size)
 }
 
+/// What the reported flush LSN tracks: completed uploads (archive default) vs
+/// bytes fsync'd to local disk (synchronous-standby durable frontier)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushMode {
+    SegmentUpload,
+    BatchFsync,
+}
+
 /// Accumulate WAL bytes into segment-sized files on disk; rotate on
 /// boundary crossings. Each fully-written segment is shipped via the
 /// existing `wal-push` pipeline so compression + retry + rate limits apply
@@ -81,6 +89,8 @@ struct SegmentAccumulator {
     /// Highest WAL LSN received (write position). Reset to the restart LSN on a
     /// timeline switch
     received_lsn: u64,
+    /// Highest fsync'd-to-disk LSN — the durable frontier, raised by `sync`
+    highest_fsyncd_lsn: u64,
 }
 
 /// In-progress segment. Written to `<seg>.partial` (pg_receivewal convention),
@@ -118,6 +128,7 @@ impl SegmentAccumulator {
             upload_sem,
             in_flight: BTreeSet::new(),
             received_lsn: start_lsn,
+            highest_fsyncd_lsn: start_lsn,
         })
     }
 
@@ -366,11 +377,30 @@ impl SegmentAccumulator {
             .copied()
             .map_or(current_floor, |oldest| oldest.min(current_floor))
     }
+
+    /// fsync the open partial and raise the durable frontier to the synced
+    /// write cursor.
+    async fn sync(&mut self) -> Result<()> {
+        let Some(cur) = self.current.as_ref() else {
+            return Ok(());
+        };
+        cur.file.sync_data().await?;
+        let durable = cur.name.start_lsn(self.seg_size) + cur.bytes_written;
+        self.highest_fsyncd_lsn = self.highest_fsyncd_lsn.max(durable);
+        Ok(())
+    }
+
+    /// Highest fsync'd-to-disk LSN — the durable frontier, reported as the flush
+    /// position in BatchFsync mode
+    fn fsyncd_position(&self) -> u64 {
+        self.highest_fsyncd_lsn
+    }
 }
 
 pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path) -> Result<()> {
     let cfg = PgConfig::from_env()?;
     let slot_name = slot_name_from_env()?;
+    let flush_mode = flush_mode_from_env()?;
 
     // wal_segment_size + slot info come from a normal (non-replication)
     // connection — physical replication mode forbids these queries, so wal-g
@@ -465,7 +495,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
             // Periodic standby status keeps a quiet client connected (wal-g
             // pings every 10s) and, with a slot, advances its restart_lsn
             if last_status.elapsed() >= STATUS_UPDATE_INTERVAL {
-                send_status(&mut conn, &acc).await?;
+                send_status(&mut conn, &acc, flush_mode).await?;
                 last_status = std::time::Instant::now();
             }
 
@@ -493,10 +523,17 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                 Message::CopyData(d) => {
                     let payload: Bytes = d.into_bytes();
                     match decode_frame(&payload)? {
-                        Frame::Wal(w) => acc.write(w.start_lsn, w.data).await?,
+                        // batch boundary: one fsync per frame today, one per
+                        // drained batch once drain-batching lands
+                        Frame::Wal(w) => {
+                            acc.write(w.start_lsn, w.data).await?;
+                            if flush_mode == FlushMode::BatchFsync {
+                                acc.sync().await?;
+                            }
+                        }
                         Frame::Keepalive(k) => {
                             if k.reply_requested {
-                                send_status(&mut conn, &acc).await?;
+                                send_status(&mut conn, &acc, flush_mode).await?;
                                 last_status = std::time::Instant::now();
                             }
                         }
@@ -553,6 +590,16 @@ fn slot_name_from_env() -> Result<Option<String>> {
     };
     validate_slot_name(&name)?;
     Ok(Some(name))
+}
+
+/// `WALG_WAL_RECEIVE_SKIP_UPLOAD` selects the durable-retain frontier
+/// (`BatchFsync`); unset/false keeps the archive upload-gated flush
+fn flush_mode_from_env() -> Result<FlushMode> {
+    if crate::config::parse_env_bool("WALG_WAL_RECEIVE_SKIP_UPLOAD", false)? {
+        Ok(FlushMode::BatchFsync)
+    } else {
+        Ok(FlushMode::SegmentUpload)
+    }
 }
 
 /// wal-g ValidateSlotName: 1-63 word characters `[0-9A-Za-z_]`
@@ -785,13 +832,21 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-/// Standby status update. Write reports received WAL; flush reports the
-/// uploaded-through LSN so a slot's restart_lsn — and thus server-side WAL
-/// retention — never advances past WAL we haven't archived (harmless but
-/// conservative when slotless). Apply mirrors flush
-async fn send_status(conn: &mut ReplicationConn, acc: &SegmentAccumulator) -> Result<()> {
+/// Standby status update. Write reports received WAL; flush reports either the
+/// uploaded-through LSN (SegmentUpload) or the fsync'd durable frontier
+/// (BatchFsync) so a slot's restart_lsn — and thus server-side WAL retention —
+/// never advances past durable WAL. Apply mirrors flush
+async fn send_status(
+    conn: &mut ReplicationConn,
+    acc: &SegmentAccumulator,
+    flush_mode: FlushMode,
+) -> Result<()> {
     let write = acc.write_position();
-    let flush = acc.flush_position().min(write);
+    let flush = match flush_mode {
+        FlushMode::SegmentUpload => acc.flush_position(),
+        FlushMode::BatchFsync => acc.fsyncd_position(),
+    }
+    .min(write);
     let payload = build_status_update(write, flush, flush);
     conn.send_copy_data(&payload).await
 }
@@ -1024,6 +1079,17 @@ mod tests {
         assert_eq!(lsn_to_timeline(content, at("0/6000000"), 3), 3);
         // no history rows -> file timeline
         assert_eq!(lsn_to_timeline(b"", 0x9999, 5), 5);
+    }
+
+    #[tokio::test]
+    async fn sync_advances_fsyncd_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        let mut acc = test_acc(dir.path(), seg_size).await;
+        acc.write(0, &[0xAB; 4]).await.unwrap();
+        assert_eq!(acc.fsyncd_position(), 0, "buffered, not yet fsync'd");
+        acc.sync().await.unwrap();
+        assert_eq!(acc.fsyncd_position(), 4, "frontier = fsync'd write cursor");
     }
 
     #[tokio::test]
