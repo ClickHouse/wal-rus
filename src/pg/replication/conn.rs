@@ -75,6 +75,13 @@ impl ReplicationConn {
         }
     }
 
+    /// Preload the read buffer so `recv_message` parses these bytes before
+    /// touching the socket — lets tests drive the message loop deterministically
+    #[cfg(test)]
+    pub(crate) fn push_rx_bytes(&mut self, data: &[u8]) {
+        self.rx.extend_from_slice(data);
+    }
+
     /// Replication-mode connection (`replication=true`); the streaming path
     pub async fn connect(cfg: &PgConfig) -> Result<Self> {
         Self::connect_with(cfg, true).await

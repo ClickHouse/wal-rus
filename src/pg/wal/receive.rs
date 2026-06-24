@@ -52,17 +52,37 @@ use crate::storage::DynStorage;
 /// Status update cadence — wal-g defaults to 10s; we match
 const STATUS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Bounds on a single drain batch (wal-g parity) — the drain "policy". After
+/// the first WAL frame, additional immediately-available frames are coalesced
+/// into one fsync batch until a bound trips
+#[derive(Clone, Copy)]
+struct DrainBounds {
+    /// Stop once this many drained bytes accumulate
+    max_bytes: u64,
+    /// Stop after this much wall-clock time
+    max_window: std::time::Duration,
+    /// Per extra-frame socket-peek timeout
+    peek_timeout: std::time::Duration,
+}
+
+const DRAIN_BOUNDS: DrainBounds = DrainBounds {
+    max_bytes: 4 * 1024 * 1024,
+    max_window: std::time::Duration::from_millis(2),
+    peek_timeout: std::time::Duration::from_micros(250),
+};
+
 /// Round an LSN down to its segment boundary
 fn align(lsn: u64, seg_size: u64) -> u64 {
     lsn - (lsn % seg_size)
 }
 
-/// What the reported flush LSN tracks: completed uploads (archive default) vs
-/// bytes fsync'd to local disk (synchronous-standby durable frontier)
+/// How the receiver operates. `Uploader` (archive default): page-cache writes,
+/// fsync deferred to rotation, flush trails completed uploads. `SyncReplica`
+/// (synchronous standby): fsync each batch and report a durable frontier
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlushMode {
-    SegmentUpload,
-    BatchFsync,
+enum ReceiveMode {
+    Uploader,
+    SyncReplica,
 }
 
 /// Accumulate WAL bytes into segment-sized files on disk; rotate on
@@ -75,6 +95,9 @@ struct SegmentAccumulator {
     current: Option<CurrentSegment>,
     settings: Settings,
     storage: DynStorage,
+    /// Upload completed segments to object storage (Uploader). When false
+    /// (SyncReplica), rotated `<seg>` files are fsync'd and retained on disk
+    upload: bool,
     /// In-flight segment uploads, bounded by `upload_sem`. Each task yields the
     /// start LSN of the segment it shipped so reaping can drop it from
     /// `in_flight`. Receive loop reaps completions each iteration; rotation
@@ -104,6 +127,14 @@ struct CurrentSegment {
     bytes_written: u64,
 }
 
+/// A rotated, fsync'd segment renamed to bare `<seg>`, awaiting an optional
+/// upload. Produced by `rotate`, consumed by `spawn_upload`
+struct Rotated {
+    name: SegmentName,
+    start: u64,
+    path: PathBuf,
+}
+
 impl SegmentAccumulator {
     async fn new(
         timeline: u32,
@@ -112,6 +143,7 @@ impl SegmentAccumulator {
         settings: Settings,
         storage: DynStorage,
         start_lsn: u64,
+        upload: bool,
     ) -> Result<Self> {
         fs::create_dir_all(&archive_dir)
             .await
@@ -124,6 +156,7 @@ impl SegmentAccumulator {
             current: None,
             settings,
             storage,
+            upload,
             uploads: JoinSet::new(),
             upload_sem,
             in_flight: BTreeSet::new(),
@@ -221,13 +254,31 @@ impl SegmentAccumulator {
         Ok(())
     }
 
-    /// Close out current segment & spawn its upload. Permit acquisition is
-    /// the backpressure point: blocks only once `upload_concurrency` uploads
-    /// are already in flight, so bursty WAL against a slow store stalls the
-    /// stream N segments deep instead of on every rotation
+    /// Close out the current segment: fsync + publish, then upload it (Uploader)
+    /// or retain the `<seg>` file on disk (SyncReplica)
     async fn rotate_and_spawn(&mut self) -> Result<()> {
-        let Some(cur) = self.current.take() else {
+        let Some(rotated) = self.rotate().await? else {
             return Ok(());
+        };
+        if self.upload {
+            self.spawn_upload(rotated).await?;
+        } else {
+            tracing::info!(
+                target = "wal_receive",
+                "segment {} complete, retained (upload disabled)",
+                rotated.name.format()
+            );
+        }
+        Ok(())
+    }
+
+    /// fsync the full segment and publish `<seg>.partial` -> `<seg>`. Only bare
+    /// `<seg>` files are complete, so a crash before upload leaves a re-pushable
+    /// segment (see `repush_leftover_segments`), never a torn partial. Both modes
+    /// do this; only Uploader follows with `spawn_upload`
+    async fn rotate(&mut self) -> Result<Option<Rotated>> {
+        let Some(cur) = self.current.take() else {
+            return Ok(None);
         };
         let CurrentSegment {
             name,
@@ -238,14 +289,20 @@ impl SegmentAccumulator {
         file.flush().await?;
         file.sync_all().await?;
         drop(file);
-        // Publish the finished segment: <seg>.partial -> <seg>. Only bare <seg>
-        // files are complete, so a crash before upload leaves a re-pushable
-        // segment (see repush_leftover_segments), never a torn partial
         let path = self.archive_dir.join(name.format());
         fs::rename(&partial, &path)
             .await
             .with_context(|| format!("rename {} -> {}", partial.display(), path.display()))?;
         let start = name.start_lsn(self.seg_size);
+        Ok(Some(Rotated { name, start, path }))
+    }
+
+    /// Spawn the archive upload of a rotated segment, removing it locally on
+    /// success. Permit acquisition is the backpressure point: blocks only once
+    /// `upload_concurrency` uploads are already in flight, so bursty WAL against
+    /// a slow store stalls the stream N segments deep instead of on every rotation
+    async fn spawn_upload(&mut self, rotated: Rotated) -> Result<()> {
+        let Rotated { name, start, path } = rotated;
         tracing::info!(
             target = "wal_receive",
             "segment {} complete, archiving",
@@ -284,11 +341,12 @@ impl SegmentAccumulator {
         Ok(())
     }
 
-    /// On a timeline switch wal-g uploads the in-progress segment under its
-    /// `<seg>.partial` name (the tail of the old timeline won't be re-sent on
-    /// the next), then drops it locally. Returns the partial's start LSN — the
-    /// point the next timeline re-streams from
-    async fn upload_partial_on_switch(&mut self) -> Result<Option<u64>> {
+    /// Finish the in-progress segment on a timeline switch and return its start
+    /// LSN — the point the next timeline re-streams from. In Uploader mode wal-g
+    /// ships the partial under its `<seg>.partial` name (the tail of the old
+    /// timeline won't be re-sent) then drops it; in SyncReplica it's fsync'd and
+    /// retained on disk
+    async fn finalize_partial_on_switch(&mut self) -> Result<Option<u64>> {
         let Some(cur) = self.current.take() else {
             return Ok(None);
         };
@@ -302,21 +360,29 @@ impl SegmentAccumulator {
         file.sync_all().await?;
         drop(file);
         let start = name.start_lsn(self.seg_size);
-        tracing::info!(
-            target = "wal_receive",
-            "timeline switch: archiving partial {}",
-            name.format()
-        );
-        // path is `<seg>.partial`; push keys off the basename so it lands under
-        // `wal_005/<seg>.partial.<ext>`, matching wal-g's partial upload
-        push::handle(&self.settings, self.storage.clone(), &path)
-            .await
-            .with_context(|| format!("archive partial {}", path.display()))?;
-        let _ = fs::remove_file(&path).await;
+        if self.upload {
+            tracing::info!(
+                target = "wal_receive",
+                "timeline switch: archiving partial {}",
+                name.format()
+            );
+            // path is `<seg>.partial`; push keys off the basename so it lands
+            // under `wal_005/<seg>.partial.<ext>`, matching wal-g's partial upload
+            push::handle(&self.settings, self.storage.clone(), &path)
+                .await
+                .with_context(|| format!("archive partial {}", path.display()))?;
+            let _ = fs::remove_file(&path).await;
+        } else {
+            tracing::info!(
+                target = "wal_receive",
+                "timeline switch: retaining partial {} (upload disabled)",
+                name.format()
+            );
+        }
         Ok(Some(start))
     }
 
-    /// Re-aim the accumulator at a new timeline. `upload_partial_on_switch`
+    /// Re-aim the accumulator at a new timeline. `finalize_partial_on_switch`
     /// already cleared `current`; re-anchor the write position to the restart
     fn reset_for_timeline(&mut self, timeline: u32, restart_lsn: u64) {
         debug_assert!(self.current.is_none());
@@ -391,7 +457,7 @@ impl SegmentAccumulator {
     }
 
     /// Highest fsync'd-to-disk LSN — the durable frontier, reported as the flush
-    /// position in BatchFsync mode
+    /// position in SyncReplica mode
     fn fsyncd_position(&self) -> u64 {
         self.highest_fsyncd_lsn
     }
@@ -400,7 +466,10 @@ impl SegmentAccumulator {
 pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path) -> Result<()> {
     let cfg = PgConfig::from_env()?;
     let slot_name = slot_name_from_env()?;
-    let flush_mode = flush_mode_from_env()?;
+    let mode = receive_mode_from_env()?;
+    let drain_batching = drain_batching_from_env()?;
+    // Uploader archives completed segments; SyncReplica retains them on disk
+    let upload = matches!(mode, ReceiveMode::Uploader);
 
     // wal_segment_size + slot info come from a normal (non-replication)
     // connection — physical replication mode forbids these queries, so wal-g
@@ -427,8 +496,10 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
 
     // Re-archive complete segments a prior crash left un-uploaded before the
     // stream resumes (a slot retains WAL from the last flushed LSN, but local
-    // leftovers still need shipping)
-    repush_leftover_segments(settings, &storage, archive_dir, seg_size).await?;
+    // leftovers still need shipping). Skipped in SyncReplica.
+    if upload {
+        repush_leftover_segments(settings, &storage, archive_dir, seg_size).await?;
+    }
 
     tracing::info!(
         target = "wal_receive",
@@ -481,6 +552,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         settings.clone(),
         storage.clone(),
         next_start,
+        upload,
     )
     .await?;
     let mut last_status = std::time::Instant::now();
@@ -495,7 +567,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
             // Periodic standby status keeps a quiet client connected (wal-g
             // pings every 10s) and, with a slot, advances its restart_lsn
             if last_status.elapsed() >= STATUS_UPDATE_INTERVAL {
-                send_status(&mut conn, &acc, flush_mode).await?;
+                send_status(&mut conn, &acc, mode).await?;
                 last_status = std::time::Instant::now();
             }
 
@@ -523,17 +595,34 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                 Message::CopyData(d) => {
                     let payload: Bytes = d.into_bytes();
                     match decode_frame(&payload)? {
-                        // batch boundary: one fsync per frame today, one per
-                        // drained batch once drain-batching lands
-                        Frame::Wal(w) => {
-                            acc.write(w.start_lsn, w.data).await?;
-                            if flush_mode == FlushMode::BatchFsync {
+                        // Archive: page-cache write, fsync deferred to rotation.
+                        // Sync standby: write, coalesce more frames into the
+                        // batch, then fsync once and act on what ended the batch
+                        Frame::Wal(w) => match mode {
+                            ReceiveMode::Uploader => acc.write(w.start_lsn, w.data).await?,
+                            ReceiveMode::SyncReplica => {
+                                acc.write(w.start_lsn, w.data).await?;
+                                let stop = if drain_batching {
+                                    drain_wal_batch(&mut conn, &mut acc, DRAIN_BOUNDS).await?
+                                } else {
+                                    DrainStop::Bound
+                                };
                                 acc.sync().await?;
+                                match stop {
+                                    DrainStop::Bound => {}
+                                    DrainStop::Keepalive { reply_requested } => {
+                                        if reply_requested {
+                                            send_status(&mut conn, &acc, mode).await?;
+                                            last_status = std::time::Instant::now();
+                                        }
+                                    }
+                                    DrainStop::CopyDone => break,
+                                }
                             }
-                        }
+                        },
                         Frame::Keepalive(k) => {
                             if k.reply_requested {
-                                send_status(&mut conn, &acc, flush_mode).await?;
+                                send_status(&mut conn, &acc, mode).await?;
                                 last_status = std::time::Instant::now();
                             }
                         }
@@ -554,7 +643,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         conn.end_copy().await?;
         acc.drain_uploads().await?;
         let restart = acc
-            .upload_partial_on_switch()
+            .finalize_partial_on_switch()
             .await?
             .unwrap_or(acc.received_lsn);
 
@@ -593,13 +682,19 @@ fn slot_name_from_env() -> Result<Option<String>> {
 }
 
 /// `WALG_WAL_RECEIVE_SKIP_UPLOAD` selects the durable-retain frontier
-/// (`BatchFsync`); unset/false keeps the archive upload-gated flush
-fn flush_mode_from_env() -> Result<FlushMode> {
+/// (`SyncReplica`); unset/false keeps the archive upload-gated flush
+fn receive_mode_from_env() -> Result<ReceiveMode> {
     if crate::config::parse_env_bool("WALG_WAL_RECEIVE_SKIP_UPLOAD", false)? {
-        Ok(FlushMode::BatchFsync)
+        Ok(ReceiveMode::SyncReplica)
     } else {
-        Ok(FlushMode::SegmentUpload)
+        Ok(ReceiveMode::Uploader)
     }
+}
+
+/// `WALG_WAL_RECEIVE_DRAIN_BATCHING`: coalesce consecutive WAL frames into one
+/// fsync per batch (SyncReplica mode only). Off by default
+fn drain_batching_from_env() -> Result<bool> {
+    crate::config::parse_env_bool("WALG_WAL_RECEIVE_DRAIN_BATCHING", false)
 }
 
 /// wal-g ValidateSlotName: 1-63 word characters `[0-9A-Za-z_]`
@@ -833,22 +928,76 @@ async fn shutdown_signal() -> Result<()> {
 }
 
 /// Standby status update. Write reports received WAL; flush reports either the
-/// uploaded-through LSN (SegmentUpload) or the fsync'd durable frontier
-/// (BatchFsync) so a slot's restart_lsn — and thus server-side WAL retention —
+/// uploaded-through LSN (Uploader) or the fsync'd durable frontier
+/// (SyncReplica) so a slot's restart_lsn — and thus server-side WAL retention —
 /// never advances past durable WAL. Apply mirrors flush
 async fn send_status(
     conn: &mut ReplicationConn,
     acc: &SegmentAccumulator,
-    flush_mode: FlushMode,
+    mode: ReceiveMode,
 ) -> Result<()> {
     let write = acc.write_position();
-    let flush = match flush_mode {
-        FlushMode::SegmentUpload => acc.flush_position(),
-        FlushMode::BatchFsync => acc.fsyncd_position(),
+    let flush = match mode {
+        ReceiveMode::Uploader => acc.flush_position(),
+        ReceiveMode::SyncReplica => acc.fsyncd_position(),
     }
     .min(write);
     let payload = build_status_update(write, flush, flush);
     conn.send_copy_data(&payload).await
+}
+
+/// Why a drain batch stopped — the caller fsyncs the batch, then acts on this
+enum DrainStop {
+    /// Socket drained empty or a size/time bound hit; just resume the recv loop
+    Bound,
+    /// A keepalive interrupted the batch; handle it after the post-batch fsync
+    Keepalive { reply_requested: bool },
+    /// Server ended CopyOut (timeline switch); break after the post-batch fsync
+    CopyDone,
+}
+
+/// After the first WAL frame, pull additional immediately-available WAL frames
+/// into `acc` (each `write`, no fsync) so the caller can fsync the whole batch
+/// once. Bounded by `bounds`; stops (reporting why) on a non-WAL frame
+async fn drain_wal_batch(
+    conn: &mut ReplicationConn,
+    acc: &mut SegmentAccumulator,
+    bounds: DrainBounds,
+) -> Result<DrainStop> {
+    let start = std::time::Instant::now();
+    let mut drained: u64 = 0;
+    loop {
+        if drained >= bounds.max_bytes || start.elapsed() >= bounds.max_window {
+            return Ok(DrainStop::Bound);
+        }
+        let msg = match tokio::time::timeout(bounds.peek_timeout, conn.recv_message()).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(DrainStop::Bound), // socket momentarily empty
+        };
+        match msg {
+            Message::CopyData(d) => {
+                let payload: Bytes = d.into_bytes();
+                match decode_frame(&payload)? {
+                    Frame::Wal(w) => {
+                        acc.write(w.start_lsn, w.data).await?;
+                        drained += w.data.len() as u64;
+                    }
+                    Frame::Keepalive(k) => {
+                        return Ok(DrainStop::Keepalive {
+                            reply_requested: k.reply_requested,
+                        });
+                    }
+                }
+            }
+            Message::CopyDone => return Ok(DrainStop::CopyDone),
+            Message::ErrorResponse(e) => bail!("wal-receive: {}", error_message(&e)),
+            m => tracing::debug!(
+                target = "wal_receive",
+                "ignoring {} during drain",
+                message_kind(&m)
+            ),
+        }
+    }
 }
 
 async fn identify_system(conn: &mut ReplicationConn) -> Result<(String, u32, u64)> {
@@ -887,12 +1036,17 @@ mod tests {
         }
     }
 
-    /// Accumulator backed by fs storage at `<dir>/store`, timeline 1
+    /// Accumulator backed by fs storage at `<dir>/store`, timeline 1, Uploader
     async fn test_acc(dir: &Path, seg_size: u64) -> SegmentAccumulator {
+        test_acc_upload(dir, seg_size, true).await
+    }
+
+    /// As `test_acc` but with the upload flag chosen (false = SyncReplica retain)
+    async fn test_acc_upload(dir: &Path, seg_size: u64, upload: bool) -> SegmentAccumulator {
         let store = dir.join("store");
         let settings = test_settings(&store);
         let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
-        SegmentAccumulator::new(1, dir.to_path_buf(), seg_size, settings, storage, 0)
+        SegmentAccumulator::new(1, dir.to_path_buf(), seg_size, settings, storage, 0, upload)
             .await
             .unwrap()
     }
@@ -968,6 +1122,28 @@ mod tests {
             .join(crate::pg::WAL_FOLDER)
             .join(&name);
         assert_eq!(std::fs::read(&archived).unwrap(), vec![0xAB; 16]);
+    }
+
+    #[tokio::test]
+    async fn retain_mode_rotates_without_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        let mut acc = test_acc_upload(dir.path(), seg_size, false).await;
+        acc.write(0, &[0xAB; 16]).await.unwrap(); // fills the segment -> rotate
+        acc.drain_uploads().await.unwrap(); // no-op: nothing was spawned
+        let name = acc.segment_for_lsn(0).format();
+        // completed segment is fsync'd + published, then retained on disk
+        assert_eq!(
+            std::fs::read(dir.path().join(&name)).unwrap(),
+            vec![0xAB; 16],
+            "completed segment retained locally"
+        );
+        let archived = dir
+            .path()
+            .join("store")
+            .join(crate::pg::WAL_FOLDER)
+            .join(&name);
+        assert!(!archived.exists(), "nothing uploaded in SyncReplica mode");
     }
 
     #[tokio::test]
@@ -1093,6 +1269,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_wal_batch_coalesces_frames_then_stops_on_keepalive() {
+        use crate::pg::replication::stream::{encode_keepalive_frame, encode_wal_data_frame};
+
+        // Server-direction CopyData wire frame: 'd' + i32 len + payload
+        fn copy_data(payload: &[u8]) -> Vec<u8> {
+            let mut v = vec![b'd'];
+            v.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
+
+        // A connected pair only to satisfy from_test_socket; the drain reads
+        // entirely from the preloaded rx buffer, so the socket is never touched
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+        let mut conn = ReplicationConn::from_test_socket(client, 160003);
+
+        // two 4-byte WAL frames (LSN 0, 4) then a keepalive, preloaded so the
+        // drain parses them from rx with no socket timing race
+        conn.push_rx_bytes(&copy_data(&encode_wal_data_frame(0, 8, &[0xAB; 4])));
+        conn.push_rx_bytes(&copy_data(&encode_wal_data_frame(4, 8, &[0xCD; 4])));
+        conn.push_rx_bytes(&copy_data(&encode_keepalive_frame(8, false)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut acc = test_acc(dir.path(), 16).await;
+
+        // Relaxed bounds so neither the wall-clock window nor the peek can trip
+        // under parallel-test load — the drain reads the preloaded frames from rx
+        let bounds = DrainBounds {
+            max_bytes: 4 * 1024 * 1024,
+            max_window: std::time::Duration::from_secs(60),
+            peek_timeout: std::time::Duration::from_secs(60),
+        };
+        let stop = drain_wal_batch(&mut conn, &mut acc, bounds).await.unwrap();
+        assert!(
+            matches!(
+                stop,
+                DrainStop::Keepalive {
+                    reply_requested: false
+                }
+            ),
+            "drain stops on the keepalive after the WAL frames"
+        );
+        assert_eq!(
+            acc.current.as_ref().unwrap().bytes_written,
+            8,
+            "both WAL frames coalesced into the open partial"
+        );
+    }
+
+    #[tokio::test]
     async fn flush_position_trails_uploads() {
         let dir = tempfile::tempdir().unwrap();
         let seg_size = 16u64;
@@ -1121,7 +1350,7 @@ mod tests {
         acc.write(0, &[0xCD; 4]).await.unwrap();
         let partial_name = acc.current.as_ref().unwrap().name.format();
 
-        let restart = acc.upload_partial_on_switch().await.unwrap();
+        let restart = acc.finalize_partial_on_switch().await.unwrap();
         assert_eq!(
             restart,
             Some(0),
