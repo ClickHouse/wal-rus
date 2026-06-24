@@ -39,10 +39,7 @@ resource "local_sensitive_file" "ssh_key" {
   file_permission = "0600"
 }
 
-# All-in-one bench box: PG18 + wal-g/walrus daemons + local pgbench driver.
-# The 'd' instance family ships a local NVMe instance-store; 00_mount_nvme.sh
-# detects the non-root NVMe, mkfs.ext4, and mounts it at /dat (PGDATA + WAL +
-# restore). Root holds the Go/Rust toolchains + build trees.
+# Bench box with local NVMe for /dat
 resource "aws_instance" "bench" {
   ami                    = data.aws_ami.ubuntu_noble.id
   instance_type          = var.instance_type

@@ -11,6 +11,10 @@ description = "walrus bench harness: 1 Hz resource sampler + CSV/plot analyzer"
 # parent package (which has no [workspace.members]).
 [workspace]
 
+[lib]
+name = "bench_tools"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bench-sampler"
 path = "src/bin/sampler.rs"
@@ -18,6 +22,10 @@ path = "src/bin/sampler.rs"
 [[bin]]
 name = "bench-analyze"
 path = "src/bin/analyze.rs"
+
+[[bin]]
+name = "bench-compare"
+path = "src/bin/compare.rs"
 
 [dependencies]
 ab_glyph = "0.2.32"

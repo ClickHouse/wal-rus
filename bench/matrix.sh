@@ -4,10 +4,7 @@
 #
 #   RUN_ID - label for this sweep's result dirs (default r1).
 #
-# Sweeps comparison on this host: pgbackrest, wal-g, walrus, once each,
-# calling run.sh per cell. Single-host counterpart of the external fleet's
-# orchestrate/run_matrix.sh (no SSH, and no GOMEMLIMIT-cap cell — that was a
-# GC-policy experiment, not intrinsic footprint).
+# Sweep archive-command cells across daemons
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"

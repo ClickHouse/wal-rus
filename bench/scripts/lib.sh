@@ -1,19 +1,13 @@
 # shellcheck shell=bash
 #
-# lib.sh — shared scaffolding for the single-host benchmark drivers.
+# lib.sh, shared benchmark driver helpers
 #
-# Sourced (not executed) by run.sh (archive_command path) and run_op.sh
-# (data-movement ops). Holds only the plumbing both share verbatim: config load,
-# logging, the local root-exec wrapper, the seeded-DB preflight, archive-backlog
-# drain, sampler start/stop, and inventory+provenance capture. The two drivers
-# keep their own measurement models (daemon-as-signal vs daemon-as-noise, burst
-# vs one-shot op); this file is scaffolding, not policy.
+# Sourced by run.sh and run_op.sh
 #
-# Relies on globals set by sourcing driver before each call: SCRIPT_DIR,
-# LOG_TAG, PGUSER, PGPASSWORD, PGHOST_DRIVER, PGDATA_DIR, PGBIN, RESULT_DIR,
-# SAMPLER, AWS_REGION.
+# Requires driver globals: SCRIPT_DIR, LOG_TAG, PGUSER, PGPASSWORD,
+# PGHOST_DRIVER, PGDATA_DIR, PGBIN, RESULT_DIR, SAMPLER, AWS_REGION
 
-# Source config.env (or ENV_FILE) with auto-export so child sudo blocks inherit.
+# Source config.env with auto-export for child sudo blocks
 load_config() {
   set -a
   # shellcheck source=../config.env.example
@@ -23,11 +17,10 @@ load_config() {
 
 log() { printf '[%s %s] %s\n' "${LOG_TAG}" "$(date -u +%H:%M:%S)" "$*" >&2; }
 
-# Run a bash snippet as root locally (fed on stdin; positional args after --).
+# Run stdin script as root
 run_root() { sudo bash -s -- "$@"; }
 
-# Abort unless the bench DB is seeded (wal_churn present). Callers that do not
-# need a populated DB (e.g. restore) skip this.
+# Abort unless bench DB is seeded
 require_seeded() {
   local seeded
   seeded="$(PGPASSWORD="${PGPASSWORD}" psql -h "${PGHOST_DRIVER}" -U "${PGUSER}" \
@@ -40,11 +33,8 @@ require_seeded() {
   fi
 }
 
-# drain_backlog THRESHOLD ITERS — wait until the .ready archive backlog falls to
-# THRESHOLD, polling every 2s up to ITERS times. Settles leftover WAL before a
-# measured window so the sample is not contaminated by prior load. Aborts the
-# cell (exit nonzero) if backlog still exceeds THRESHOLD after ITERS: a timed-out
-# drain leaks prior load into the measured start, so fail rather than sample it.
+# Wait for .ready archive backlog to fall below threshold
+# Abort on timeout to avoid sampling prior load
 drain_backlog() {
   local threshold="$1" iters="$2"
   run_root "${PGDATA_DIR}" "${threshold}" "${iters}" <<'REMOTE'
@@ -64,7 +54,7 @@ echo "drain complete: ready backlog = ${rb}"
 REMOTE
 }
 
-# Normalize FPI state before burst workloads. CHECKPOINT is superuser-only.
+# Normalize FPI state before bursts
 checkpoint_pg() {
   run_root "${PGBIN:-/usr/lib/postgresql/18/bin}" <<'REMOTE'
 set -euo pipefail
@@ -75,10 +65,8 @@ echo "checkpoint complete"
 REMOTE
 }
 
-# Reset archiver stats and launch the 1 Hz sampler as postgres into RESULT_DIR.
-# MODE_FLAG/MODE_VALUE select the attach mode: --daemon <unit> (run.sh, the
-# daemon IS the measurement) or --proc-match <comm> (run_op.sh, match the op
-# process). Aborts if the sampler does not come up.
+# Reset archiver stats and launch sampler
+# MODE_FLAG/MODE_VALUE select --daemon or --proc-match
 start_sampler() {
   local mode_flag="$1" mode_value="$2"
   log "starting sampler (${mode_flag} ${mode_value}) -> ${RESULT_DIR}"
@@ -86,6 +74,15 @@ start_sampler() {
 set -euo pipefail
 RESULT_DIR="$1"; SAMPLER="$2"; MODE_FLAG="$3"; MODE_VALUE="$4"; PGDATA="$5"
 install -d -o postgres -g postgres "${RESULT_DIR}"
+# Sampler runs as postgres, so RESULT_DIR must be postgres-traversable; the
+# default results/ under a 0750 home is not. Fail clear, not as a cryptic
+# sampler start failure. Relocate via RESULTS_ROOT (e.g. /dat/bench-results).
+if ! sudo -u postgres test -w "${RESULT_DIR}"; then
+  echo "error: ${RESULT_DIR} unwritable by postgres (sampler runs as postgres)" >&2
+  echo "       ancestor likely not traversable (e.g. a 0750 home dir); set" >&2
+  echo "       RESULTS_ROOT to a postgres-traversable path, e.g. /dat/bench-results" >&2
+  exit 1
+fi
 sudo -u postgres psql -X -q -c "SELECT pg_stat_reset_shared('archiver');" >/dev/null 2>&1 || true
 sudo -u postgres bash -c "
   nohup '${SAMPLER}' ${MODE_FLAG} '${MODE_VALUE}' --pgdata '${PGDATA}' \
@@ -103,8 +100,7 @@ echo "sampler running pid=${SPID}"
 REMOTE
 }
 
-# Stop the sampler (TERM, then KILL after 10s grace). Safe to call twice and from
-# an EXIT trap; never fails the caller.
+# Stop sampler, safe from EXIT trap
 stop_sampler() {
   log "stopping sampler"
   run_root "${RESULT_DIR}" <<'REMOTE' || true
@@ -119,9 +115,7 @@ fi
 REMOTE
 }
 
-# Record an explicit invalid-run marker in RESULT_DIR. bench-analyze skips any run
-# dir containing INVALID, so a degraded cell is excluded from comparison instead
-# of being silently averaged in. Reason is free text. Relies on RESULT_DIR.
+# Mark degraded run so analysis skips it
 mark_invalid() {
   log "INVALID run: $*"
   run_root "${RESULT_DIR}" "$*" <<'REMOTE' || true
@@ -134,10 +128,7 @@ chown postgres:postgres "${RESULT_DIR}/INVALID"
 REMOTE
 }
 
-# Capture the S3 inventory and write provenance.txt. Args: RESULT_DIR INV_PREFIX
-# REGION then any number of leading "key=value" lines (driver-specific identity:
-# daemon/op/tool, run_id, sizing, harness_git). The shared tool version/sha block
-# and captured_at are appended.
+# Capture S3 inventory and provenance
 write_provenance() {
   run_root "$@" <<'REMOTE'
 set -euo pipefail

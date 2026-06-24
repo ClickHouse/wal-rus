@@ -1,6 +1,7 @@
 //! Backup-list / backup-fetch end-to-end against fs storage with a synthetic
 //! sentinel + tar produced in wal-g format
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -30,9 +31,9 @@ fn test_settings() -> Settings {
 fn make_sentinel_v2(name_data_dir: &str) -> BackupSentinelDtoV2 {
     BackupSentinelDtoV2 {
         sentinel: BackupSentinelDto {
-            backup_start_lsn: Some(0x0300_0000),
+            backup_start_lsn: NonZeroU64::new(0x0300_0000),
             pg_version: 160003,
-            backup_finish_lsn: Some(0x0300_1000),
+            backup_finish_lsn: NonZeroU64::new(0x0300_1000),
             system_identifier: Some(7000000000000000000),
             uncompressed_size: 1024,
             compressed_size: 512,
@@ -92,7 +93,7 @@ async fn list_finds_seeded_backup() {
     assert_eq!(summaries.len(), 1);
     let s = &summaries[0];
     assert_eq!(s.name, backup_name);
-    assert_eq!(s.start_lsn, Some(0x0300_0000));
+    assert_eq!(s.start_lsn, NonZeroU64::new(0x0300_0000));
     assert_eq!(s.pg_version, 160003);
     assert_eq!(s.hostname.as_deref(), Some("testhost"));
 }
@@ -476,7 +477,7 @@ async fn delta_parent_picks_latest_when_enabled() {
     // Seed two sentinels; the later one (higher LSN, later StartTime) wins
     let older_name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
     let mut older = make_sentinel_v2("/var/lib/postgres/data");
-    older.sentinel.backup_start_lsn = Some(0x0100_0000);
+    older.sentinel.backup_start_lsn = NonZeroU64::new(0x0100_0000);
     older.start_time = chrono::Utc::now() - chrono::Duration::hours(2);
     older.finish_time = older.start_time + chrono::Duration::minutes(1);
     put_bytes(
@@ -488,7 +489,7 @@ async fn delta_parent_picks_latest_when_enabled() {
 
     let newer_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
     let mut newer = make_sentinel_v2("/var/lib/postgres/data");
-    newer.sentinel.backup_start_lsn = Some(0x0300_0000);
+    newer.sentinel.backup_start_lsn = NonZeroU64::new(0x0300_0000);
     newer.start_time = chrono::Utc::now();
     newer.finish_time = newer.start_time + chrono::Duration::minutes(1);
     put_bytes(
@@ -693,10 +694,10 @@ async fn fetch_applies_delta_chain_wi1() {
     );
     let mut delta_sentinel = make_sentinel_v2("/d");
     delta_sentinel.sentinel.increment_from = Some(full_name.clone());
-    delta_sentinel.sentinel.increment_from_lsn = Some(0x0100_0000);
+    delta_sentinel.sentinel.increment_from_lsn = NonZeroU64::new(0x0100_0000);
     delta_sentinel.sentinel.increment_full_name = Some(full_name.clone());
     delta_sentinel.sentinel.increment_count = Some(1);
-    delta_sentinel.sentinel.backup_start_lsn = Some(0x0200_0000);
+    delta_sentinel.sentinel.backup_start_lsn = NonZeroU64::new(0x0200_0000);
     put_bytes(
         store.clone(),
         &sentinel_key(&delta_name),
@@ -810,10 +811,10 @@ async fn fetch_applies_delta_chain_walg_leading_slash() {
     );
     let mut delta_sentinel = make_sentinel_v2("/d");
     delta_sentinel.sentinel.increment_from = Some(full_name.clone());
-    delta_sentinel.sentinel.increment_from_lsn = Some(0x0100_0000);
+    delta_sentinel.sentinel.increment_from_lsn = NonZeroU64::new(0x0100_0000);
     delta_sentinel.sentinel.increment_full_name = Some(full_name.clone());
     delta_sentinel.sentinel.increment_count = Some(1);
-    delta_sentinel.sentinel.backup_start_lsn = Some(0x0200_0000);
+    delta_sentinel.sentinel.backup_start_lsn = NonZeroU64::new(0x0200_0000);
     put_bytes(
         store.clone(),
         &sentinel_key(&delta_name),
@@ -909,10 +910,10 @@ async fn fetch_walks_three_step_chain() {
     );
     let mut s1 = make_sentinel_v2("/d");
     s1.sentinel.increment_from = Some(full_name.clone());
-    s1.sentinel.increment_from_lsn = Some(0x0100_0000);
+    s1.sentinel.increment_from_lsn = NonZeroU64::new(0x0100_0000);
     s1.sentinel.increment_full_name = Some(full_name.clone());
     s1.sentinel.increment_count = Some(1);
-    s1.sentinel.backup_start_lsn = Some(0x0200_0000);
+    s1.sentinel.backup_start_lsn = NonZeroU64::new(0x0200_0000);
     put_bytes(
         store.clone(),
         &sentinel_key(&delta1_name),
@@ -959,10 +960,10 @@ async fn fetch_walks_three_step_chain() {
     );
     let mut s2 = make_sentinel_v2("/d");
     s2.sentinel.increment_from = Some(delta1_name.clone());
-    s2.sentinel.increment_from_lsn = Some(0x0200_0000);
+    s2.sentinel.increment_from_lsn = NonZeroU64::new(0x0200_0000);
     s2.sentinel.increment_full_name = Some(full_name.clone());
     s2.sentinel.increment_count = Some(2);
-    s2.sentinel.backup_start_lsn = Some(0x0300_0000);
+    s2.sentinel.backup_start_lsn = NonZeroU64::new(0x0300_0000);
     put_bytes(
         store.clone(),
         &sentinel_key(&delta2_name),

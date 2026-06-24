@@ -387,7 +387,7 @@ fn encode_identify_system(tx: &mut BytesMut, identity: &Identity) {
     tx[row_desc_len_pos..row_desc_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
 
     // DataRow with the 4 column values.
-    let xlogpos_str = format_pg_lsn(identity.xlogpos);
+    let xlogpos_str = format_pg_lsn(identity.xlogpos).to_string();
     let columns: [Option<&str>; 4] = [
         Some(identity.system_id.as_str()),
         None, // timeline rendered below (needs a String)

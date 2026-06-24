@@ -2,13 +2,10 @@
 #
 # run_workload.sh
 #
-# Driver-side orchestrator for ONE benchmark cell. run.sh invokes it locally as:
+# Driver workload wrapper for one benchmark cell:
 #   PGHOST=.. PGUSER=.. PGPASSWORD=.. RUN_ID=.. bash scripts/driver/run_workload.sh
 #
-# Runs the measured workload: the high-WAL burst phase, and BLOCKS until it
-# finishes. The burst is the heavy-load phase we care about. Assumes the
-# 'walbench' DB is already initialized (pgbench_init.sh ran once during setup) —
-# it does NOT re-init.
+# Runs high-WAL burst, assumes pgbench_init.sh already ran
 #
 # Env (with defaults):
 #   PGHOST/PGUSER/PGPASSWORD  (required; passed by run.sh)
@@ -18,7 +15,7 @@
 #   CHURN_ROWS       2000000 must match pgbench_init.sh CHURN_ROWS
 #   RUN_ID           label, for logs only
 #
-# Runs from scripts/driver/, next to the workload_burst.sh phase script.
+# Runs next to workload_burst.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"

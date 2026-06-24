@@ -53,4 +53,4 @@ fn cap_malloc_arenas(n: usize) {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn cap_malloc_arenas() {}
+fn cap_malloc_arenas(_: usize) {}

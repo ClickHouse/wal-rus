@@ -540,17 +540,28 @@ async fn delta_chain_against_live_pg() {
     psql(&format!("SELECT count(*) FROM {tbl}")); // settle hint bits on touched pages
     psql("CHECKPOINT");
 
-    // self-archive WAL so the WAL-walk delta map sees the changed blocks
+    // Archive WAL as the fallback source for segments PG recycles; the delta
+    // push below reads the live pg_wal first
     psql("SELECT pg_switch_wal()");
-    let data_dir = psql("SHOW data_directory");
-    archive_pg_wal(&s, &store, &std::path::Path::new(&data_dir).join("pg_wal")).await;
+    let data_dir = std::path::PathBuf::from(psql("SHOW data_directory"));
+    archive_pg_wal(&s, &store, &data_dir.join("pg_wal")).await;
 
-    // (2) delta backup off the full (WALG_DELTA_MAX_STEPS=1)
+    // (2) delta backup off the full (WALG_DELTA_MAX_STEPS=1). Real deltas read a
+    // local PGDATA (filesystem source): only the changed blocks ship, and the
+    // WAL-walk delta map serves segments from the live pg_wal. BASE_BACKUP has no
+    // local WAL & streams every block, so it's a full-backup path only
     let mut s_delta = s.clone();
     s_delta.delta.max_steps = 1;
-    backup::push::handle(&s_delta, store.clone(), default_push_args())
-        .await
-        .expect("delta backup");
+    backup::push::handle(
+        &s_delta,
+        store.clone(),
+        backup::push::PushArgs {
+            pgdata: Some(data_dir.clone()),
+            ..default_push_args()
+        },
+    )
+    .await
+    .expect("delta backup");
     let delta_name = backup::fetch::resolve_name(&store, "LATEST").await.unwrap();
     assert_ne!(delta_name, full_name, "delta should be the new LATEST");
     assert!(
@@ -860,7 +871,7 @@ async fn wal_summaries_parse_real_pg_files() {
     )))
     .unwrap();
 
-    let map =
+    let (map, _covered_start, _covered_end) =
         walrus::pg::wal_summaries::read_for_range(std::path::Path::new(&data_dir), tli, start, end)
             .expect("parse real PG WAL summaries");
     assert!(!map.is_empty(), "summary map should carry changed blocks");

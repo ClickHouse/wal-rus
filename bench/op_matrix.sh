@@ -4,24 +4,21 @@
 #
 #   RUN_ID - label for this sweep's result dirs (default r1).
 #
-# Sweeps data-movement operation benchmarks (run_op.sh) on this host:
-# backup-send, backup-fetch, backup-delta, backup-delta-summaries, then
-# wal-receive — each across the tools that implement it, once. Op order matters:
-# backup-send runs first so a parent full exists for backup-fetch to restore and
-# for the delta cells to extend.
+# Sweep data-movement ops across tools that implement them
+# backup-send runs first so backup-fetch has something to restore
+# Delta cells take their own parent full, avoiding cross-tool WAL gaps
 #
-# Skipped cells: pgbackrest has no wal-receive equivalent; backup-delta-summaries
-# is walrus-only (no wal-g / pgbackrest WAL-summary delta). Override OPS / TOOLS
-# via env. Counterpart of matrix.sh (archive path).
+# Skipped cells: pgbackrest has no wal-receive equivalent; backup-delta-sidecar
+# has no pgbackrest peer (WALG_USE_WAL_DELTA is a walrus/wal-g daemon feature);
+# backup-delta-summaries is walrus-only (no wal-g / pgbackrest WAL-summary delta).
+# Override OPS / TOOLS via env
 #
-# backup-delta-chain (DELTA_MAX_STEPS-deep chain + leaf restore) is omitted from
-# the default sweep — it churns once per step, so its cost scales with depth. Opt
-# in with OPS="backup-send backup-delta-chain" (backup-send must precede it).
+# backup-delta-chain is opt-in: OPS="backup-delta-chain"
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 RUN_ID="${1:-${RUN_ID:-r1}}"
-read -r -a OPS <<< "${OPS:-backup-send backup-fetch backup-delta backup-delta-summaries wal-receive}"
+read -r -a OPS <<< "${OPS:-backup-send backup-fetch backup-delta backup-delta-sidecar backup-delta-summaries wal-receive}"
 read -r -a TOOLS <<< "${TOOLS:-pgbackrest walg walrus}"
 
 log() { printf '[op-matrix %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -36,6 +33,10 @@ for op in "${OPS[@]}"; do
     fi
     if [[ "${op}" == "backup-delta-summaries" && "${tool}" != "walrus" ]]; then
       log "skip ${op}/${tool} (walrus-only)"
+      continue
+    fi
+    if [[ "${op}" == "backup-delta-sidecar" && "${tool}" == "pgbackrest" ]]; then
+      log "skip ${op}/${tool} (no WALG_USE_WAL_DELTA peer)"
       continue
     fi
     log "=== run ${op} ${tool} ${RUN_ID} ==="

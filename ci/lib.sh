@@ -113,11 +113,14 @@ pg_replication_on() {
     # wal_keep_size retains recent segments so START_REPLICATION from the
     # current segment boundary can't race a checkpoint that recycles it
     # ("requested WAL segment ... has already been removed") on an otherwise
-    # idle cluster.
+    # idle cluster. Sized large enough that a delta push's WAL-walk reaches its
+    # parent's start segment: the suite runs tests in parallel, so concurrent WAL
+    # widens the parent->delta gap (observed past 160MB), and archive_mode is off
+    # here, so a segment recycled before the delta reads it is gone for good.
     cat >>"$PGDATA/postgresql.conf" <<EOF
 wal_level = replica
 max_wal_senders = 8
-wal_keep_size = 128MB
+wal_keep_size = 1GB
 EOF
 }
 
@@ -179,10 +182,16 @@ walg() {
 # One bucket-interop roundtrip: $1 writes the backup + WAL, $2 restores and
 # replays, dumps compared. Storage/compression/encryption come from the
 # exported env so callers vary just those. Leaves the cluster stopped + dropped.
-# Used by the new cross_tool_{encryption,lzma} scripts; the original
+# Used by the new cross_tool_{encryption,lzma,stream} scripts; the original
 # forward/reverse scripts predate it and stay inline.
+#
+# $3.. is the backup-push source: pass a PGDATA path to read the filesystem
+# (same-input interop), or nothing to stream BASE_BACKUP off a replication
+# connection. Both tools take the same positional, so a lane picks fs vs
+# streaming by what it forwards here.
 cross_roundtrip() {
     local writer="$1" reader="$2"
+    shift 2
     pg_initdb
     pg_archive_on "$writer"
     pg_start
@@ -190,7 +199,7 @@ cross_roundtrip() {
     psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
     pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump1.sql"
 
-    if [ "$writer" = "$WALRUS_BIN" ]; then walrus backup-push; else walg backup-push "$PGDATA"; fi
+    if [ "$writer" = "$WALRUS_BIN" ]; then walrus backup-push "$@"; else walg backup-push "$@"; fi
     psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
     sleep 3
 
@@ -232,7 +241,7 @@ cross_delta_roundtrip() {
 
     # parent full (delta detection explicitly off)
     export WALG_DELTA_MAX_STEPS=0
-    if [ "$writer" = "$WALRUS_BIN" ]; then walrus backup-push; else walg backup-push "$PGDATA"; fi
+    if [ "$writer" = "$WALRUS_BIN" ]; then walrus backup-push "$PGDATA"; else walg backup-push "$PGDATA"; fi
 
     # mutate, then close + archive the changed WAL before the delta
     pgbench -p "$PGPORT" -h "$PGHOST" -t 2000 postgres >/dev/null
@@ -241,9 +250,9 @@ cross_delta_roundtrip() {
     sleep 3
     pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump1.sql"
 
-    # 1-step delta off the parent
+    # 1-step delta off the parent. Deltas read local PGDATA (fs source)
     export WALG_DELTA_MAX_STEPS=1
-    if [ "$writer" = "$WALRUS_BIN" ]; then walrus backup-push; else walg backup-push "$PGDATA"; fi
+    if [ "$writer" = "$WALRUS_BIN" ]; then walrus backup-push "$PGDATA"; else walg backup-push "$PGDATA"; fi
     psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
     sleep 3
     unset WALG_DELTA_MAX_STEPS

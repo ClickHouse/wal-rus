@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Initialize the PG18 cluster at /dat/18/data, write prod-mirrored
-# postgresql.conf + a pg_hba.conf entry for the driver box, and (re)start the
-# cluster. Idempotent: safe to re-run.
+# Initialize PG18 cluster and benchmark config
 set -euo pipefail
 
 PGDATA="${PGDATA:-/dat/18/data}"
 PGBIN="${PGBIN:-/usr/lib/postgresql/18/bin}"
-# CIDR allowed to connect over the network (the driver SG / subnet).
+# Driver CIDR allowed over network
 DRIVER_CIDR="${DRIVER_CIDR:-}"
 PG_LOG="${PG_LOG:-/dat/18/pg.log}"
 
@@ -25,9 +23,7 @@ if [[ ! -x "${PGBIN}/initdb" ]]; then
   exit 1
 fi
 
-# PGDG auto-creates AND starts a default cluster '18/main' on port 5432 at
-# install time; it holds the socket and would collide with our cluster
-# (same port + socket dir). Drop it so 5432 is free. Idempotent.
+# Drop PGDG default cluster so port 5432 is free
 if command -v pg_lsclusters >/dev/null 2>&1 \
   && pg_lsclusters -h 2>/dev/null | awk '{print $1"/"$2}' | grep -qx '18/main'; then
   echo "=== Removing PGDG default cluster 18/main (frees port 5432) ==="
@@ -45,22 +41,18 @@ fi
 
 echo "=== Writing postgresql.conf ==="
 sudo -u postgres tee "${PGDATA}/postgresql.conf" >/dev/null <<EOF
-# Managed by 10_init_pg.sh — prod-mirrored benchmark config.
+# Managed by 10_init_pg.sh
 listen_addresses = '*'
 port = 5432
-# PGHOST=/var/run/postgresql in wal-g.env + the sampler expect the socket here.
+# wal-g.env and sampler expect this socket
 unix_socket_directories = '/var/run/postgresql'
 
 wal_level = replica
 archive_mode = on
 archive_timeout = 60
-# PG17+ WAL summarizer: required by walrus backup-push --delta-from-wal-summaries
-# (the summaries-sourced delta bench cell). Off by default upstream.
+# Required by walrus --delta-from-wal-summaries
 summarize_wal = on
-# Per-daemon archive_command is set by 30_select_daemon.sh / run_one.sh (each
-# daemon's OWN client — walg_archive's extension does not interoperate with the
-# walrus daemon). This placeholder fails safe (segments stay .ready) until a
-# run configures the real command.
+# Real archive_command is set per daemon; placeholder fails safe
 archive_command = '/bin/false'
 
 wal_compression = lz4

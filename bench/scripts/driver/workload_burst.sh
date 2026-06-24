@@ -2,21 +2,12 @@
 #
 # workload_burst.sh
 #
-# High-WAL burst load, driven over the network at the SUT's PostgreSQL.
-# Goal: generate WAL >= ~2x the single-daemon archive drain rate so the
-# pg_wal *.ready backlog climbs into the hundreds/thousands and we can measure
-# how each archiver daemon keeps up (or falls behind).
+# High-WAL burst load against SUT PostgreSQL
+# Target WAL >= ~2x single-daemon drain rate so the .ready backlog climbs,
+# exposing how each archiver keeps up (or falls behind)
 #
-# Strategy:
-#   * UPDATE storm  -- random-row UPDATEs on wal_churn that mutate *indexed*
-#     columns (k1,k2,k3,tag,updated_at). After each checkpoint, the first touch
-#     of every heap + index page emits a full-page image (FPI), so random
-#     scatter across a wide, 5-B-tree table maximizes WAL bytes per row.
-#   * COPY storm    -- a fraction of workers run large COPY batches into the
-#     unindexed wal_bulk table for bursty heap-insert WAL on top of the UPDATEs.
-#
-# Both are expressed as pgbench custom scripts run by N concurrent workers
-# (one pgbench process per worker so COPY \. blocks behave) for DURATION.
+# UPDATE workers dirty indexed rows; COPY workers bulk-insert unindexed rows
+# One pgbench process per worker runs for DURATION
 #
 # Env vars (with defaults):
 #   PGHOST      (required) SUT private IP / host
@@ -41,7 +32,7 @@ DURATION="${DURATION:-600}"
 CHURN_ROWS="${CHURN_ROWS:-2000000}"
 UPDATE_BATCH="${UPDATE_BATCH:-25}"
 COPY_ROWS="${COPY_ROWS:-50000}"
-COPY_BLOB_REPEAT="${COPY_BLOB_REPEAT:-8}"   # md5 repeats per blob; raises WAL bytes/row at ~same CPU
+COPY_BLOB_REPEAT="${COPY_BLOB_REPEAT:-8}"   # md5 repeats per blob
 PROTOCOL="${PROTOCOL:-prepared}"
 
 host_cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
@@ -66,7 +57,7 @@ echo "==> update_batch=${UPDATE_BATCH} copy_rows=${COPY_ROWS} churn_rows=${CHURN
 # --- temp pgbench script files ---------------------------------------------
 WORKDIR="$(mktemp -d)"
 cleanup() {
-    # Kill any still-running worker pgbench processes, then remove temp scripts.
+    # Kill any remaining workers, then remove temp scripts
     if [[ -n "${WORKER_PIDS:-}" ]]; then
         # shellcheck disable=SC2086
         kill ${WORKER_PIDS} 2>/dev/null || true
@@ -78,9 +69,8 @@ trap cleanup EXIT INT TERM
 UPDATE_SQL="${WORKDIR}/update.sql"
 COPY_SQL="${WORKDIR}/copy.sql"
 
-# UPDATE worker script: one random id per :rid, repeated UPDATE_BATCH times in a
-# single transaction. Every mutated column is indexed so each row dirties the
-# heap page plus several index pages -> heavy FPI WAL.
+# UPDATE worker mutates indexed columns: post-checkpoint first page touch emits
+# an FPI, so random scatter across the wide 5-index table maximizes WAL bytes/row
 {
     echo "\\set rmax ${CHURN_ROWS}"
     echo "BEGIN;"
@@ -100,9 +90,7 @@ SQL
     echo "END;"
 } > "${UPDATE_SQL}"
 
-# COPY worker script: build a COPY_ROWS-row batch on the server with
-# generate_series feeding an INSERT...SELECT. This is the COPY-equivalent bulk
-# heap-insert burst into the unindexed wal_bulk table, fully WAL-logged.
+# COPY worker bulk-inserts fully logged rows into wal_bulk
 {
     echo "\\set batch random(1, 1000000000)"
     cat <<SQL
@@ -112,18 +100,14 @@ FROM generate_series(1, ${COPY_ROWS}) AS g;
 SQL
 } > "${COPY_SQL}"
 
-# Reset wal_bulk so the COPY storm does not accumulate across cells/runs and
-# fill the data volume — at COPY_ROWS=50000 a 10-min burst adds tens of GB, and
-# nothing reclaimed it, so a multi-cell matrix on a finite NVMe eventually hit
-# ENOSPC (PG crash + aborted workload). wal_bulk is pure churn (only there to
-# emit heap-insert WAL), so truncating loses nothing and each cell starts clean.
+# Reset COPY churn table: wal_bulk is pure churn, unreclaimed it adds tens of GB
+# per burst until a multi-cell matrix hits ENOSPC (PG crash). Truncate loses
+# nothing, each cell starts clean
 echo "==> TRUNCATE wal_bulk (bound data-volume growth across cells/runs)"
 psql -X -v ON_ERROR_STOP=1 -c "TRUNCATE TABLE wal_bulk;"
 
 # --- launch workers ---------------------------------------------------------
-# One pgbench process per worker (-c 1 -j 1), each looping its script for the
-# whole DURATION. Running them as separate processes keeps a clean 1:1 mapping
-# between workers and backends and isolates COPY workers from UPDATE workers.
+# One pgbench process per worker keeps COPY and UPDATE isolated
 WORKER_PIDS=""
 
 launch_worker() {
@@ -143,21 +127,20 @@ for i in $(seq 1 "${UPDATE_WORKERS}"); do
     launch_worker "update-${i}" "${UPDATE_SQL}" "${PROTOCOL}"
 done
 for i in $(seq 1 "${COPY_WORKERS}"); do
-    # COPY/INSERT-SELECT workers use the simple protocol; no benefit from prepared.
+    # COPY/INSERT-SELECT gains nothing from prepared protocol
     launch_worker "copy-${i}" "${COPY_SQL}" "simple"
 done
 
 echo "==> Launched ${WORKERS} workers; running for ${DURATION}s ..."
 
-# Wait for all workers; tally failures without aborting mid-burst so every log is
-# still summarized below.
+# Wait for all workers, then summarize all logs
 failed_workers=0
 for pid in ${WORKER_PIDS}; do
     if ! wait "${pid}"; then
         failed_workers=$(( failed_workers + 1 ))
     fi
 done
-WORKER_PIDS=""   # all reaped; nothing for cleanup() to kill
+WORKER_PIDS=""   # all reaped
 
 echo "==> Per-worker pgbench summaries:"
 for log in "${WORKDIR}"/*.log; do
@@ -166,16 +149,13 @@ for log in "${WORKDIR}"/*.log; do
     grep -E "tps|number of transactions actually processed|failed" "${log}" || cat "${log}"
 done
 
-# pgbench prints "number of failed transactions" only when >0 (deadlock /
-# serialization / mid-run disconnect): a worker can exit 0 yet still drop work, so
-# a clean exit code alone does not prove a full-strength workload.
+# pgbench can exit 0 with failed transactions
 failed_txns="$(grep -hoE 'number of failed transactions: [0-9]+' "${WORKDIR}"/*.log 2>/dev/null \
     | awk '{s+=$NF} END{print s+0}' || true)"
 
 echo "==> Burst finished: failed_workers=${failed_workers} failed_txns=${failed_txns}"
 
-# A degraded burst means this cell saw a weaker workload than its peers and is not
-# comparable. Exit non-zero; callers record an explicit invalid-run marker.
+# Degraded bursts are not comparable
 if (( failed_workers != 0 || failed_txns != 0 )); then
     echo "FATAL: burst degraded (${failed_workers} worker(s) failed, ${failed_txns} failed txn(s))" >&2
     exit 1

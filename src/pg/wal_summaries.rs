@@ -29,6 +29,7 @@ use roaring::RoaringBitmap;
 use thiserror::Error;
 
 use crate::pg::backup::delta::PagedFileDeltaMap;
+use crate::pg::backup::format_pg_lsn;
 use crate::pg::walparser::RelFileNode;
 
 pub const SUMMARIES_DIR: &str = "pg_wal/summaries";
@@ -50,19 +51,16 @@ pub enum SummaryError {
     BadMagic { expected: u32, got: u32 },
     #[error("CRC mismatch: expected {expected:08X}, got {got:08X}")]
     BadCrc { expected: u32, got: u32 },
-    #[error("empty LSN range [{start:X}, {end:X})")]
+    #[error("empty LSN range [{}, {})", format_pg_lsn(*start), format_pg_lsn(*end))]
     EmptyRange { start: u64, end: u64 },
     #[error(
-        "no WAL summaries cover [{start:X}, {end:X}) on timeline {timeline} \
-        (enable summarize_wal and retain summaries for the full range)"
+        "no WAL summaries cover [{}, {}) on timeline {timeline} \
+        (enable summarize_wal and retain summaries for the full range)",
+        format_pg_lsn(*start), format_pg_lsn(*end)
     )]
     NoSummariesForRange { start: u64, end: u64, timeline: u32 },
-    #[error("WAL summary gap at start: first summary begins at {first:X}, need {need:X}")]
-    GapAtStart { first: u64, need: u64 },
-    #[error("WAL summary gap between {a_end:X} and {b_start:X}")]
+    #[error("WAL summary gap between {} and {}", format_pg_lsn(*a_end), format_pg_lsn(*b_start))]
     GapInside { a_end: u64, b_start: u64 },
-    #[error("WAL summary gap at end: last summary ends at {last:X}, need {need:X}")]
-    GapAtEnd { last: u64, need: u64 },
 }
 
 /// One on-disk summary file, decoded from its filename.
@@ -78,16 +76,19 @@ pub struct SummaryFile {
 /// Top-level: walk `$pgdata/pg_wal/summaries`, pick the files covering
 /// `[first_used_lsn, first_not_used_lsn)` on `timeline`, verify contiguous
 /// coverage, parse them chronologically, return main-fork blocks aggregated
-/// into a `PagedFileDeltaMap`
+/// into a `PagedFileDeltaMap` plus the `[covered_start, covered_end)` LSN span
+/// the summaries actually span (may fall short of the request at either end;
+/// see `select_for_range`)
 pub fn read_for_range(
     pg_data_dir: &Path,
     timeline: u32,
     first_used_lsn: u64,
     first_not_used_lsn: u64,
-) -> Result<PagedFileDeltaMap, SummaryError> {
+) -> Result<(PagedFileDeltaMap, u64, u64), SummaryError> {
     let dir = pg_data_dir.join(SUMMARIES_DIR);
     let files = list_summary_files(&dir)?;
-    let selected = select_for_range(&files, timeline, first_used_lsn, first_not_used_lsn)?;
+    let (selected, covered_start, covered_end) =
+        select_for_range(&files, timeline, first_used_lsn, first_not_used_lsn)?;
     let mut state: BTreeMap<RelForkKey, RelForkState> = BTreeMap::new();
     for f in &selected {
         tracing::info!(
@@ -109,7 +110,7 @@ pub fn read_for_range(
             });
         }
     }
-    Ok(delta)
+    Ok((delta, covered_start, covered_end))
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -177,16 +178,20 @@ pub fn parse_summary_filename(name: &str) -> Option<SummaryFile> {
     })
 }
 
-/// Pick the subset of `files` overlapping `[first_used, first_not_used)`
-/// on the given timeline, then assert contiguous coverage. Errors out on
-/// any gap (covers wal-g semantics: a delta with missing WAL summaries
-/// must NOT silently produce an incorrect delta)
+/// Pick the subset of `files` overlapping `[first_used, first_not_used)` on the
+/// given timeline (sorted), with the LSN span `[covered_start, covered_end)`
+/// they actually cover. Leading and trailing gaps are soft: retention drops the
+/// oldest summaries (head gap) and the summarizer trails the backup LSN (tail
+/// gap), so the caller raw-walks `[first_used, covered_start)` and
+/// `[covered_end, first_not_used)` and unions them in. A gap *between* summaries
+/// stays fatal — not normal lag/retention, so the WAL it'd need may be gone;
+/// erroring drops the push to a full backup rather than a silently-wrong delta
 pub fn select_for_range(
     files: &[SummaryFile],
     timeline: u32,
     first_used_lsn: u64,
     first_not_used_lsn: u64,
-) -> Result<Vec<SummaryFile>, SummaryError> {
+) -> Result<(Vec<SummaryFile>, u64, u64), SummaryError> {
     if first_not_used_lsn <= first_used_lsn {
         return Err(SummaryError::EmptyRange {
             start: first_used_lsn,
@@ -207,12 +212,6 @@ pub fn select_for_range(
             timeline,
         });
     }
-    if kept[0].start_lsn > first_used_lsn {
-        return Err(SummaryError::GapAtStart {
-            first: kept[0].start_lsn,
-            need: first_used_lsn,
-        });
-    }
     for w in kept.windows(2) {
         if w[1].start_lsn > w[0].end_lsn {
             return Err(SummaryError::GapInside {
@@ -221,14 +220,9 @@ pub fn select_for_range(
             });
         }
     }
-    let last = kept.last().unwrap();
-    if last.end_lsn < first_not_used_lsn {
-        return Err(SummaryError::GapAtEnd {
-            last: last.end_lsn,
-            need: first_not_used_lsn,
-        });
-    }
-    Ok(kept)
+    let covered_start = kept[0].start_lsn;
+    let covered_end = kept.last().unwrap().end_lsn;
+    Ok((kept, covered_start, covered_end))
 }
 
 /// Stream one summary file, fold its entries into `state`. Reads through a
@@ -528,10 +522,12 @@ mod tests {
                 end_lsn: 0x500,
             },
         ];
-        let got = select_for_range(&files, 1, 0x150, 0x350).unwrap();
+        let (got, covered_start, covered_end) = select_for_range(&files, 1, 0x150, 0x350).unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].start_lsn, 0x100);
         assert_eq!(got[2].end_lsn, 0x400);
+        // span brackets the request: caller walks no gap
+        assert_eq!((covered_start, covered_end), (0x100, 0x400));
     }
 
     #[test]
@@ -558,15 +554,33 @@ mod tests {
     }
 
     #[test]
-    fn select_for_range_tail_missing() {
+    fn select_for_range_tail_gap_soft() {
+        // Summarizer trails the backup LSN: coverage stops at 0x200, caller walks
+        // [0x200, 0x300)
         let files = vec![SummaryFile {
             path: PathBuf::new(),
             timeline: 1,
             start_lsn: 0x100,
             end_lsn: 0x200,
         }];
-        let err = select_for_range(&files, 1, 0x150, 0x300).unwrap_err();
-        assert!(matches!(err, SummaryError::GapAtEnd { .. }), "{err:?}");
+        let (got, covered_start, covered_end) = select_for_range(&files, 1, 0x150, 0x300).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((covered_start, covered_end), (0x100, 0x200));
+    }
+
+    #[test]
+    fn select_for_range_head_gap_soft() {
+        // Retention dropped the oldest summaries: coverage starts at 0x200, caller
+        // walks [0x150, 0x200)
+        let files = vec![SummaryFile {
+            path: PathBuf::new(),
+            timeline: 1,
+            start_lsn: 0x200,
+            end_lsn: 0x300,
+        }];
+        let (got, covered_start, covered_end) = select_for_range(&files, 1, 0x150, 0x300).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((covered_start, covered_end), (0x200, 0x300));
     }
 
     #[test]
@@ -740,7 +754,8 @@ mod tests {
         let fname = "0000000100000000000001000000000000000200.summary";
         std::fs::write(sum_dir.join(fname), &data).unwrap();
 
-        let m = read_for_range(dir.path(), 1, 0x100, 0x200).unwrap();
+        let (m, covered_start, covered_end) = read_for_range(dir.path(), 1, 0x100, 0x200).unwrap();
+        assert_eq!((covered_start, covered_end), (0x100, 0x200));
         let blocks = m
             .blocks_for("base/16385/100")
             .unwrap()

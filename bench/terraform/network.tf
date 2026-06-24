@@ -1,5 +1,4 @@
-# Dedicated VPC + public subnet so the box is isolated from any existing VPCs.
-# Single host, so no intra-SG PG rule is needed (pgbench talks to PG over loopback).
+# Dedicated VPC + public subnet for bench box
 
 data "aws_availability_zones" "available" {
   state = "available"

@@ -9,6 +9,8 @@
 //! Mirrors wal-g's `wal-verify` modes; output is intentionally machine-
 //! readable so it can drive an exit-non-zero check
 
+use std::num::NonZeroU64;
+
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
@@ -23,7 +25,7 @@ pub struct IntegrityReport {
     pub status: ReportStatus,
     pub backup_name: Option<String>,
     pub timeline: u32,
-    pub start_lsn: Option<u64>,
+    pub start_lsn: Option<NonZeroU64>,
     pub gaps: Vec<GapInfo>,
 }
 
@@ -121,7 +123,7 @@ pub async fn check_integrity(storage: DynStorage) -> Result<IntegrityReport> {
             gaps: Vec::new(),
         });
     };
-    let gaps = show::integrity_for_backup(storage, start, timeline).await?;
+    let gaps = show::integrity_for_backup(storage, start.get(), timeline).await?;
     let status = if gaps.is_empty() {
         ReportStatus::Ok
     } else {
@@ -163,7 +165,9 @@ fn print_integrity(r: &IntegrityReport) {
         println!(
             "  backup: {name} timeline={} start_lsn={}",
             r.timeline,
-            r.start_lsn.map(format_pg_lsn).unwrap_or_else(|| "-".into())
+            r.start_lsn
+                .map(|l| format_pg_lsn(l.get()).to_string())
+                .unwrap_or_else(|| "-".into())
         );
     }
     for g in &r.gaps {
@@ -190,8 +194,8 @@ mod tests {
     fn sentinel(seg_no: u64) -> BackupSentinelDtoV2 {
         BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(lsn_for_seg(seg_no)),
-                backup_finish_lsn: Some(lsn_for_seg(seg_no)),
+                backup_start_lsn: NonZeroU64::new(lsn_for_seg(seg_no)),
+                backup_finish_lsn: NonZeroU64::new(lsn_for_seg(seg_no)),
                 pg_version: 160003,
                 ..Default::default()
             },
@@ -210,7 +214,7 @@ mod tests {
         let r = check_integrity(s).await.unwrap();
         assert_eq!(r.status, ReportStatus::Ok);
         assert_eq!(r.timeline, 1);
-        assert_eq!(r.start_lsn, Some(lsn_for_seg(2)));
+        assert_eq!(r.start_lsn, NonZeroU64::new(lsn_for_seg(2)));
         assert!(r.gaps.is_empty());
     }
 

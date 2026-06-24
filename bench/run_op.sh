@@ -2,61 +2,54 @@
 #
 # run_op.sh OP TOOL RUN_ID
 #
-#   OP     - backup-send | backup-fetch | backup-delta | backup-delta-summaries |
-#            backup-delta-chain | wal-receive            (data-movement operation)
+#   OP     - backup-send | backup-fetch | backup-delta | backup-delta-sidecar |
+#            backup-delta-summaries | backup-delta-chain | wal-receive
+#                                                         (data-movement operation)
 #   TOOL   - walrus | walg | pgbackrest                  (implementation)
 #   RUN_ID - free-form label, e.g. r1 / 2026-06-22
 #
-# Benchmarks ONE data-movement operation with ONE tool, single-host (PG + tool
-# local), cross-tool where an equivalent exists. Counterpart of run.sh, which
-# benches the archive_command (wal-push) path; this covers the rest of walrus:
+# Benchmark one data-movement operation with one local tool
 #
 #   backup-send             base backup -> S3   walrus/wal-g backup-push ... --full |
 #                                               pgbackrest backup --type=full
 #   backup-fetch            restore   <- S3     walrus/wal-g backup-fetch       | pgbackrest restore
 #   backup-delta            delta backup -> S3  walrus/wal-g backup-push (wi1)  | pgbackrest backup --type=incr
+#   backup-delta-sidecar    delta, archiver     walrus/wal-g backup-push (wi1), | (no pgbackrest peer)
+#                           pre-records          WALG_USE_WAL_DELTA=1 on the daemon
+#                           <group>_delta
 #   backup-delta-summaries  delta from WAL      walrus backup-push              | (walrus-only)
 #                           summaries -> S3      --delta-from-wal-summaries
 #   backup-delta-chain      N-deep delta chain  walrus/wal-g backup-push xN     | pgbackrest backup --type=incr xN
 #                           + restore of leaf    (origin=LATEST), then backup-fetch LATEST
 #   wal-receive             stream WAL from PG  walrus/wal-g wal-receive        | (no pgbackrest peer)
 #
-# Delta cells need a parent full backup (backup-send must precede them) and a
-# churn phase: they configure the tool, checkpoint, drive a DELTA_CHURN_SECONDS
-# burst with the archiver live (the default delta map walks archived WAL),
-# drain, then time the delta push while archiver stays live. backup-delta-summaries
-# instead sources the delta map from $PGDATA/pg_wal/summaries (needs
-# summarize_wal=on, set by 10_init_pg.sh) and is walrus-only (no wal-g /
-# pgbackrest peer). DELTA_ORIGIN defaults to LATEST_FULL so both delta paths
-# anchor to chain root. Delta size is S3-inventory byte growth across the push,
-# not on-disk cluster size.
+# Delta cells take a fresh parent full, churn, drain, then time delta push
+# with tool archiver still live. Variants differ only by changed-block source:
+#   backup-delta           archived raw WAL, reparsed in full (no sidecars) -- the
+#                          cold worst case
+#   backup-delta-sidecar   same, but WALG_USE_WAL_DELTA=1 on the archiver pre-records
+#                          <group>_delta sidecars during the churn, so the push folds
+#                          whole groups and reparses only the trailing partial group
+#                          (walrus + wal-g; pgbackrest has no peer)
+#   backup-delta-summaries $PGDATA/pg_wal/summaries (needs summarize_wal=on, set by
+#                          10_init_pg.sh); walrus-only
+# DELTA_ORIGIN defaults to LATEST_FULL, the in-cell full
+# Delta size is S3-inventory byte growth across the push, not on-disk cluster size.
 #
-# backup-delta-chain builds a real DELTA_MAX_STEPS-deep chain: each step churns,
-# drains, then pushes a delta with WALG_DELTA_ORIGIN=LATEST so it extends the
-# PREVIOUS delta (LATEST_FULL would re-anchor each to the root, leaving restore
-# depth 2). Every step is timed + sized on its own (chain_metrics.txt), then a
-# backup-fetch LATEST walks full + all N deltas to exercise restore-time replay.
-# Its churn is per-step and INSIDE the sampler window, so the daemon's archiving
-# during churn is sampled too; the per-step push timings isolate the push.
+# backup-delta-chain uses WALG_DELTA_ORIGIN=LATEST, then restores leaf backup
+# chain_metrics.txt records per-step push timing + size
 #
-# walrus's walsender (serving WAL via the replication protocol) has no CLI entry
-# point yet, so wal-send is intentionally absent.
+# wal-send is absent until walrus exposes walsender CLI
 #
-# The 1 Hz sampler is reused, here attached with --proc-match <tool comm>: these
-# ops are one-shot CLI processes, not systemd units. Both archive daemons are
-# stopped first; backup-push ops (NEEDS_ARCHIVE) then start ONLY the tool's own
-# daemon and leave it up across the push (pg_backup_stop blocks on WAL archival),
-# so for those the sample is the op process plus the mostly-idle daemon (~27 MB
-# for walrus). backup-fetch / wal-receive run with no daemon — op process only.
+# Sampler attaches with --proc-match <tool comm>. Backup-push samples op + daemon
+# because pg_backup_stop waits for WAL archival
 #
-# Results: bench/results/<OP>-<TOOL>-<RUN_ID>/ — sampler CSVs, op_metrics.txt
+# Results: bench/results/<OP>-<TOOL>-<RUN_ID>/, sampler CSVs, op_metrics.txt
 # (elapsed, bytes processed, MB/s), provenance.txt, s3_inventory.txt. Override
 # RESULTS_ROOT to relocate.
 #
-# Assumes ./setup.sh has run. backup-send and wal-receive also assume the bench
-# DB is seeded (pgbench_init.sh); backup-fetch assumes a compatible backup-send
-# already produced a backup to fetch. Run as a normal user (uses sudo for root
-# steps); do not run pgbench as root.
+# Assumes setup + seeded DB, backup-fetch needs prior compatible backup-send
+# Run as normal user, sudo handles root steps
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -66,7 +59,7 @@ LOG_TAG=op
 load_config
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <backup-send|backup-fetch|backup-delta|backup-delta-summaries|backup-delta-chain|wal-receive> <walrus|walg|pgbackrest> <run_id>" >&2
+  echo "usage: $0 <backup-send|backup-fetch|backup-delta|backup-delta-sidecar|backup-delta-summaries|backup-delta-chain|wal-receive> <walrus|walg|pgbackrest> <run_id>" >&2
   exit 2
 fi
 OP="$1"
@@ -74,8 +67,8 @@ TOOL="$2"
 RUN_ID="$3"
 
 case "${OP}" in
-  backup-send|backup-fetch|backup-delta|backup-delta-summaries|backup-delta-chain|wal-receive) ;;
-  *) echo "error: OP must be backup-send|backup-fetch|backup-delta|backup-delta-summaries|backup-delta-chain|wal-receive, got '${OP}'" >&2; exit 2 ;;
+  backup-send|backup-fetch|backup-delta|backup-delta-sidecar|backup-delta-summaries|backup-delta-chain|wal-receive) ;;
+  *) echo "error: OP must be backup-send|backup-fetch|backup-delta|backup-delta-sidecar|backup-delta-summaries|backup-delta-chain|wal-receive, got '${OP}'" >&2; exit 2 ;;
 esac
 case "${TOOL}" in
   walrus|walg|pgbackrest) ;;
@@ -85,26 +78,31 @@ if [[ "${OP}" == "wal-receive" && "${TOOL}" == "pgbackrest" ]]; then
   echo "error: pgbackrest has no wal-receive equivalent (skip this cell)" >&2
   exit 2
 fi
-# WAL-summary-sourced delta is a walrus-only path (no wal-g / pgbackrest peer).
+# WAL-summary delta is walrus-only
 if [[ "${OP}" == "backup-delta-summaries" && "${TOOL}" != "walrus" ]]; then
   echo "error: backup-delta-summaries is walrus-only (skip this cell)" >&2
   exit 2
 fi
+# WALG_USE_WAL_DELTA has no pgbackrest peer
+if [[ "${OP}" == "backup-delta-sidecar" && "${TOOL}" == "pgbackrest" ]]; then
+  echo "error: backup-delta-sidecar has no pgbackrest equivalent (skip this cell)" >&2
+  exit 2
+fi
 
-# Single-delta ops drive one churn phase, then one delta push; group for branches.
+# Single-delta ops churn once, then push once
 IS_DELTA=0
-[[ "${OP}" == "backup-delta" || "${OP}" == "backup-delta-summaries" ]] && IS_DELTA=1
-# Chain op churns + pushes per step inside the timed loop (not the single step 1b).
+[[ "${OP}" == "backup-delta" || "${OP}" == "backup-delta-sidecar" || "${OP}" == "backup-delta-summaries" ]] && IS_DELTA=1
+# Sidecar variant records <group>_delta during churn
+USE_WAL_DELTA=""
+[[ "${OP}" == "backup-delta-sidecar" ]] && USE_WAL_DELTA=1
+# Chain op churns + pushes inside timed loop
 IS_CHAIN=0
 [[ "${OP}" == "backup-delta-chain" ]] && IS_CHAIN=1
 
-# Backup-push ops (full + delta) take a base backup, whose pg_backup_stop blocks
-# on BackupWaitWalArchive until the backup's WAL is archived. So the tool's
-# archiver MUST stay live across these cells (the sampler then sees the op
-# process plus the mostly-idle daemon; for walrus that baseline is ~27 MB).
+# Backup-push needs live archiver, pg_backup_stop waits for WAL archival
 # backup-fetch (restore) and wal-receive need no archiver.
 NEEDS_ARCHIVE=0
-case "${OP}" in backup-send|backup-delta|backup-delta-summaries|backup-delta-chain) NEEDS_ARCHIVE=1 ;; esac
+case "${OP}" in backup-send|backup-delta|backup-delta-sidecar|backup-delta-summaries|backup-delta-chain) NEEDS_ARCHIVE=1 ;; esac
 
 : "${BUCKET:?set BUCKET in config.env}"
 : "${PGUSER:?set PGUSER in config.env}"
@@ -115,9 +113,7 @@ case "${OP}" in backup-send|backup-delta|backup-delta-summaries|backup-delta-cha
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 COMPRESSION="${WALG_COMPRESSION_METHOD:-lz4}"
-# Scope the prefix per tool+run (same bucket = same destination storage, fair
-# comparison) so fetch LATEST / implicit delta-parent resolve only within current
-# tool/run backups, never another tool's or a prior sweep's.
+# Isolate LATEST and delta parents per tool+run
 WALG_PREFIX="s3://${BUCKET}/walg-bench/${TOOL}/${RUN_ID}"
 PGBACKREST_REPO_PATH="/pgbackrest-bench/${TOOL}/${RUN_ID}"
 PGBACKREST_STANZA="walbench"
@@ -129,12 +125,11 @@ WALG_BIN="/usr/bin/wal-g"
 RESULTS_ROOT="${RESULTS_ROOT:-${SCRIPT_DIR}/results}"
 RESULT_DIR="${RESULTS_ROOT}/${OP}-${TOOL}-${RUN_ID}"
 SAMPLER="/usr/local/bin/bench-sampler"
-# Where backup-fetch restores into and wal-receive assembles segments.
+# Restore and WAL-receive staging dirs
 RESTORE_DIR="${RESTORE_DIR:-/dat/restore}"
 WAL_RECV_DIR="${WAL_RECV_DIR:-/dat/walrecv}"
 WAL_RECEIVE_SECONDS="${WAL_RECEIVE_SECONDS:-300}"
-# Delta cells: churn window that dirties pages between the parent full and the
-# delta push, and the delta-chain depth handed to walrus/wal-g (WALG_DELTA_MAX_STEPS).
+# Delta churn window + max chain depth
 DELTA_CHURN_SECONDS="${DELTA_CHURN_SECONDS:-300}"
 DELTA_MAX_STEPS="${DELTA_MAX_STEPS:-3}"
 DELTA_ORIGIN="${DELTA_ORIGIN:-LATEST_FULL}"
@@ -150,9 +145,7 @@ else
   INV_PREFIX="${WALG_PREFIX}"
 fi
 
-# Run a walrus/wal-g command as postgres with the daemon env file sourced
-# (WALG_S3_PREFIX, AWS creds, region, compression, PGHOST). Absolute paths, so
-# no reliance on the postgres login PATH.
+# Run walrus/wal-g as postgres with daemon env
 run_tool() {
   sudo -u postgres bash -c '
     set -a
@@ -162,39 +155,50 @@ run_tool() {
   ' _ "$@"
 }
 
-# Current WAL position as an absolute byte offset (for wal-receive throughput).
+# Current WAL position, absolute bytes
 lsn_bytes() {
   PGPASSWORD="${PGPASSWORD}" psql -h "${PGHOST_DRIVER}" -U "${PGUSER}" -d walbench \
     -tAc "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')"
 }
 
-# Total bytes stored under the tool's S3 prefix (delta cells diff before/after
-# the push to size the increment). Empty/zero when the prefix has no objects.
+# Total stored bytes under tool S3 prefix
 inv_size() {
   sudo aws s3 ls --recursive --summarize "${INV_PREFIX}/" --region "${AWS_REGION}" 2>/dev/null \
     | awk '/Total Size:/ {print $3}' | tail -1
 }
 
-# Fail fast if no parent backup exists for a delta to anchor to. Without one,
-# backup-push silently emits a FULL (mislabeled as a delta) and inv-growth sizing
-# reports a full's bytes. op_matrix runs backup-send first; this guards lone runs.
+# Verify parent full under tool prefix
+# Without one, backup-push silently emits full backup
 assert_delta_parent() {
   local roots
   if [[ "${TOOL}" == "pgbackrest" ]]; then
-    # full backup-set dirs end in 'F/'; incr (delta) dirs end in 'I/'
+    # Full backup-set dirs end in F/, incr dirs end in I/
     roots="$(sudo aws s3 ls "s3://${BUCKET}${PGBACKREST_REPO_PATH}/backup/${PGBACKREST_STANZA}/" \
       --region "${AWS_REGION}" 2>/dev/null | awk '/ PRE / && /F\/$/ {n++} END{print n+0}')"
   else
-    # walrus/wal-g chain root = base_<lsn> without the _D_ delta suffix
+    # Chain root is base_<lsn> without _D_ suffix
     roots="$(sudo aws s3 ls "${WALG_PREFIX}/basebackups_005/" \
       --region "${AWS_REGION}" 2>/dev/null | awk '/ PRE base_/ && !/_D_/ {n++} END{print n+0}')"
   fi
   if [[ "${roots:-0}" -eq 0 ]]; then
-    echo "error: no parent full backup under ${INV_PREFIX}; run backup-send ${TOOL} ${RUN_ID} first" >&2
+    echo "error: no parent full under ${INV_PREFIX} after take_parent_full (the --full push may have failed)" >&2
     echo "       (a delta with no parent silently becomes a full, corrupting the measurement)" >&2
     exit 1
   fi
   log "parent check: ${roots} full backup(s) under ${INV_PREFIX}"
+}
+
+# Take parent full inside delta cell
+# Keeps parent-to-push WAL under current tool prefix
+take_parent_full() {
+  log "delta-prep: fresh parent full via ${TOOL} (anchors delta inside this cell, archiver live)"
+  case "${TOOL}" in
+    walrus) run_tool "${WALRUS_BIN}" backup-push "${PGDATA_DIR}" --full ;;
+    walg)   run_tool "${WALG_BIN}" backup-push "${PGDATA_DIR}" --full ;;
+    pgbackrest) sudo -u postgres pgbackrest --stanza="${PGBACKREST_STANZA}" backup --type=full ;;
+  esac
+  log "delta-prep: draining the parent full's WAL before churn"
+  drain_backlog 5 600
 }
 
 # --- pre-flight: DB seeded? (backup-send + wal-receive need a populated DB) ---
@@ -204,8 +208,7 @@ log "op=${OP} tool=${TOOL} run_id=${RUN_ID} concurrency=${UPLOAD_CONCURRENCY}"
 CHECKPOINT_BEFORE_WORKLOAD=0
 
 # --- step 1: tool config -----------------------------------------------------
-# Stop both archive daemons so neither pollutes proc-match (they share the
-# 'walrus'/'wal-g' comm with the op process) and so they do not race archiving.
+# Stop daemons before proc-match sampling and archive selection
 run_root <<'REMOTE'
 set -euo pipefail
 systemctl stop wal-g.service walrus.service 2>/dev/null || true
@@ -230,9 +233,7 @@ echo "process-max -> $(grep -E '^process-max=' "${CONF}")"
 echo "repo1-path -> $(grep -E '^repo1-path=' "${CONF}")"
 sudo -u postgres pgbackrest --stanza="${STANZA}" stanza-create || true
 
-# backup (full or incr) needs WAL archiving live (pgbackrest blocks on the
-# start-WAL archive), so point archive_command at pgbackrest and drain. restore
-# reads only the repo. backup-delta (incr) churns + drains in the delta-prep step.
+# pgbackrest backup needs archive_command live, restore reads repo only
 if [[ "${OP}" == "backup-send" || "${OP}" == "backup-delta" || "${OP}" == "backup-delta-chain" ]]; then
   ARCHIVE_CMD="pgbackrest --stanza=${STANZA} archive-push %p"
   sudo -u postgres "${PGBIN}/psql" -p 5432 -tA \
@@ -247,20 +248,17 @@ REMOTE
   [[ "${NEEDS_ARCHIVE}" -eq 1 ]] && { log "pre-drain leftover backlog"; drain_backlog 10 300; }
 else
   log "writing /etc/postgresql/wal-g.env for ${TOOL}"
-  # Pin ENV_FILE to the daemon env path: 11_write_walg_env.sh reads ENV_FILE as
-  # its OUTPUT target, and sudo -E would otherwise leak a caller-set ENV_FILE
-  # (our config-file selector) and clobber it.
+  # Pin ENV_FILE so sudo -E cannot redirect env output to config file
   ENV_FILE="/etc/postgresql/wal-g.env" \
     BUCKET="${BUCKET}" UPLOAD_CONCURRENCY="${UPLOAD_CONCURRENCY}" \
     WALG_S3_PREFIX="${WALG_PREFIX}" \
     AWS_REGION="${AWS_REGION}" WALG_COMPRESSION_METHOD="${COMPRESSION}" \
+    WALG_USE_WAL_DELTA="${USE_WAL_DELTA}" \
     AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
     AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}" \
     sudo -E bash "${SCRIPT_DIR}/scripts/sut/11_write_walg_env.sh"
 
-  # backup-push ops need a live archiver (see NEEDS_ARCHIVE): start the tool's
-  # daemon and point archive_command at its own client, then pre-drain leftover
-  # backlog. backup-fetch / wal-receive skip this (no archiving needed).
+  # backup-push needs live tool archiver; fetch/receive do not
   if [[ "${NEEDS_ARCHIVE}" -eq 1 ]]; then
     log "starting ${TOOL} archive daemon (backup-push waits on WAL archival at stop)"
     sudo bash "${SCRIPT_DIR}/scripts/sut/30_select_daemon.sh" "${TOOL}"
@@ -274,16 +272,15 @@ if [[ "${OP}" == "backup-send" || "${OP}" == "wal-receive" ]]; then
   CHECKPOINT_BEFORE_WORKLOAD=1
 fi
 
-# Delta ops must extend an existing full; bail before churning if none exists.
-[[ "${IS_DELTA}" -eq 1 || "${IS_CHAIN}" -eq 1 ]] && assert_delta_parent
+# Delta/chain ops take parent full inside current tool prefix
+if [[ "${IS_DELTA}" -eq 1 || "${IS_CHAIN}" -eq 1 ]]; then
+  take_parent_full
+  assert_delta_parent
+fi
 
-# --- step 1b: delta prep — churn between the parent full and the delta push ---
-# The default delta map walks ARCHIVED WAL, so the churn WAL must reach the repo
-# before the push. The tool's archiver is already live (step 1, NEEDS_ARCHIVE)
-# and STAYS up through the push: pg_backup_stop blocks on WAL archival, so a push
-# without a live archiver hangs. Just churn, then drain so the map is complete.
-# (backup-delta-summaries sources the map from local pg_wal/summaries instead,
-# but archiving the churn still lets pg_wal recycle and keeps the parent valid.)
+# --- step 1b: delta prep, churn between parent full and delta push ------------
+# Default delta map reads archived WAL, so drain churn WAL before push
+# Summaries path still archives churn so pg_wal can recycle
 if [[ "${IS_DELTA}" -eq 1 ]]; then
   log "delta-prep: checkpoint before churn"
   checkpoint_pg
@@ -315,12 +312,12 @@ case "${OP}" in
       walg)   run_tool "${WALG_BIN}" backup-push "${PGDATA_DIR}" --full ;;
       pgbackrest) sudo -u postgres pgbackrest --stanza="${PGBACKREST_STANZA}" backup --type=full ;;
     esac
-    # bytes processed = on-disk cluster size, excluding WAL (the backup payload)
+    # bytes processed = on-disk cluster size, excluding WAL
     BYTES="$(sudo du -sb --exclude=pg_wal "${PGDATA_DIR}" | awk '{print $1}')"
     ;;
-  backup-delta)
+  backup-delta|backup-delta-sidecar)
     inv_before="$(inv_size)"; inv_before="${inv_before:-0}"
-    log "delta backup -> ${INV_PREFIX} (wi1; origin=${DELTA_ORIGIN}; parent inventory ${inv_before} B)"
+    log "delta backup -> ${INV_PREFIX} (wi1; origin=${DELTA_ORIGIN}; sidecars=${USE_WAL_DELTA:-0}; parent inventory ${inv_before} B)"
     case "${TOOL}" in
       walrus) run_tool env WALG_DELTA_MAX_STEPS="${DELTA_MAX_STEPS}" \
                 WALG_DELTA_ORIGIN="${DELTA_ORIGIN}" \
@@ -330,7 +327,7 @@ case "${OP}" in
                 "${WALG_BIN}" backup-push "${PGDATA_DIR}" ;;
       pgbackrest) sudo -u postgres pgbackrest --stanza="${PGBACKREST_STANZA}" backup --type=incr ;;
     esac
-    # bytes processed = inventory growth = the delta's stored (compressed) size
+    # bytes processed = inventory growth, compressed
     inv_after="$(inv_size)"; inv_after="${inv_after:-0}"
     BYTES=$(( inv_after - inv_before )); (( BYTES < 0 )) && BYTES=0
     ;;
@@ -344,10 +341,7 @@ case "${OP}" in
     BYTES=$(( inv_after - inv_before )); (( BYTES < 0 )) && BYTES=0
     ;;
   backup-delta-chain)
-    # Build a DELTA_MAX_STEPS-deep chain (origin=LATEST: each delta extends the
-    # prior one). Per step: churn, drain, then time + size the push alone. BYTES
-    # accumulates per-step delta payloads (not END-START inventory: that would
-    # also count the inter-step churn WAL). chain_metrics.txt holds the breakdown.
+    # Each delta extends prior one; count pushed delta bytes, not inter-step WAL
     DELTA_ORIGIN=LATEST
     CHAIN_METRICS="${RESULT_DIR}/chain_metrics.txt"
     push_s_total=0
@@ -455,15 +449,12 @@ rm -rf "${WAL_RECV_DIR}"
 install -d -o postgres -g postgres "${WAL_RECV_DIR}"
 REMOTE
     if [[ "${TOOL}" == "walrus" ]]; then
-      # archive_dir is a rotation buffer: walrus uploads each rotated segment to
-      # WALG_S3_PREFIX, the SAME S3 destination wal-g streams to. Both are scored
-      # by what lands in storage (below), not where they stage locally.
+      # walrus stages locally, both tools are scored by S3 bytes
       recv_cmd=("${WALRUS_BIN}" wal-receive "${WAL_RECV_DIR}")
     else
       recv_cmd=("${WALG_BIN}" wal-receive)
     fi
-    # Launch as postgres with the env file sourced; redirect INSIDE sudo so the
-    # log lands in the postgres-owned results dir. Background the sudo wrapper.
+    # Redirect inside sudo so postgres owns receiver log
     sudo -u postgres bash -c '
       set -a; . /etc/postgresql/wal-g.env; set +a
       log="$1"; shift
@@ -487,10 +478,8 @@ REMOTE
     fi
     lsn_end="$(lsn_bytes)"
 
-    # Throughput = WAL that actually LANDED in the S3 destination, not WAL
-    # generated by PG (pg_current_wal_lsn advances regardless of receiver lag).
-    # Uploads are async, so keep the receiver alive and poll the inventory until
-    # it stops growing before sizing receipt.
+    # Throughput = WAL stored in S3, not WAL generated by PG
+    # Poll async uploads before sizing receipt
     log "draining receiver uploads into ${INV_PREFIX}"
     recv_after="${recv_before}"; prev=""
     for _ in $(seq 1 30); do
@@ -504,7 +493,7 @@ REMOTE
 
     gen=$(( lsn_end - lsn_start ))
     log "wal-receive: generated=${gen} B (uncompressed) received=${BYTES} B (stored)"
-    # WAL generated but nothing stored => measured generation, not receipt.
+    # WAL generated but nothing stored means receipt was not measured
     if (( gen > 0 && BYTES == 0 )); then
       mark_invalid "wal-receive stored 0 B to ${INV_PREFIX} while ${gen} B WAL generated"
     fi
@@ -559,6 +548,7 @@ write_provenance "${RESULT_DIR}" "${INV_PREFIX}" "${AWS_REGION}" \
   "run_id=${RUN_ID}" \
   "checkpoint_before_workload=${CHECKPOINT_BEFORE_WORKLOAD}" \
   "delta_origin=${DELTA_ORIGIN}" \
+  "use_wal_delta=${USE_WAL_DELTA:-0}" \
   "harness_git=${HARNESS_GIT}"
 
 log "DONE: ${OP}-${TOOL}-${RUN_ID}"

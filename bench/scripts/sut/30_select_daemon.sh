@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Select exactly one archive daemon (wal-g or walrus). Stops both units,
-# removes the shared socket, installs (if needed) and starts the chosen unit,
-# waits for the socket to appear, and prints the active PID/cgroup.
+# Select one archive daemon
 #
 # Usage: sudo ./30_select_daemon.sh walg|walrus
 set -euo pipefail
@@ -55,10 +53,7 @@ if [[ ! -S "${SOCKET}" ]]; then
   exit 1
 fi
 
-# Point archive_command at the chosen daemon's OWN client (walg_archive's
-# extension does not interoperate with the walrus daemon; each tool's own
-# daemon-client does). walrus needs the absolute WAL path; wal-g uses %f.
-# Best-effort here (PG is up by this point in setup); run_one.sh sets it per cell.
+# archive_command must use chosen tool's own daemon client
 PGDATA_DIR="/dat/18/data"
 if [[ "${CHOICE}" == "walg" ]]; then
   archive_cmd="/usr/bin/walg-daemon-client ${SOCKET} wal-push %f"
@@ -66,7 +61,7 @@ else
   archive_cmd="/usr/local/bin/walrus daemon-client --socket ${SOCKET} wal-push ${PGDATA_DIR}/%p"
 fi
 echo "=== Setting archive_command for ${CHOICE} (and clearing archive_library) ==="
-# Each ALTER SYSTEM in its own -c (cannot run inside a transaction block).
+# ALTER SYSTEM cannot run inside transaction block
 sudo -u postgres /usr/lib/postgresql/18/bin/psql -p 5432 -tA \
   -c "ALTER SYSTEM SET archive_library = '';" \
   -c "ALTER SYSTEM SET archive_command = '${archive_cmd}';" \

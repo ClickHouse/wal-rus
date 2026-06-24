@@ -245,4 +245,67 @@ mod tests {
         let p = resolve_pgdata_path("000000010000000000000001", None, true);
         assert_eq!(p, Path::new("000000010000000000000001"));
     }
+
+    fn test_daemon(store: &Path, push_timeout: Duration) -> Arc<Daemon> {
+        let settings = Settings {
+            storage: crate::config::StorageSettings::Fs {
+                path: store.to_string_lossy().into(),
+            },
+            compression: crate::compression::Method::None,
+            ..Default::default()
+        };
+        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(store).unwrap());
+        Arc::new(Daemon {
+            uploader: Arc::new(Uploader::new(Arc::new(settings), storage)),
+            pgdata: None,
+            push_timeout,
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_unsupported_message_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(&dir.path().join("store"), DEFAULT_PUSH_TIMEOUT);
+        // a response-only type is never a valid request
+        assert!(dispatch(MessageType::Ok, Vec::new(), &d).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn wal_fetch_requires_two_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(&dir.path().join("store"), DEFAULT_PUSH_TIMEOUT);
+        let body = protocol::encode_args(&["only-one-arg"]).unwrap();
+        assert!(dispatch(MessageType::WalFetch, body, &d).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn wal_fetch_missing_archive_maps_to_non_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(&dir.path().join("store"), DEFAULT_PUSH_TIMEOUT);
+        let dst = dir.path().join("dst-seg");
+        let body =
+            protocol::encode_args(&["000000010000000000000099", dst.to_str().unwrap()]).unwrap();
+        let resp = dispatch(MessageType::WalFetch, body, &d).await.unwrap();
+        assert_eq!(resp, MessageType::ArchiveNonExistence);
+    }
+
+    #[tokio::test]
+    async fn wal_push_with_zero_timeout_skips_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        // zero timeout takes the no-deadline branch
+        let d = test_daemon(&store, Duration::ZERO);
+        let seg = "000000010000000000000001";
+        let seg_path = dir.path().join(seg);
+        std::fs::write(&seg_path, vec![0u8; 32]).unwrap();
+        let resp = dispatch(
+            MessageType::WalPush,
+            seg_path.to_str().unwrap().as_bytes().to_vec(),
+            &d,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp, MessageType::Ok);
+        assert!(store.join(crate::pg::WAL_FOLDER).join(seg).exists());
+    }
 }

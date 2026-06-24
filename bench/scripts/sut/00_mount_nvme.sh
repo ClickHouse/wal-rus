@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Detect the non-root NVMe instance-store device, format it ext4 (only if not
-# already formatted), mount it at /dat, and prepare the PG18 data parent dir.
+# Mount non-root NVMe instance store at /dat
 set -euo pipefail
 
 MOUNT_POINT=/dat
@@ -11,24 +10,23 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# The root filesystem's backing device. lsblk -no PKNAME gives the parent disk
-# of whatever device hosts "/", e.g. nvme0n1.
+# Root filesystem backing disk
 root_src="$(findmnt -no SOURCE / )"
 root_disk="$(lsblk -no PKNAME "${root_src}" | head -n1)"
 if [[ -z "${root_disk}" ]]; then
-  # Some setups mount / directly on the whole disk; fall back to basename.
+  # Some setups mount / on whole disk
   root_disk="$(basename "${root_src}")"
 fi
 echo "Root device: ${root_src} (disk: ${root_disk})"
 
-# Pick the first NVMe whole-disk that is not the root disk and has no children.
+# Pick first non-root NVMe whole disk
 target=""
 while read -r name type; do
   [[ "${type}" == "disk" ]] || continue
   [[ "${name}" == "${root_disk}" ]] && continue
   case "${name}" in
     nvme*)
-      # Skip disks that already have partitions/children mounted as root.
+      # Skip root disk
       target="${name}"
       break
       ;;
@@ -44,7 +42,7 @@ fi
 dev="/dev/${target}"
 echo "Selected instance-store device: ${dev}"
 
-# Guard: only mkfs if there is no existing filesystem on the device.
+# Create filesystem only when absent
 fstype="$(blkid -o value -s TYPE "${dev}" 2>/dev/null || true)"
 if [[ -z "${fstype}" ]]; then
   echo "No filesystem detected on ${dev}; creating ext4..."
@@ -63,10 +61,7 @@ else
 fi
 
 mkdir -p "${PG_PARENT}"
-# The postgres user is created later by 01_install_pg18.sh, and 10_init_pg.sh
-# sets ${PG_PARENT} ownership. Keep /dat root-owned but world-traversable so
-# postgres can reach PGDATA underneath it; chown to postgres only once it exists
-# (e.g. on a re-run after PG is installed).
+# Keep /dat traversable until postgres user exists
 chmod 755 "${MOUNT_POINT}"
 if id -u postgres >/dev/null 2>&1; then
   chown postgres:postgres "${MOUNT_POINT}" "${PG_PARENT}"

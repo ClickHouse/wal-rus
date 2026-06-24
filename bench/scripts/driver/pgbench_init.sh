@@ -2,13 +2,9 @@
 #
 # pgbench_init.sh
 #
-# Initialize the benchmark database on the SUT (driven over the network):
-#   1. create the 'walbench' database if it is absent
-#   2. pgbench -i -s "$SCALE" to lay down the standard TPC-B tables
-#   3. apply gen_schema.sql to add the WAL-churn / bulk-COPY workload tables
+# Initialize benchmark DB over network
 #
-# All connection parameters come from libpq env vars so no IPs/passwords are
-# hardcoded. Set PGHOST to the SUT private IP before running.
+# Connection comes from libpq env vars
 #
 # Env vars (with defaults):
 #   PGHOST      (required) SUT private IP / host
@@ -42,8 +38,7 @@ fi
 
 echo "==> Target: ${PGUSER}@${PGHOST}:${PGPORT}, database '${PGDATABASE}', scale ${SCALE}"
 
-# 1. Create the database if it does not already exist. Connect to 'postgres'
-#    for the existence check / CREATE DATABASE.
+# Create database if absent
 db_exists="$(psql -d postgres -At -c \
     "SELECT 1 FROM pg_database WHERE datname = '${PGDATABASE}'")"
 
@@ -54,12 +49,11 @@ else
     createdb "${PGDATABASE}"
 fi
 
-# 2. Standard pgbench TPC-B tables at the requested scale. Init mode is
-#    single-threaded — pgbench rejects -j here ("cannot be used in init mode").
+# Standard pgbench TPC-B tables
 echo "==> pgbench -i -s ${SCALE} (this can take a while at large scale)."
 pgbench -i -s "${SCALE}" "${PGDATABASE}"
 
-# 3. WAL-churn workload schema. CHURN_ROWS is passed as the :rows variable.
+# WAL-churn workload schema
 echo "==> Applying gen_schema.sql with ${CHURN_ROWS} churn rows."
 psql -d "${PGDATABASE}" -v ON_ERROR_STOP=1 \
     -v rows="${CHURN_ROWS}" \

@@ -2,9 +2,7 @@ resource "random_id" "suffix" {
   byte_length = 4
 }
 
-# Private bench bucket; force_destroy + a 7-day lifecycle so a forgotten teardown
-# does not leak storage. setup/smoke default to s3://<bucket>/walg-bench; runs
-# scope walrus/wal-g and pgbackrest below tool-specific prefixes by run.
+# Private bench bucket with short object lifecycle
 resource "aws_s3_bucket" "bench" {
   bucket        = "walrus-bench-${random_id.suffix.hex}"
   force_destroy = true

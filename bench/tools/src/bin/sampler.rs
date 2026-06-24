@@ -1,17 +1,13 @@
-//! bench-sampler — 1 Hz on-SUT resource sampler
+//! bench-sampler, 1 Hz on-SUT resource sampler
 //!
-//! Writes one CSV per metric family, sharing a float-epoch `ts`. Schemas are
-//! fixed by the bench contract (consumed by bench-analyze and plot.py alike):
+//! Writes one CSV per metric family, sharing `ts`:
 //!   mem.csv:     ts,vmpeak_kb,vmsize_kb,vmhwm_kb,vmrss_kb,rssanon_kb,cg_current_bytes,cg_peak_bytes
 //!   cpu.csv:     ts,pct_usr,pct_sys,pct_cpu
 //!   wal.csv:     ts,wal_bytes
 //!   archive.csv: ts,archived_count,failed_count,ready_backlog,last_archived_age_s
 //!   net.csv:     ts,tx_bytes,rx_bytes
 //!
-//! Memory/CPU come from /proc, network from /sys, PG metrics from a long-lived
-//! `psql` reused across ticks (result framing via a sentinel row, respawned if
-//! it dies). Daemonless archivers (pgbackrest) are followed by --proc-match,
-//! which rescans /proc each tick and aggregates over the matching process tree.
+//! Reads /proc, /sys, and PostgreSQL via persistent psql
 //!
 //! Self-test (no PostgreSQL):
 //!   sleep 30 & bench-sampler --pid $! --iface lo --no-pg \
@@ -31,7 +27,7 @@ use clap::Parser;
 
 const SENTINEL: &str = "__SAMPLER_EOT__";
 
-// Per-tick PG queries; each yields exactly one tuple line, framed by SENTINEL.
+// Per-tick PG queries, framed by SENTINEL
 const PG_QUERIES: [&str; 2] = [
     "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0');",
     "SELECT archived_count, failed_count, \
@@ -45,24 +41,22 @@ struct Args {
     /// PID to sample
     #[arg(long)]
     pid: Option<i32>,
-    /// systemd unit; MainPID resolved via systemctl show (auto cgroup too)
+    /// systemd unit
     #[arg(long)]
     unit: Option<String>,
-    /// do not exit if no PID can be resolved (mem/cpu columns left blank)
+    /// allow blank mem/cpu when no PID resolves
     #[arg(long = "no-pid-required")]
     no_pid_required: bool,
-    /// aggregate mem/cpu over ALL processes whose comm equals this name,
-    /// rescanned every tick (daemonless archivers). Excludes --pid/--unit.
+    /// aggregate mem/cpu over processes with matching comm
     #[arg(long = "proc-match")]
     proc_match: Option<String>,
-    /// archiver shorthand: walg|walrus -> that unit's MainPID, pgbackrest ->
-    /// proc-match (daemonless). Fills --unit/--proc-match when neither is given.
+    /// archiver shorthand
     #[arg(long, value_parser = ["walg", "walrus", "pgbackrest"])]
     daemon: Option<String>,
-    /// cgroup v2 dir (default: auto from --unit)
+    /// cgroup v2 dir
     #[arg(long)]
     cgroup: Option<String>,
-    /// network iface (default: auto default-route iface)
+    /// network iface
     #[arg(long)]
     iface: Option<String>,
     /// PGDATA path
@@ -74,16 +68,16 @@ struct Args {
     /// sample interval seconds
     #[arg(long, default_value_t = 1.0)]
     interval: f64,
-    /// number of ticks to take (default: until SIGTERM)
+    /// number of ticks
     #[arg(long)]
     duration: Option<u64>,
-    /// psql conninfo (default: local socket, db walbench)
+    /// psql conninfo
     #[arg(
         long,
         default_value = "host=/var/run/postgresql user=postgres dbname=walbench"
     )]
     pg: String,
-    /// skip wal/archive queries (CSVs get headers only); PG-free self-test
+    /// skip WAL/archive queries
     #[arg(long = "no-pg")]
     no_pg: bool,
 }
@@ -93,13 +87,10 @@ fn clk_tck() -> f64 {
     if v > 0 { v as f64 } else { 100.0 }
 }
 
-// Diagnostic events go to stderr (bare). The orchestrator redirects the
-// sampler's stderr to sampler.log in the result dir (run.sh/run_op.sh), so
-// events land there co-located with the CSVs; standalone runs print to the
-// terminal. Pipe through awk for timestamps if wanted; no own log file.
+// Diagnostic events go to stderr; drivers redirect it to sampler.log
 
 // --------------------------------------------------------------------------
-// CSV sink: header on open, one comma-joined row per tick, flushed each write.
+// CSV sink
 // --------------------------------------------------------------------------
 struct CsvSink {
     fh: BufWriter<File>,
@@ -150,9 +141,7 @@ fn resolve_cgroup_path(unit: &str) -> Option<String> {
     Path::new(&path).is_dir().then_some(path)
 }
 
-/// Map an archiver token to a sampling target (unit, proc_match): walg/walrus
-/// follow their systemd unit's MainPID; pgbackrest is daemonless (PG forks
-/// archive-push per segment) so it is followed by proc-match.
+/// Map archiver token to sampling target
 fn daemon_target(daemon: &str) -> (Option<String>, Option<String>) {
     match daemon {
         "walg" => (Some("wal-g.service".into()), None),
@@ -181,7 +170,7 @@ fn list_pids_by_comm(name: &str) -> Vec<i32> {
 }
 
 fn detect_default_iface() -> Option<String> {
-    // /proc/net/route: Iface col 0, Destination col 1 (00000000 = default).
+    // /proc/net/route uses 00000000 for default destination
     let data = fs::read_to_string("/proc/net/route").ok()?;
     for line in data.lines().skip(1) {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -195,7 +184,7 @@ fn detect_default_iface() -> Option<String> {
 // --------------------------------------------------------------------------
 // /proc readers
 // --------------------------------------------------------------------------
-/// From /proc/<pid>/status (kB)
+/// /proc/<pid>/status memory fields, kB
 #[derive(Default, Clone, Copy)]
 struct MemStats {
     vmpeak: Option<u64>,
@@ -225,7 +214,7 @@ impl MemStats {
         })
     }
 
-    /// Field-wise sum, missing treated as 0; result always present.
+    /// Field-wise sum, missing treated as 0
     fn add(&mut self, o: MemStats) {
         self.vmpeak = Some(self.vmpeak.unwrap_or(0) + o.vmpeak.unwrap_or(0));
         self.vmsize = Some(self.vmsize.unwrap_or(0) + o.vmsize.unwrap_or(0));
@@ -254,13 +243,12 @@ fn read_proc_status(pid: i32) -> MemStats {
     out
 }
 
-/// (utime, stime) in clock ticks from /proc/<pid>/stat. comm (field 2) may hold
-/// spaces/parens, so split after the final ')'. None if the process is gone.
+/// utime/stime ticks from /proc/<pid>/stat
 fn read_proc_cpu_jiffies(pid: i32) -> Option<(u64, u64)> {
     let data = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rparen = data.rfind(')')?;
     let rest: Vec<&str> = data[rparen + 1..].split_whitespace().collect();
-    // rest[0]=state; utime is overall field 14 -> index 11, stime 15 -> 12.
+    // utime field 14 -> index 11, stime field 15 -> index 12
     if rest.len() < 13 {
         return None;
     }
@@ -308,7 +296,7 @@ impl PsqlConn {
     }
 
     fn spawn(&mut self) {
-        // -A unaligned, -t tuples-only, -q quiet, -X no psqlrc, -F '|' field sep.
+        // -A unaligned, -t tuples-only, -q quiet, -X no psqlrc
         let mut child = match Command::new("psql")
             .args([
                 "-Atq",
@@ -442,7 +430,7 @@ fn parse_pg(lines: &[String]) -> PgRow {
             out.archived_count = nonempty(parts[0].trim());
             out.failed_count = nonempty(parts[1].trim());
             let age = parts[2].trim();
-            // -1 sentinel => never archived yet => blank.
+            // -1 sentinel means never archived
             out.last_archived_age_s = (age != "-1").then(|| nonempty(age)).flatten();
         }
     }
@@ -480,8 +468,7 @@ impl Sampler {
         let outdir = Path::new(&args.outdir);
         fs::create_dir_all(outdir).with_context(|| format!("mkdir {outdir:?}"))?;
 
-        // --daemon is a bench shorthand: fill unit/proc_match from the token
-        // unless an explicit flag already set one.
+        // --daemon fills unit/proc_match unless explicit flags did
         let (mut unit, mut proc_match) = (args.unit.clone(), args.proc_match.clone());
         if let Some(d) = &args.daemon {
             let (u, pm) = daemon_target(d);
@@ -587,16 +574,14 @@ impl Sampler {
 
     fn sample_mem(&mut self, ts: f64) {
         let vals = if let Some(pm) = &self.proc_match {
-            // Sum each metric over the live tree. Per-proc lifetime highs
-            // (VmPeak/VmHWM) summed over the live set are a lower bound on the
-            // tree peak; run-level peak is max-over-time downstream.
+            // Sum live process tree; run-level peak is max-over-time downstream
             let mut agg = MemStats::default();
             let mut found = false;
             for pid in list_pids_by_comm(pm) {
                 agg.add(read_proc_status(pid));
                 found = true;
             }
-            // found => summed tree; else genuine 0 (async drained + exited).
+            // No matches means async worker drained + exited
             if found { agg } else { MemStats::ZERO }
         } else if let Some(pid) = self.pid {
             read_proc_status(pid)
@@ -635,8 +620,7 @@ impl Sampler {
             if elapsed > 0.0 {
                 let du = cur.0.saturating_sub(prev.0) as f64;
                 let ds = cur.1.saturating_sub(prev.1) as f64;
-                // ticks -> CPU-seconds / wall-seconds * 100. May exceed 100 on
-                // multi-threaded daemons.
+                // CPU percent may exceed 100 on multi-threaded daemons
                 let u = 100.0 * (du / self.clk_tck) / elapsed;
                 let s = 100.0 * (ds / self.clk_tck) / elapsed;
                 usr = format!("{:.2}", u.max(0.0));
@@ -652,9 +636,7 @@ impl Sampler {
     }
 
     fn sample_cpu_proctree(&mut self, ts: f64) {
-        // Per-PID cumulative ticks diffed tick-over-tick; a freshly forked PID
-        // contributes its whole counter (~one interval), a vanished one drops
-        // out. Only combined pct_cpu is meaningful across a churning set.
+        // Diff per-PID ticks across churning process set
         let pm = self.proc_match.clone().unwrap();
         let mut cur_map: HashMap<i32, u64> = HashMap::new();
         for pid in list_pids_by_comm(&pm) {
@@ -763,9 +745,9 @@ fn run(args: &Args, sampler: &mut Sampler, stop: &Arc<AtomicBool>) {
         next_at += interval;
         let now = Instant::now();
         if next_at <= now {
-            next_at = now; // fell behind; resync, no burst catch-up
+            next_at = now; // resync, no burst catch-up
         } else {
-            // Interruptible sleep so SIGTERM is honored promptly.
+            // Keep SIGTERM responsive
             while !stop.load(Ordering::Relaxed) && Instant::now() < next_at {
                 let remaining = next_at.saturating_duration_since(Instant::now());
                 std::thread::sleep(remaining.min(Duration::from_millis(100)));
@@ -801,7 +783,7 @@ mod tests {
 
     #[test]
     fn parse_pg_never_archived() {
-        // -1 age sentinel collapses to blank.
+        // -1 age sentinel becomes blank
         let r = parse_pg(&["10".into(), "0|0|-1".into()]);
         assert_eq!(r.last_archived_age_s, None);
     }

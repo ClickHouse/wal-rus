@@ -968,4 +968,37 @@ mod tests {
             assert!(DeltaSettings::from_env().is_err());
         }
     }
+
+    #[tokio::test]
+    async fn throttle_wraps_reader_when_rate_limited() {
+        use tokio::io::AsyncReadExt;
+        let payload = vec![7u8; 64];
+        let mk = || -> crate::compression::AsyncReader {
+            Box::pin(std::io::Cursor::new(payload.clone()))
+        };
+        // non-zero limits take the RateLimited-wrapping arm; bytes pass through
+        let s = Settings {
+            network_rate_limit: 1 << 20,
+            disk_rate_limit: 1 << 20,
+            ..Default::default()
+        };
+        for mut r in [s.throttle_network(mk()), s.throttle_disk(mk())] {
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, payload);
+        }
+    }
+
+    #[test]
+    fn s3_credentials_incomplete_static_is_error() {
+        // access key without its secret is a hard error, never a silent IMDS
+        // fallback
+        let _g = EnvGuard::new(&[
+            ("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE")),
+            ("AWS_ACCESS_KEY", None),
+            ("AWS_SECRET_ACCESS_KEY", None),
+            ("AWS_SECRET_KEY", None),
+        ]);
+        assert!(s3_credentials(None).is_err());
+    }
 }

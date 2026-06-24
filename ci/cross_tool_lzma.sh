@@ -10,11 +10,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # lib.sh respects a pre-set method; the archive_command inlines it too
 export WALG_COMPRESSION_METHOD=lzma
 
-cross_roundtrip "$WALRUS_BIN" "$WALG_BIN"
+cross_roundtrip "$WALRUS_BIN" "$WALG_BIN" "$PGDATA"
 echo "cross_tool_lzma forward OK"
 
 bucket_reset
-cross_roundtrip "$WALG_BIN" "$WALRUS_BIN"
+cross_roundtrip "$WALG_BIN" "$WALRUS_BIN" "$PGDATA"
 echo "cross_tool_lzma reverse OK"
 
 echo "cross_tool_lzma OK"

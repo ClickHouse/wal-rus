@@ -3,6 +3,7 @@
 //! Wire format mirrors wal-g so walrus and wal-g can share buckets
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -123,8 +124,17 @@ pub fn parse_pg_lsn(s: &str) -> Result<u64> {
     Ok((hi << 32) | lo)
 }
 
-pub fn format_pg_lsn(lsn: u64) -> String {
-    format!("{:X}/{:X}", lsn >> 32, lsn as u32)
+/// Canonical postgres LSN rendering `hi/lo` in uppercase hex. Returns a
+/// `Display` adapter so callers format in place without allocating; use
+/// `.to_string()` when an owned `String` is required
+pub fn format_pg_lsn(lsn: u64) -> impl std::fmt::Display {
+    struct PgLsn(u64);
+    impl std::fmt::Display for PgLsn {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:X}/{:X}", self.0 >> 32, self.0 as u32)
+        }
+    }
+    PgLsn(lsn)
 }
 
 /// Match `base_<24hex>` and optional `_D_<24hex>` delta and `_<8hex>` LSN
@@ -309,10 +319,15 @@ pub struct FileDescription {
 /// Sentinel: subset of wal-g BackupSentinelDto. Skips delta-backup fields we do not produce
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackupSentinelDto {
-    #[serde(rename = "LSN", default)]
-    pub backup_start_lsn: Option<u64>,
-    #[serde(rename = "DeltaLSN", default, skip_serializing_if = "Option::is_none")]
-    pub increment_from_lsn: Option<u64>,
+    #[serde(rename = "LSN", default, with = "lsn_opt")]
+    pub backup_start_lsn: Option<NonZeroU64>,
+    #[serde(
+        rename = "DeltaLSN",
+        default,
+        with = "lsn_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub increment_from_lsn: Option<NonZeroU64>,
     #[serde(rename = "DeltaFrom", default, skip_serializing_if = "Option::is_none")]
     pub increment_from: Option<String>,
     #[serde(
@@ -339,8 +354,8 @@ pub struct BackupSentinelDto {
 
     #[serde(rename = "PgVersion", default)]
     pub pg_version: i32,
-    #[serde(rename = "FinishLSN", default)]
-    pub backup_finish_lsn: Option<u64>,
+    #[serde(rename = "FinishLSN", default, with = "lsn_opt")]
+    pub backup_finish_lsn: Option<NonZeroU64>,
     #[serde(
         rename = "SystemIdentifier",
         default,
@@ -496,6 +511,22 @@ fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 
+/// Serde for LSN fields shared with wal-g: serialize as a plain JSON number,
+/// deserialize mapping 0 (InvalidXLogRecPtr) / null / absent -> None so reading
+/// foreign metadata never errors on a missing LSN
+mod lsn_opt {
+    use super::NonZeroU64;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<NonZeroU64>, s: S) -> Result<S::Ok, S::Error> {
+        v.map(NonZeroU64::get).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NonZeroU64>, D::Error> {
+        Ok(Option::<u64>::deserialize(d)?.and_then(NonZeroU64::new))
+    }
+}
+
 fn is_false(v: &bool) -> bool {
     !*v
 }
@@ -537,12 +568,12 @@ mod tests {
 
     #[test]
     fn formats_lsn_uppercase() {
-        assert_eq!(format_pg_lsn(0x0300_0000), "0/3000000");
-        assert_eq!(format_pg_lsn((2u64 << 32) | 0xab), "2/AB");
+        assert_eq!(format_pg_lsn(0x0300_0000).to_string(), "0/3000000");
+        assert_eq!(format_pg_lsn((2u64 << 32) | 0xab).to_string(), "2/AB");
         // high word > 10 separates hex from decimal: "2A" vs decimal "42"
-        assert_eq!(format_pg_lsn((0x2A_u64 << 32) | 0x16), "2A/16");
-        assert_eq!(format_pg_lsn((0xFF_u64 << 32) | 0xFF), "FF/FF");
-        assert_eq!(format_pg_lsn(u64::MAX), "FFFFFFFF/FFFFFFFF");
+        assert_eq!(format_pg_lsn((0x2A_u64 << 32) | 0x16).to_string(), "2A/16");
+        assert_eq!(format_pg_lsn((0xFF_u64 << 32) | 0xFF).to_string(), "FF/FF");
+        assert_eq!(format_pg_lsn(u64::MAX).to_string(), "FFFFFFFF/FFFFFFFF");
     }
 
     #[test]
@@ -555,7 +586,7 @@ mod tests {
             (0xA_u64 << 32) | 0xDEAD_BEEF,
             u64::MAX,
         ] {
-            assert_eq!(parse_pg_lsn(&format_pg_lsn(lsn)).unwrap(), lsn);
+            assert_eq!(parse_pg_lsn(&format_pg_lsn(lsn).to_string()).unwrap(), lsn);
         }
     }
 
@@ -581,9 +612,9 @@ mod tests {
     #[test]
     fn sentinel_v1_serde_roundtrip() {
         let s = BackupSentinelDto {
-            backup_start_lsn: Some(0x0300_0000),
+            backup_start_lsn: NonZeroU64::new(0x0300_0000),
             pg_version: 160003,
-            backup_finish_lsn: Some(0x0300_1000),
+            backup_finish_lsn: NonZeroU64::new(0x0300_1000),
             system_identifier: Some(7000000000000000000),
             uncompressed_size: 1024,
             compressed_size: 512,
@@ -597,22 +628,34 @@ mod tests {
         assert!(j.contains("\"PgVersion\":160003"));
         assert!(j.contains("\"FilesMetadataDisabled\":true"));
         let back: BackupSentinelDto = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.backup_start_lsn, Some(0x0300_0000));
+        assert_eq!(back.backup_start_lsn, NonZeroU64::new(0x0300_0000));
         assert_eq!(back.system_identifier, Some(7000000000000000000));
+    }
+
+    #[test]
+    fn lsn_zero_null_absent_deserialize_to_none() {
+        // 0 = InvalidXLogRecPtr; foreign/zero metadata must read as None, not error
+        let back: BackupSentinelDto = serde_json::from_str(
+            r#"{"LSN":0,"FinishLSN":null,"UncompressedSize":0,"CompressedSize":0}"#,
+        )
+        .unwrap();
+        assert_eq!(back.backup_start_lsn, None);
+        assert_eq!(back.backup_finish_lsn, None);
+        assert_eq!(back.increment_from_lsn, None);
     }
 
     #[test]
     fn increment_format_sentinel_field() {
         use increment::Format;
         let mut s = BackupSentinelDto {
-            backup_start_lsn: Some(1),
-            increment_from_lsn: Some(0),
+            backup_start_lsn: NonZeroU64::new(1),
+            increment_from_lsn: NonZeroU64::new(1),
             increment_from: Some("base_x".into()),
             increment_full_name: Some("base_x".into()),
             increment_count: Some(1),
             increment_format: Format::Native,
             pg_version: 170000,
-            backup_finish_lsn: Some(2),
+            backup_finish_lsn: NonZeroU64::new(2),
             ..Default::default()
         };
         // Native deltas record the format
@@ -658,9 +701,9 @@ mod tests {
     fn sentinel_v2_extra_fields_present() {
         let s = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(1),
+                backup_start_lsn: NonZeroU64::new(1),
                 pg_version: 160003,
-                backup_finish_lsn: Some(2),
+                backup_finish_lsn: NonZeroU64::new(2),
                 files_metadata_disabled: true,
                 ..Default::default()
             },

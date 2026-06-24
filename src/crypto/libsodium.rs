@@ -582,4 +582,131 @@ mod tests {
         assert!(t.apply(&b64).is_ok());
         assert!(t.apply("aGVsbG8=").is_err());
     }
+
+    #[test]
+    fn crypter_reports_its_name() {
+        assert_eq!(LibsodiumCrypter::new(key()).name(), "libsodium");
+    }
+
+    #[test]
+    fn key_transform_from_name_maps_aliases_and_rejects_unknown() {
+        assert_eq!(KeyTransform::from_name("").unwrap(), KeyTransform::None);
+        assert_eq!(KeyTransform::from_name("none").unwrap(), KeyTransform::None);
+        // case-insensitive
+        assert_eq!(KeyTransform::from_name("HEX").unwrap(), KeyTransform::Hex);
+        assert_eq!(
+            KeyTransform::from_name("Base64").unwrap(),
+            KeyTransform::Base64
+        );
+        assert!(KeyTransform::from_name("rot13").is_err());
+    }
+
+    #[test]
+    fn from_path_reads_trims_and_validates_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("key");
+        // surrounding whitespace is trimmed before the none-transform padding
+        std::fs::write(&key_file, b"  0123456789012345678901234567  \n").unwrap();
+        let c =
+            LibsodiumCrypter::from_path(key_file.to_str().unwrap(), KeyTransform::None).unwrap();
+        assert_eq!(&c.key[..28], b"0123456789012345678901234567");
+
+        // missing file surfaces a read error
+        assert!(
+            LibsodiumCrypter::from_path(
+                dir.path().join("absent").to_str().unwrap(),
+                KeyTransform::None
+            )
+            .is_err()
+        );
+
+        // non-UTF-8 contents rejected before transform
+        let bad = dir.path().join("bin");
+        std::fs::write(&bad, [0xff, 0xfe, 0x00]).unwrap();
+        assert!(LibsodiumCrypter::from_path(bad.to_str().unwrap(), KeyTransform::None).is_err());
+    }
+
+    /// Yields `data` verbatim, then errors on the next poll. Drives the
+    /// inner-read error and EOF branches of the secretstream readers
+    struct FailAfter {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for FailAfter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.pos < self.data.len() {
+                let n = buf.remaining().min(self.data.len() - self.pos);
+                let start = self.pos;
+                buf.put_slice(&self.data[start..start + n]);
+                self.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(std::io::Error::other("boom")))
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypt_propagates_inner_read_error() {
+        let c = LibsodiumCrypter::new(key());
+        let mut enc = c.encrypt_reader(Box::pin(FailAfter {
+            data: Vec::new(),
+            pos: 0,
+        }));
+        let mut out = Vec::new();
+        // header drains first, then the inner error surfaces
+        assert!(enc.read_to_end(&mut out).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn decrypt_errors_on_eof_before_header() {
+        let c = LibsodiumCrypter::new(key());
+        let mut dec = c.decrypt_reader(Box::pin(Cursor::new(Vec::new())));
+        let mut out = Vec::new();
+        assert!(dec.read_to_end(&mut out).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn decrypt_propagates_inner_error_after_header() {
+        let c = LibsodiumCrypter::new(key());
+        // 24 arbitrary header bytes init the pull stream; the next read errors
+        let mut dec = c.decrypt_reader(Box::pin(FailAfter {
+            data: vec![0u8; HEADER_BYTES],
+            pos: 0,
+        }));
+        let mut out = Vec::new();
+        assert!(dec.read_to_end(&mut out).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn decrypt_errors_on_header_only_stream() {
+        // a valid header followed by no chunk at all: ends without a FINAL tag
+        let plain: &[u8] = &[];
+        let c = LibsodiumCrypter::new(key());
+        let mut enc = c.encrypt_reader(Box::pin(Cursor::new(plain.to_vec())));
+        let mut ct = Vec::new();
+        enc.read_to_end(&mut ct).await.unwrap();
+        let header_only = ct[..HEADER_BYTES].to_vec();
+        let mut dec = c.decrypt_reader(Box::pin(Cursor::new(header_only)));
+        let mut out = Vec::new();
+        assert!(dec.read_to_end(&mut out).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn decrypt_errors_on_sub_abytes_tail() {
+        // header + a tail shorter than the per-chunk overhead can't authenticate
+        let c = LibsodiumCrypter::new(key());
+        let mut enc = c.encrypt_reader(Box::pin(Cursor::new(Vec::new())));
+        let mut ct = Vec::new();
+        enc.read_to_end(&mut ct).await.unwrap();
+        let mut short = ct[..HEADER_BYTES].to_vec();
+        short.extend_from_slice(&ct[HEADER_BYTES..HEADER_BYTES + 4]); // 4 < ABYTES
+        let mut dec = c.decrypt_reader(Box::pin(Cursor::new(short)));
+        let mut out = Vec::new();
+        assert!(dec.read_to_end(&mut out).await.is_err());
+    }
 }

@@ -1,6 +1,4 @@
-# Instance role scoped to the bench bucket. 11_write_walg_env.sh bridges these
-# IMDSv2 creds into wal-g.env (walrus has no IMDS credential chain); the aws CLI
-# and pgbackrest read the instance role directly.
+# Instance role scoped to bench bucket
 
 data "aws_iam_policy_document" "assume_role" {
   statement {

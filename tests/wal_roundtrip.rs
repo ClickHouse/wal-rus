@@ -1,5 +1,6 @@
 //! End-to-end wal-push -> wal-fetch with fs backend; bytes must match
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -510,6 +511,86 @@ async fn wal_restore_fills_gap_into_local_dir() {
 }
 
 #[tokio::test]
+async fn wal_restore_timeline_filter_skips_other_timelines() {
+    use walrus::pg::wal::restore;
+    use walrus::storage::Storage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let stage = dir.path().join("stage");
+    let restore_dst = dir.path().join("restore");
+    std::fs::create_dir_all(&stage).unwrap();
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
+
+    // tli 1 hole at seg 3 (push 1,2,4); tli 2 hole at seg 6 (push 5,7)
+    for hex in [
+        "000000010000000000000001",
+        "000000010000000000000002",
+        "000000010000000000000004",
+        "000000020000000000000005",
+        "000000020000000000000007",
+    ] {
+        let p = stage.join(hex);
+        std::fs::write(&p, hex.as_bytes()).unwrap();
+        walrus::pg::wal::push::handle(&s, store.clone(), &p)
+            .await
+            .unwrap();
+    }
+
+    // Filter to tli 2: the tli-1 gap is skipped before its segments expand, so
+    // only tli-2's missing seg is attempted (and tolerated as unfetchable)
+    restore::handle(&s, store as Arc<dyn Storage>, &restore_dst, Some(2))
+        .await
+        .unwrap();
+    assert!(
+        !restore_dst.join("000000010000000000000003").exists(),
+        "filtered-out timeline must not be restored"
+    );
+}
+
+#[tokio::test]
+async fn wal_restore_skips_segment_already_present() {
+    use walrus::pg::wal::restore;
+    use walrus::storage::Storage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let stage = dir.path().join("stage");
+    let restore_dst = dir.path().join("restore");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::create_dir_all(&restore_dst).unwrap();
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
+
+    // Hole at seg 3 (push 1,2,4)
+    for hex in [
+        "000000010000000000000001",
+        "000000010000000000000002",
+        "000000010000000000000004",
+    ] {
+        let p = stage.join(hex);
+        std::fs::write(&p, hex.as_bytes()).unwrap();
+        walrus::pg::wal::push::handle(&s, store.clone(), &p)
+            .await
+            .unwrap();
+    }
+
+    // Pre-place the missing segment in dst: restore must skip it (idempotent),
+    // leaving the sentinel bytes untouched
+    let present = restore_dst.join("000000010000000000000003");
+    std::fs::write(&present, b"already-here").unwrap();
+    restore::handle(&s, store as Arc<dyn Storage>, &restore_dst, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&present).unwrap(),
+        b"already-here",
+        "an already-present segment must not be overwritten"
+    );
+}
+
+#[tokio::test]
 async fn wal_verify_integrity_detects_gap_after_backup() {
     use walrus::pg::backup::{format_backup_name, sentinel_key};
     use walrus::pg::wal::verify;
@@ -539,9 +620,9 @@ async fn wal_verify_integrity_detects_gap_after_backup() {
     let backup_name = format_backup_name(1, seg_size, seg_size);
     let v2 = walrus::pg::backup::BackupSentinelDtoV2 {
         sentinel: walrus::pg::backup::BackupSentinelDto {
-            backup_start_lsn: Some(seg_size),
+            backup_start_lsn: NonZeroU64::new(seg_size),
             pg_version: 160003,
-            backup_finish_lsn: Some(seg_size + 16),
+            backup_finish_lsn: NonZeroU64::new(seg_size + 16),
             system_identifier: Some(1),
             files_metadata_disabled: true,
             ..Default::default()

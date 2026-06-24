@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Install PostgreSQL 18 (PGDG), build toolchain, Go 1.26.2, and Rust 1.89 for
-# building wal-g and walrus on Ubuntu 24.04 (noble).
+# Install PG18, build deps, Go, and Rust
 set -euo pipefail
 
 GO_VERSION="${GO_VERSION:-1.26.2}"
 RUST_VERSION="${RUST_VERSION:-1.89.0}"
 GO_TARBALL="go${GO_VERSION}.linux-amd64.tar.gz"
 GO_URL="https://go.dev/dl/${GO_TARBALL}"
-# User who will run cargo to build walrus. Defaults to the sudo invoker (dev box,
-# any distro), then ubuntu (provisioned EC2 SUT) — matches the other sut scripts.
+# User owning cargo toolchain
 BUILD_USER="${BUILD_USER:-${SUDO_USER:-ubuntu}}"
 
 if [[ $EUID -ne 0 ]]; then
@@ -66,7 +64,7 @@ if [[ ! -x /usr/local/go/bin/go ]] || ! /usr/local/go/bin/go version | grep -q "
   tar -C /usr/local -xzf "${tmp}/${GO_TARBALL}"
   rm -rf "${tmp}"
 fi
-# Make go available on PATH for all login shells.
+# Put Go on login-shell PATH
 cat > /etc/profile.d/go.sh <<'EOF'
 export PATH=$PATH:/usr/local/go/bin
 EOF

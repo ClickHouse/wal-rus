@@ -4,6 +4,7 @@
 //! impermanent backups, and WAL segments. Exercises each `delete` mode and
 //! the `copy` command end-to-end. Mirrors wal-g's `delete_test.go` shape
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -34,9 +35,9 @@ fn seg_size() -> u64 {
 fn make_sentinel(start_lsn: u64, is_permanent: bool) -> BackupSentinelDtoV2 {
     BackupSentinelDtoV2 {
         sentinel: BackupSentinelDto {
-            backup_start_lsn: Some(start_lsn),
+            backup_start_lsn: NonZeroU64::new(start_lsn),
             pg_version: 160003,
-            backup_finish_lsn: Some(start_lsn + seg_size()),
+            backup_finish_lsn: NonZeroU64::new(start_lsn + seg_size()),
             system_identifier: Some(7000000000000000000),
             uncompressed_size: 1024,
             compressed_size: 512,
@@ -310,7 +311,7 @@ async fn delete_target_drops_delta_dependants() {
     let store = Arc::new(FsStorage::new(dir.path()).unwrap());
     let full = backup_name(1, seg_size());
     let mut full_s = make_sentinel(seg_size(), false);
-    full_s.sentinel.backup_start_lsn = Some(seg_size());
+    full_s.sentinel.backup_start_lsn = NonZeroU64::new(seg_size());
     put_bytes(
         &store,
         &sentinel_key(&full),

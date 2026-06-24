@@ -1,6 +1,8 @@
 //! backup-list: enumerate sentinel files under basebackups_005/, fetch each,
 //! print backup names with start/finish times and LSNs
 
+use std::num::NonZeroU64;
+
 use anyhow::{Context, Result};
 use futures::StreamExt;
 
@@ -13,8 +15,8 @@ pub struct BackupSummary {
     pub name: String,
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
     pub finish_time: Option<chrono::DateTime<chrono::Utc>>,
-    pub start_lsn: Option<u64>,
-    pub finish_lsn: Option<u64>,
+    pub start_lsn: Option<NonZeroU64>,
+    pub finish_lsn: Option<NonZeroU64>,
     pub pg_version: i32,
     pub hostname: Option<String>,
     pub is_permanent: bool,
@@ -129,8 +131,8 @@ mod tests {
     fn sentinel(host: &str, ts: i64, perm: bool) -> BackupSentinelDtoV2 {
         BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(0x0200_0000),
-                backup_finish_lsn: Some(0x0200_1000),
+                backup_start_lsn: NonZeroU64::new(0x0200_0000),
+                backup_finish_lsn: NonZeroU64::new(0x0200_1000),
                 pg_version: 160003,
                 uncompressed_size: 2048,
                 compressed_size: 1024,

@@ -1,17 +1,7 @@
 #!/usr/bin/env bash
-# Install pgBackRest (PGDG apt) and configure it as the third WAL archiver under
-# test. Unlike wal-g/walrus there is NO long-running daemon: PG's archiver runs
-# `pgbackrest archive-push` per segment; in async mode the first invocation forks
-# a transient async process that pushes ready segments with up to `process-max`
-# worker processes, then exits. Footprint is therefore a process TREE, sampled by
-# bench-sampler's --proc-match mode (--daemon pgbackrest), not a systemd MainPID.
+# Install pgBackRest and configure async archive-push
 #
-# Credentials: on EC2, pgBackRest speaks IMDSv2 natively (repo1-s3-key-type=auto,
-# since pgBackRest 2.39) and reads the instance-profile role directly. Off-AWS
-# (dev / Debian, no IMDS) it falls back to static keys from the environment
-# (repo1-s3-key-type=shared) — the same AWS_ACCESS_KEY_ID/SECRET path wal-g and
-# walrus use via wal-g.env. Repo lives in the SAME bucket as wal-g under a
-# SEPARATE prefix (repo1-path) so the two never collide.
+# Uses env static keys off-AWS, otherwise pgBackRest IMDS auth
 #
 # Usage:
 #   BUCKET=my-bucket [UPLOAD_CONCURRENCY=4] sudo ./05_install_pgbackrest.sh
@@ -27,8 +17,7 @@ PGDATA="${PGDATA:-/dat/18/data}"
 PGBIN="${PGBIN:-/usr/lib/postgresql/18/bin}"
 CONF_DIR="/etc/pgbackrest"
 CONF="${CONF_DIR}/pgbackrest.conf"
-# Spool + logs on the data NVMe (not tmpfs, not the small root volume); async
-# only writes tiny ack files to the spool, so disk pressure is negligible.
+# Put spool + logs on data NVMe
 SPOOL_PATH="${PGBACKREST_SPOOL_PATH:-/dat/pgbackrest/spool}"
 LOG_PATH="${PGBACKREST_LOG_PATH:-/dat/pgbackrest/log}"
 
@@ -55,7 +44,7 @@ install -d -o postgres -g postgres -m 0750 "${CONF_DIR}"
 install -d -o postgres -g postgres -m 0750 "${SPOOL_PATH}"
 install -d -o postgres -g postgres -m 0750 "${LOG_PATH}"
 
-# S3 auth: static keys from env when present (off-AWS / Debian), else IMDS role.
+# Static keys from env off-AWS, otherwise IMDS
 if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
   echo "=== pgbackrest S3 auth: shared (static keys from environment) ==="
   S3_AUTH="repo1-s3-key-type=shared
@@ -69,9 +58,8 @@ else
 fi
 
 echo "=== Writing ${CONF} (process-max=${UPLOAD_CONCURRENCY}, bucket=${BUCKET}) ==="
-# process-max matches WALG_UPLOAD_CONCURRENCY so pgbackrest's async parallelism is
-# the same knob as wal-g's background uploader — the throughput<->memory tradeoff
-# is compared at equal fan-out. compress-type=lz4 matches WALG_COMPRESSION_METHOD.
+# Match process-max to WALG_UPLOAD_CONCURRENCY
+# Use lz4 to match WALG_COMPRESSION_METHOD
 umask 077
 tmp="$(mktemp)"
 cat > "${tmp}" <<EOF
@@ -100,8 +88,7 @@ install -o postgres -g postgres -m 0640 "${tmp}" "${CONF}"
 rm -f "${tmp}"
 
 echo "=== stanza-create (idempotent) ==="
-# Connects to PG (local socket) for the system identifier and to S3 for the repo
-# layout. Safe to re-run: a no-op on an existing matching stanza.
+# Safe to re-run with existing matching stanza
 sudo -u postgres pgbackrest --stanza="${STANZA}" stanza-create
 
 echo "=== Installed pgbackrest config ==="
