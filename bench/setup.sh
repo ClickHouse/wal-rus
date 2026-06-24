@@ -1,22 +1,14 @@
 #!/usr/bin/env bash
 #
-# setup.sh — bootstrap THIS host as a single-box benchmark System-Under-Test.
+# setup.sh, bootstrap this host as single-box benchmark SUT
 #
-# Runs the numbered scripts/sut steps in order: mount NVMe (optional) -> install
-# PG18 + toolchains -> build wal-g, walrus (from this repo), walg_archive -> init
-# the PG18 cluster -> install + stanza pgbackrest -> create the bench role ->
-# deploy the sampler -> write wal-g.env -> install both systemd units.
-#
-# Single-host counterpart of the external AWS fleet's setup_sut.sh: no SSH, no
-# source upload (walrus builds straight from this repo), driver == this box.
-#
-# Run as root: sudo ./setup.sh   (config from ./config.env)
+# Run as root: sudo ./setup.sh, config from ./config.env
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 SUT="${SCRIPT_DIR}/scripts/sut"
 
-# Export everything sourced so the sub-scripts inherit it (BUCKET, creds, etc).
+# Export config for child setup scripts
 set -a
 # shellcheck source=config.env.example
 . "${ENV_FILE:-${SCRIPT_DIR}/config.env}"
@@ -32,7 +24,7 @@ fi
 : "${PGPASSWORD:?set PGPASSWORD in config.env}"
 : "${UPLOAD_CONCURRENCY:?set UPLOAD_CONCURRENCY in config.env}"
 
-# Toolchain owner + pg_hba CIDR. Single-host driver is loopback.
+# Toolchain owner + pg_hba CIDR
 export BUILD_USER="${BUILD_USER:-${SUDO_USER:-ubuntu}}"
 export DRIVER_CIDR="${DRIVER_CIDR:-127.0.0.1/32}"
 
@@ -41,9 +33,8 @@ log() { printf '[setup %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 cd "${SUT}"
 chmod +x ./*.sh
 
-# 00 is AWS instance-store specific: it formats+mounts a spare NVMe at /dat.
-# Skip on a box that already has /dat (or set SKIP_MOUNT=1 to point PGDATA at an
-# existing fast disk yourself).
+# 00 formats + mounts spare NVMe at /dat
+# Skip when /dat already points at fast storage
 if [[ -n "${SKIP_MOUNT:-}" ]]; then
   log "SKIP_MOUNT set — skipping 00_mount_nvme.sh (ensure /dat exists)"
 else
@@ -65,14 +56,15 @@ else
   ${PSQL} -c "CREATE ROLE \"${PGUSER}\" LOGIN PASSWORD '${PGPASSWORD}' CREATEDB;"
 fi
 
-log "build bench-tools (bench-sampler + bench-analyze) from ${SCRIPT_DIR}/tools"
+log "build bench-tools (bench-sampler + bench-analyze + bench-compare) from ${SCRIPT_DIR}/tools"
 build_home="$(getent passwd "${BUILD_USER}" | cut -d: -f6)"
 cargo_bin="${build_home}/.cargo/bin/cargo"
 sudo -u "${BUILD_USER}" -H bash -c "cd '${SCRIPT_DIR}/tools' && '${cargo_bin}' build --release"
 
-log "deploy bench-sampler + bench-analyze to /usr/local/bin"
+log "deploy bench-sampler + bench-analyze + bench-compare to /usr/local/bin"
 install -m 0755 "${SCRIPT_DIR}/tools/target/release/bench-sampler" /usr/local/bin/bench-sampler
 install -m 0755 "${SCRIPT_DIR}/tools/target/release/bench-analyze" /usr/local/bin/bench-analyze
+install -m 0755 "${SCRIPT_DIR}/tools/target/release/bench-compare" /usr/local/bin/bench-compare
 
 log "11 write wal-g.env";                          bash ./11_write_walg_env.sh
 log "install both systemd units (via 30, starts walg)"; bash ./30_select_daemon.sh walg

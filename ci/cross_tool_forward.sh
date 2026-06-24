@@ -17,7 +17,7 @@ pgbench -p "$PGPORT" -h "$PGHOST" -i -s 1 postgres
 psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
 pg_dumpall -p "$PGPORT" -h "$PGHOST" -f "$WORKROOT/dump1.sql"
 
-walrus backup-push
+walrus backup-push "$PGDATA"
 psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
 sleep 3
 

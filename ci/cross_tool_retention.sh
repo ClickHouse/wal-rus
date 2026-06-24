@@ -22,7 +22,7 @@ push_three() {
     local _i
     for _i in 1 2 3; do
         psql -p "$PGPORT" -h "$PGHOST" -c "CHECKPOINT" postgres
-        if [ "$tool" = "$WALRUS_BIN" ]; then walrus backup-push; else walg backup-push "$PGDATA"; fi
+        if [ "$tool" = "$WALRUS_BIN" ]; then walrus backup-push "$PGDATA"; else walg backup-push "$PGDATA"; fi
         psql -p "$PGPORT" -h "$PGHOST" -c "SELECT pg_switch_wal()" postgres
         sleep 1
     done

@@ -712,6 +712,7 @@ mod tests {
             start_lsn,
             end_lsn,
             compression::Method::None,
+            None,
         )
         .await
         .unwrap();
@@ -722,5 +723,688 @@ mod tests {
         let want: std::collections::BTreeSet<u32> =
             (1000 + n as u32..=1000 + tail as u32).collect();
         assert_eq!(got, want, "sidecar group + tail WAL must cover every block");
+    }
+
+    /// Unaligned start_lsn: the parent full begins mid-group (segment 20, in
+    /// group 16), so group 16's sidecar would cover pre-start segments the full
+    /// never archived and is never finalized. The consumer must raw-walk the
+    /// leading partial [20, 31], fold the complete group-32 sidecar (segs
+    /// 32..=47), then raw-walk the trailing segment 48 — recovering 1020..=1048.
+    /// Before the leading-partial fix this errored on the absent group-16 sidecar
+    /// and fell back to a raw walk of the (unfetchable) sidecar-only segments
+    #[tokio::test]
+    async fn unaligned_start_walks_leading_partial() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let n = WAL_FILES_IN_DELTA;
+        let tmp = tempfile::tempdir().unwrap();
+        let pg_wal = tmp.path().join("pg_wal");
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&pg_wal).unwrap();
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        let start = n + 4; // 20: group 16, position 4
+        let last_complete = 2 * n; // group 32
+        let tail = 3 * n; // 48: trailing partial group
+
+        // Leading partial [start, 31] + trailing seg 48 fetchable as raw WAL.
+        // Group-32 segments are deliberately absent here so a fold of that
+        // sidecar (not a raw fetch) is the only way to recover their blocks
+        for g in (start..last_complete).chain(std::iter::once(tail)) {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let bytes = one_record_segment(1000 + g as u32);
+            let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+            storage
+                .put(&format!("{WAL_FOLDER}/{name}"), r, None)
+                .await
+                .unwrap();
+        }
+
+        // Record 31..=47: seg 31 seeds group 32's prev_head, 32..=47 complete it.
+        // Group 16 stays incomplete, so its sidecar is never uploaded
+        for g in (last_complete - 1)..(last_complete + n) {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let bytes = one_record_segment(1000 + g as u32);
+            let path = pg_wal.join(&name);
+            std::fs::write(&path, &bytes).unwrap();
+            record_segment(&settings, &storage, &path, &name)
+                .await
+                .unwrap();
+        }
+
+        let none = compression::Method::None;
+        assert!(
+            !storage
+                .exists(&delta_storage_key(&delta_group_name(1, n, seg_size), none))
+                .await
+                .unwrap(),
+            "leading group 16 sidecar must be absent"
+        );
+        assert!(
+            storage
+                .exists(&delta_storage_key(
+                    &delta_group_name(1, last_complete, seg_size),
+                    none
+                ))
+                .await
+                .unwrap(),
+            "complete group 32 sidecar must exist"
+        );
+
+        let start_lsn = start * seg_size;
+        let end_lsn = tail * seg_size + 100;
+        let map = build_delta_map_from_wal(&settings, &storage, 1, start_lsn, end_lsn, none, None)
+            .await
+            .unwrap();
+        let got: std::collections::BTreeSet<u32> =
+            map.locations().into_iter().map(|l| l.block_no).collect();
+        let want: std::collections::BTreeSet<u32> =
+            (1000 + start as u32..=1000 + tail as u32).collect();
+        assert_eq!(
+            got, want,
+            "leading raw walk + group-32 sidecar + trailing seg must cover every block"
+        );
+    }
+
+    /// Aligned mid-stream start: recording begins exactly on group boundary 32,
+    /// so group 32 fills all 16 positions yet never seeds prev_head (segment 31
+    /// was never recorded) and its sidecar is never finalized. The consumer must
+    /// raw-walk the sidecar-less group 32, fold the present group-48 sidecar, then
+    /// raw-walk the trailing segment 64 — recovering 1032..=1064 — instead of
+    /// failing the whole range to a full reparse on the absent group-32 sidecar
+    #[tokio::test]
+    async fn aligned_start_walks_missing_first_group() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let n = WAL_FILES_IN_DELTA;
+        let tmp = tempfile::tempdir().unwrap();
+        let pg_wal = tmp.path().join("pg_wal");
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&pg_wal).unwrap();
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        let start = 2 * n; // 32: group boundary, recording starts here
+        let second_group = 3 * n; // 48
+        let tail = 4 * n; // 64: trailing partial
+
+        // Record 32..=63 aligned: group 32 fills every position but never seeds
+        // prev_head (segment 31 unrecorded) so no group-32 sidecar; segment 47
+        // seeds group 48, which completes at segment 63
+        for g in start..(start + 2 * n) {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let bytes = one_record_segment(1000 + g as u32);
+            let path = pg_wal.join(&name);
+            std::fs::write(&path, &bytes).unwrap();
+            record_segment(&settings, &storage, &path, &name)
+                .await
+                .unwrap();
+        }
+
+        // Raw WAL for the sidecar-less group 32 + the tail seg 64 fetchable; group
+        // 48's raw segments deliberately absent so only its sidecar covers them
+        for g in (start..second_group).chain(std::iter::once(tail)) {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let bytes = one_record_segment(1000 + g as u32);
+            let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+            storage
+                .put(&format!("{WAL_FOLDER}/{name}"), r, None)
+                .await
+                .unwrap();
+        }
+
+        let none = compression::Method::None;
+        assert!(
+            !storage
+                .exists(&delta_storage_key(
+                    &delta_group_name(1, start, seg_size),
+                    none
+                ))
+                .await
+                .unwrap(),
+            "aligned first group 32 sidecar must be absent"
+        );
+        assert!(
+            storage
+                .exists(&delta_storage_key(
+                    &delta_group_name(1, second_group, seg_size),
+                    none
+                ))
+                .await
+                .unwrap(),
+            "group 48 sidecar must exist"
+        );
+
+        let start_lsn = start * seg_size;
+        let end_lsn = tail * seg_size + 100;
+        let map = build_delta_map_from_wal(&settings, &storage, 1, start_lsn, end_lsn, none, None)
+            .await
+            .unwrap();
+        let got: std::collections::BTreeSet<u32> =
+            map.locations().into_iter().map(|l| l.block_no).collect();
+        let want: std::collections::BTreeSet<u32> =
+            (1000 + start as u32..=1000 + tail as u32).collect();
+        assert_eq!(
+            got, want,
+            "raw-walked group 32 + group-48 sidecar + tail must cover every block"
+        );
+    }
+
+    /// Multi-segment raw-WAL fallback: no sidecars, three fetchable segments in
+    /// group 0 so `build_delta_map_from_wal` bails to the full walk. Exercises
+    /// the fetch-vs-parse prefetch pipeline (segment N+1 fetched while N parses)
+    /// and proves the changed-block set is the union across all segments
+    #[tokio::test]
+    async fn full_walk_pipelines_multiple_segments() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        // Segments 1..=3 (group 0), each touching a distinct block, all fetchable
+        for g in 1u64..=3 {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let bytes = one_record_segment(2000 + g as u32);
+            let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+            storage
+                .put(&format!("{WAL_FOLDER}/{name}"), r, None)
+                .await
+                .unwrap();
+        }
+
+        let start_lsn = seg_size; // segment 1
+        let end_lsn = 3 * seg_size + 100; // inside segment 3
+        let map = build_delta_map_from_wal(
+            &settings,
+            &storage,
+            1,
+            start_lsn,
+            end_lsn,
+            compression::Method::None,
+            None,
+        )
+        .await
+        .unwrap();
+        let got: std::collections::BTreeSet<u32> =
+            map.locations().into_iter().map(|l| l.block_no).collect();
+        let want: std::collections::BTreeSet<u32> = (2001..=2003).collect();
+        assert_eq!(
+            got, want,
+            "full walk must union every segment's changed blocks"
+        );
+    }
+
+    /// A missing segment in the required range is a hard error, never a silent
+    /// skip: dropping segment 2 would omit its changed pages from the increment
+    /// and restore stale parent data. Segments 1 and 3 present, 2 missing
+    #[tokio::test]
+    async fn full_walk_errors_on_missing_segment() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        for g in [1u64, 3] {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let bytes = one_record_segment(2000 + g as u32);
+            let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+            storage
+                .put(&format!("{WAL_FOLDER}/{name}"), r, None)
+                .await
+                .unwrap();
+        }
+
+        build_delta_map_from_wal(
+            &settings,
+            &storage,
+            1,
+            seg_size,
+            3 * seg_size + 100,
+            compression::Method::None,
+            None,
+        )
+        .await
+        .expect_err("missing required segment must error, not skip");
+    }
+
+    /// `wal_dir` makes the walk read raw segments from local `pg_wal` and fall
+    /// back to the archive only for what is absent locally. Segment 1 lives only
+    /// on disk, segments 2 and 3 only in the bucket: recovering 3001, 3002 and
+    /// 3003 proves local-first read with archive fallback for the rest
+    #[tokio::test]
+    async fn full_walk_prefers_local_pg_wal() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let tmp = tempfile::tempdir().unwrap();
+        let pg_wal = tmp.path().join("pg_wal");
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&pg_wal).unwrap();
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        // segment 1: local pg_wal only (uncompressed, raw segment name)
+        let name1 = seg_name_from_global(1, 1, seg_size).format();
+        std::fs::write(pg_wal.join(&name1), one_record_segment(3001)).unwrap();
+        // segments 2,3: archive only — exercise the NotFound → archive fallback
+        for g in [2u64, 3] {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let r: compression::AsyncReader =
+                Box::pin(std::io::Cursor::new(one_record_segment(3000 + g as u32)));
+            storage
+                .put(&format!("{WAL_FOLDER}/{name}"), r, None)
+                .await
+                .unwrap();
+        }
+
+        let map = build_delta_map_from_wal(
+            &settings,
+            &storage,
+            1,
+            seg_size,
+            3 * seg_size + 100,
+            compression::Method::None,
+            Some(&pg_wal),
+        )
+        .await
+        .unwrap();
+        let got: std::collections::BTreeSet<u32> =
+            map.locations().into_iter().map(|l| l.block_no).collect();
+        let want: std::collections::BTreeSet<u32> = [3001, 3002, 3003].into_iter().collect();
+        assert_eq!(
+            got, want,
+            "local segment + archive-fallback segments recovered"
+        );
+    }
+
+    /// Build a `total`-byte heap record referencing `base/200/300` block 7
+    /// (24 header + 20 block-0 header + 5 LONG main-data marker + main data)
+    fn boundary_block_record(total: usize) -> Vec<u8> {
+        use crate::pg::walparser::{RmId, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG};
+        let main_len = total - X_LOG_RECORD_HEADER_SIZE - 20 - 5;
+        let mut r = Vec::new();
+        r.extend_from_slice(&(total as u32).to_le_bytes());
+        r.extend_from_slice(&0u32.to_le_bytes()); // xact
+        r.extend_from_slice(&0u64.to_le_bytes()); // prev
+        r.push(0u8); // info
+        r.push(RmId::Heap as u8);
+        r.push(0);
+        r.push(0);
+        r.extend_from_slice(&0u32.to_le_bytes()); // crc
+        r.push(0u8); // block id 0
+        r.push(0u8); // fork_flags: no image, no data
+        r.extend_from_slice(&0u16.to_le_bytes()); // data_length
+        r.extend_from_slice(&1663u32.to_le_bytes()); // spc
+        r.extend_from_slice(&200u32.to_le_bytes()); // db
+        r.extend_from_slice(&300u32.to_le_bytes()); // rel
+        r.extend_from_slice(&7u32.to_le_bytes()); // block_no
+        r.push(XLR_BLOCK_ID_DATA_LONG);
+        r.extend_from_slice(&(main_len as u32).to_le_bytes());
+        r.extend_from_slice(&vec![0x5Au8; main_len]);
+        assert_eq!(r.len(), total);
+        r
+    }
+
+    /// Long-header page (36 B header + 4 B align) holding `body` bytes, zero-padded
+    fn long_header_page(body: &[u8]) -> Vec<u8> {
+        use crate::pg::walparser::XLP_LONG_HEADER;
+        let mut page = Vec::with_capacity(WAL_PAGE_SIZE as usize);
+        page.extend_from_slice(&XLP_PAGE_MAGIC_PG14.to_le_bytes());
+        page.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        page.extend_from_slice(&1u32.to_le_bytes()); // timeline
+        page.extend_from_slice(&0u64.to_le_bytes()); // page_address
+        page.extend_from_slice(&0u32.to_le_bytes()); // remaining_data_len (no continuation)
+        page.extend_from_slice(&12345u64.to_le_bytes()); // sysid
+        page.extend_from_slice(&(16u32 * 1024 * 1024).to_le_bytes()); // seg_size
+        page.extend_from_slice(&8192u32.to_le_bytes()); // xlog_block_size
+        page.extend_from_slice(&[0u8; 4]); // align 36 → 40
+        page.extend_from_slice(body);
+        page.resize(WAL_PAGE_SIZE as usize, 0);
+        page
+    }
+
+    /// Short-header continuation page (20 B header + 4 B align) carrying `rem`
+    /// bytes of remaining-data length and `body` bytes, zero-padded
+    fn cont_header_page(rem: u32, body: &[u8]) -> Vec<u8> {
+        use crate::pg::walparser::XLP_FIRST_IS_CONT_RECORD;
+        let mut page = Vec::with_capacity(WAL_PAGE_SIZE as usize);
+        page.extend_from_slice(&XLP_PAGE_MAGIC_PG14.to_le_bytes());
+        page.extend_from_slice(&XLP_FIRST_IS_CONT_RECORD.to_le_bytes());
+        page.extend_from_slice(&1u32.to_le_bytes()); // timeline
+        page.extend_from_slice(&(WAL_PAGE_SIZE as u64).to_le_bytes()); // page_address
+        page.extend_from_slice(&rem.to_le_bytes());
+        page.extend_from_slice(&[0u8; 4]); // align 20 → 24
+        page.extend_from_slice(body);
+        page.resize(WAL_PAGE_SIZE as usize, 0);
+        page
+    }
+
+    async fn put_segment(storage: &DynStorage, seg: u64, bytes: Vec<u8>) {
+        let name = seg_name_from_global(1, seg, wal_segment_size()).format();
+        let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
+        storage
+            .put(&format!("{WAL_FOLDER}/{name}"), r, None)
+            .await
+            .unwrap();
+    }
+
+    /// End-to-end parallel full walk over a record whose body spans the seg 1 /
+    /// seg 2 boundary: seg 1 holds the head, seg 2 the tail. The boundary stitch
+    /// must recover block 7, which neither segment's in-segment parse sees alone
+    #[tokio::test]
+    async fn full_walk_stitches_boundary_record() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        let total = 9049;
+        let split = 8152; // bytes on seg 1 after long header + align
+        let record = boundary_block_record(total);
+        put_segment(&storage, 1, long_header_page(&record[..split])).await;
+        put_segment(
+            &storage,
+            2,
+            cont_header_page((total - split) as u32, &record[split..]),
+        )
+        .await;
+
+        let map = build_delta_map_from_wal(
+            &settings,
+            &storage,
+            1,
+            seg_size,
+            2 * seg_size + 100,
+            compression::Method::None,
+            None,
+        )
+        .await
+        .unwrap();
+        let got: Vec<u32> = map.locations().into_iter().map(|l| l.block_no).collect();
+        assert_eq!(got, vec![7], "boundary record's block recovered via stitch");
+    }
+
+    /// A record longer than a segment (head in seg 1, all of seg 2 its middle,
+    /// tail in seg 3) can't be reconstructed pairwise; the parallel walk detects
+    /// the fully-middle seg 2 and falls back to the serial threaded walk, which
+    /// still recovers block 7
+    #[tokio::test]
+    async fn full_walk_falls_back_on_multi_segment_record() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        let head = 8152; // bytes on seg 1 (long header + align)
+        let mid = 8168; // bytes on seg 2 (short header + align), fully inside record
+        let tail = 500;
+        let total = head + mid + tail;
+        let record = boundary_block_record(total);
+        put_segment(&storage, 1, long_header_page(&record[..head])).await;
+        put_segment(
+            &storage,
+            2,
+            cont_header_page((total - head) as u32, &record[head..head + mid]),
+        )
+        .await;
+        put_segment(
+            &storage,
+            3,
+            cont_header_page((total - head - mid) as u32, &record[head + mid..]),
+        )
+        .await;
+
+        let map = build_delta_map_from_wal(
+            &settings,
+            &storage,
+            1,
+            seg_size,
+            3 * seg_size + 100,
+            compression::Method::None,
+            None,
+        )
+        .await
+        .unwrap();
+        let got: Vec<u32> = map.locations().into_iter().map(|l| l.block_no).collect();
+        assert_eq!(got, vec![7], "serial fallback recovers the oversize record");
+    }
+
+    /// A record straddling the seg 1 / seg 2 boundary leaves seg 1 with a
+    /// trailing head only seg 2 can complete. With seg 2 absent the parallel
+    /// walk must error, never return a map missing the stitched block — a
+    /// partial increment would restore stale parent data for that page
+    #[tokio::test]
+    async fn parallel_parse_missing_boundary_neighbor_errors() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        // seg 1 holds only the head of a boundary-spanning record (trailing head
+        // non-empty); seg 2, carrying the tail, is never uploaded
+        let total = 9049;
+        let split = 8152; // bytes on seg 1 after long header + align
+        let record = boundary_block_record(total);
+        put_segment(&storage, 1, long_header_page(&record[..split])).await;
+
+        build_delta_map_from_wal(
+            &settings,
+            &storage,
+            1,
+            seg_size,
+            2 * seg_size + 100,
+            compression::Method::None,
+            None,
+        )
+        .await
+        .expect_err("absent boundary neighbor must error, not yield a partial map");
+    }
+
+    /// A complete group's sidecar truncated mid-stream (no terminator, eg an
+    /// interrupted upload) must never fold as a partial map: the consumer errors
+    /// the sidecar path and re-walks the group's raw WAL, recovering exactly the
+    /// real blocks. The truncated sidecar's stray tuple must not leak through
+    #[tokio::test]
+    async fn truncated_sidecar_falls_back_to_raw_walk() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let n = WAL_FILES_IN_DELTA;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let none = compression::Method::None;
+
+        // group 16's 16 raw segments fetchable for the fallback walk
+        for g in n..(2 * n) {
+            put_segment(&storage, g, one_record_segment(1000 + g as u32)).await;
+        }
+
+        // Truncated group-16 sidecar: a lone tuple (block 9999), no terminator
+        // or parser state — mimics a finalize cut short
+        let group16 = delta_group_name(1, n, seg_size);
+        let mut raw = Vec::new();
+        write_location_tuples(&mut raw, &[BlockLocation::new(1663, 16384, 16385, 9999)]).unwrap();
+        let key = delta_storage_key(&group16, none);
+        let len = raw.len() as u64;
+        let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(raw));
+        storage.put(&key, r, Some(len)).await.unwrap();
+
+        let start_lsn = n * seg_size; // seg 16, group-aligned
+        let end_lsn = 2 * n * seg_size; // seg 32 exclusive → no trailing group
+        let map = build_delta_map_from_wal(&settings, &storage, 1, start_lsn, end_lsn, none, None)
+            .await
+            .unwrap();
+        let got: std::collections::BTreeSet<u32> =
+            map.locations().into_iter().map(|l| l.block_no).collect();
+        // raw walk of segs 16..=31 → blocks 1016..=1031; the truncated sidecar's
+        // 9999 is discarded, not folded
+        let want: std::collections::BTreeSet<u32> = (1016..=1031).collect();
+        assert_eq!(got, want, "fallback raw walk recovers real blocks only");
+        assert!(
+            !got.contains(&9999),
+            "truncated sidecar tuple must not leak"
+        );
+    }
+
+    /// Companion to [`aligned_start_walks_missing_first_group`]: when the
+    /// sidecar-less aligned first group also has no fetchable raw WAL, the build
+    /// must error rather than silently drop that group's changed blocks. Records
+    /// segs 32..=63 (group 48 finalizes, group 32 never does) but uploads no raw
+    /// segments, so group 32 is recoverable by neither sidecar nor raw walk
+    #[tokio::test]
+    async fn aligned_first_group_missing_sidecar_and_raw_errors() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let n = WAL_FILES_IN_DELTA;
+        let tmp = tempfile::tempdir().unwrap();
+        let pg_wal = tmp.path().join("pg_wal");
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&pg_wal).unwrap();
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+
+        let start = 2 * n; // 32: group boundary, recording starts here
+        let second_group = 3 * n; // 48
+
+        // Record 32..=63 aligned: group 32 fills every position but never seeds
+        // prev_head (segment 31 unrecorded) so no group-32 sidecar; group 48
+        // completes. Recording only writes local scratch + the finalized
+        // sidecar — no raw segments reach the bucket
+        for g in start..(start + 2 * n) {
+            let name = seg_name_from_global(1, g, seg_size).format();
+            let bytes = one_record_segment(1000 + g as u32);
+            let path = pg_wal.join(&name);
+            std::fs::write(&path, &bytes).unwrap();
+            record_segment(&settings, &storage, &path, &name)
+                .await
+                .unwrap();
+        }
+
+        let none = compression::Method::None;
+        assert!(
+            !storage
+                .exists(&delta_storage_key(
+                    &delta_group_name(1, start, seg_size),
+                    none
+                ))
+                .await
+                .unwrap(),
+            "aligned first group 32 sidecar must be absent"
+        );
+        assert!(
+            storage
+                .exists(&delta_storage_key(
+                    &delta_group_name(1, second_group, seg_size),
+                    none
+                ))
+                .await
+                .unwrap(),
+            "group 48 sidecar must exist"
+        );
+
+        let start_lsn = start * seg_size;
+        let end_lsn = 4 * n * seg_size + 100; // through seg 64
+        build_delta_map_from_wal(&settings, &storage, 1, start_lsn, end_lsn, none, None)
+            .await
+            .expect_err("sidecar-less group with no raw WAL must error, not drop blocks");
+    }
+
+    /// Corrupt sidecar with no fallback WAL. A truncated group-16 sidecar forces
+    /// the raw-WAL fallback (see [`truncated_sidecar_falls_back_to_raw_walk`] for
+    /// the success case), but group 16's raw segments are absent from the archive
+    /// too, so the build must error rather than fold the corrupt sidecar's partial
+    /// map — a partial increment would restore stale parent data
+    #[tokio::test]
+    async fn corrupt_sidecar_without_raw_wal_errors() {
+        use crate::pg::backup::delta::build_delta_map_from_wal;
+        use crate::storage::DynStorage;
+        use crate::storage::fs::FsStorage;
+        use std::sync::Arc;
+
+        let seg_size = DEFAULT_WAL_SEG_SIZE;
+        let n = WAL_FILES_IN_DELTA;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let settings = test_settings(&bucket);
+        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let none = compression::Method::None;
+
+        // Truncated group-16 sidecar: lone tuple, no terminator. No raw segments
+        // uploaded, so the fallback walk has nothing to read
+        let group16 = delta_group_name(1, n, seg_size);
+        let mut raw = Vec::new();
+        write_location_tuples(&mut raw, &[BlockLocation::new(1663, 16384, 16385, 9999)]).unwrap();
+        let key = delta_storage_key(&group16, none);
+        let len = raw.len() as u64;
+        let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(raw));
+        storage.put(&key, r, Some(len)).await.unwrap();
+
+        let start_lsn = n * seg_size; // seg 16, group-aligned
+        let end_lsn = 2 * n * seg_size; // seg 32 exclusive → only group 16
+        build_delta_map_from_wal(&settings, &storage, 1, start_lsn, end_lsn, none, None)
+            .await
+            .expect_err("corrupt sidecar with no raw WAL must error, not fold a partial map");
     }
 }

@@ -5,22 +5,13 @@
 #   DAEMON  - walg | walrus | pgbackrest   (which archiver to exercise)
 #   RUN_ID  - free-form label, e.g. r1 / 2026-06-22
 #
-# Drives ONE benchmark cell end to end on THIS host (PG + daemon + pgbench all
-# local). Single-host counterpart of the external fleet's orchestrate/run_one.sh,
-# with SSH and IMDS removed: credentials come from config.env, the workload runs
-# against the local cluster.
+# Drive one archive-command benchmark cell on this host
 #
-#   1. Select the daemon: write wal-g.env (this cell's concurrency), start its
-#      unit, point archive_command at the tool's own client, pre-drain backlog.
-#      (pgbackrest is daemonless: set process-max, stanza, archive-push, drain.)
-#   2. Reset pg_stat_archiver, start the 1 Hz sampler into the results dir.
-#   3. Run the workload (high-WAL burst) against local PG.
-#   4. Stop the sampler, capture the S3 inventory + provenance.
+# Select archiver, drain backlog, sample high-WAL burst, capture inventory
 #
 # Results land under bench/results/<DAEMON>-<RUN_ID>/ (override RESULTS_ROOT).
 # Assumes ./setup.sh has run and the bench DB is seeded (pgbench_init.sh).
-# Run as a normal user (it uses sudo for the root steps); do not run pgbench as
-# root.
+# Run as normal user, sudo handles root steps
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -51,8 +42,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 PG_ENV_FILE="/etc/postgresql/wal-g.env"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 COMPRESSION="${WALG_COMPRESSION_METHOD:-lz4}"
-# Scope the archive prefix per daemon+run (same bucket = same destination storage,
-# fair comparison) so cells of a sweep do not pile WAL into one shared prefix.
+# Isolate each daemon+run under one bucket
 WALG_PREFIX="s3://${BUCKET}/walg-bench/${DAEMON}/${RUN_ID}"
 PGBACKREST_REPO_PATH="/pgbackrest-bench/${DAEMON}/${RUN_ID}"
 PGBACKREST_STANZA="walbench"
@@ -116,11 +106,7 @@ REMOTE
   drain_backlog 10 300
 else
   log "writing ${PG_ENV_FILE} + selecting ${DAEMON} (own daemon-client)"
-  # 11 writes the shared env file from the env credentials; 30 stops the other
-  # unit, starts this one, points archive_command at its own client, waits the
-  # socket. Both inherit BUCKET/creds/region from this shell. ENV_FILE is pinned
-  # to the daemon env path so a caller-set ENV_FILE (config selector) preserved
-  # by sudo -E cannot redirect 11's OUTPUT onto the config file.
+  # Pin ENV_FILE so sudo -E cannot turn config selector into env-file output
   ENV_FILE="${PG_ENV_FILE}" \
     BUCKET="${BUCKET}" UPLOAD_CONCURRENCY="${UPLOAD_CONCURRENCY}" \
     WALG_S3_PREFIX="${WALG_PREFIX}" \

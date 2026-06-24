@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test the currently-active archive daemon: force a few WAL switches,
-# insert a tiny table, wait for archiving, then confirm WAL objects landed under
-# s3://<BUCKET>/walg-bench/wal_005/. FAIL loudly if nothing appears.
+# Smoke test active archive daemon
 #
 # Usage: BUCKET=my-bucket sudo ./40_smoke_test.sh   (or pass BUCKET as $1)
 set -euo pipefail
@@ -29,9 +27,7 @@ if [[ ! -S "${SOCKET}" ]]; then
 fi
 
 echo "=== Baseline object count under ${S3_WAL_PREFIX} (before this daemon archives) ==="
-# The prefix is SHARED by both daemons. Counting >0 would false-pass walrus on
-# objects wal-g left earlier (and vice versa). Capture a baseline and require an
-# INCREASE so the test proves THIS daemon archived.
+# Shared prefix, require count increase from baseline
 before="$(aws s3 ls "${S3_WAL_PREFIX}" --region "${AWS_REGION}" 2>/dev/null | grep -c . || true)"
 echo "baseline=${before}"
 
@@ -47,7 +43,7 @@ for _ in $(seq 1 "${WAL_SWITCHES}"); do
   run_psql -d postgres -tAc \
     "INSERT INTO walg_smoke (payload) SELECT repeat('y',256) FROM generate_series(1,500);"
 done
-# Final switch so the last populated segment becomes archivable.
+# Make last populated segment archivable
 run_psql -d postgres -tAc "SELECT pg_switch_wal();" >/dev/null
 
 echo "=== Waiting up to ${WAIT_SECONDS}s for NEW archived WAL under ${S3_WAL_PREFIX} ==="

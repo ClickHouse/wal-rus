@@ -12,6 +12,7 @@
 //! several S3 connections and CPU cores run at once instead of one
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,18 +32,21 @@ use crate::pg::backup::delta;
 use crate::pg::backup::increment::Format as IncrementFormat;
 use crate::pg::backup::push::{self, Finalize, PushArgs};
 use crate::pg::backup::tar_streamer::{
-    DeltaClass, DeltaContext, IncrementBodyReader, PartWriter, classify_for_delta,
+    DeltaClass, DeltaContext, IncrementBodyReader, PG_PAGE_HEADER_SIZE, PartWriter,
+    classify_for_delta, increment_class_for_blocks, page_changed_since,
 };
 use crate::pg::backup::{
-    BACKUP_NAME_PREFIX, FileDescription, TablespaceSpec, format_backup_name, format_pg_lsn,
-    parse_pg_lsn, tar_part_key,
+    FileDescription, TablespaceSpec, format_backup_name, format_pg_lsn, parse_pg_lsn, tar_part_key,
 };
 use crate::pg::replication::PgConfig;
 use crate::pg::replication::base_backup::ChannelReader;
 use crate::pg::replication::conn::ReplicationConn;
 use crate::storage::DynStorage;
 
+// walk-relative path used to detect pg_control during the tree walk
 const PG_CONTROL_ENTRY: &str = "global/pg_control";
+// tar entry name for the pg_control tee, restores without a files_metadata entry
+const TAR_PG_CONTROL_ENTRY: &str = "/global/pg_control";
 
 /// Coalesce file-body reads. tokio_tar copies each body through io::copy's 8 KB
 /// buffer, and every tokio::fs::File read is a blocking-pool dispatch; reading a
@@ -257,13 +261,6 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
 
     let seg_size = crate::pg::wal::segment::wal_segment_size();
     let base_name = format_backup_name(timeline, start_lsn, seg_size);
-    let backup_name = match parent.as_ref() {
-        Some(p) => format!(
-            "{base_name}_D_{}",
-            p.name.strip_prefix(BACKUP_NAME_PREFIX).unwrap_or(&p.name),
-        ),
-        None => base_name.clone(),
-    };
 
     // Build the delta map now that the upper LSN bound is known. Failure drops
     // to a full backup (wal-g semantics: a partial delta is worse than a full)
@@ -278,6 +275,13 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         start_lsn,
     )
     .await;
+
+    // Delta backups get a `_D_<parent-without-base_>` suffix (wal-g
+    // convention). delete/list/show all key off this. Chosen only after the
+    // delta map built: a failed build falls back to a full, so name must not
+    // claim `_D_` when sentinel reports FULL
+    let backup_name =
+        push::resolve_backup_name(&base_name, parent.as_ref(), delta_context.is_some());
 
     let tar_size = if args.tar_size_threshold == 0 {
         crate::pg::backup::tar_streamer::DEFAULT_TAR_SIZE_THRESHOLD
@@ -544,13 +548,110 @@ async fn append_entry(
             Ok(false)
         }
         DeltaClass::Increment {
-            header_bytes,
-            blocks,
-            total_size,
+            mut header_bytes,
+            mut blocks,
+            mut total_size,
         } => {
-            let Some(mut file) = open_walked(&e.abs).await? else {
+            // WAL/summary candidates over-mark: every block touched in the window,
+            // including pages settled below the parent's start LSN. Drop those to
+            // match wal-g selectivity. One fd for prepass and body so a concurrent
+            // unlink can't swap the file
+            let format = delta_context
+                .as_ref()
+                .expect("increment implies delta context")
+                .format;
+            let parent_start_lsn = delta_context.as_ref().and_then(|c| c.parent_start_lsn);
+            let cand_count = blocks.len();
+            let abs = e.abs.clone();
+            let cand = std::mem::take(&mut blocks);
+            let (std_file, kept) = tokio::task::spawn_blocking(
+                move || -> Result<(Option<std::fs::File>, Vec<u32>)> {
+                    let file = match std::fs::File::open(&abs) {
+                        Ok(f) => f,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok((None, Vec::new()));
+                        }
+                        Err(err) => {
+                            return Err(err).with_context(|| format!("open {}", abs.display()));
+                        }
+                    };
+                    let kept = match parent_start_lsn {
+                        Some(lsn) => filter_changed_blocks(&file, &cand, lsn.get())
+                            .with_context(|| format!("page-lsn filter {}", abs.display()))?,
+                        None => cand,
+                    };
+                    Ok((Some(file), kept))
+                },
+            )
+            .await
+            .context("join page-lsn filter")??;
+
+            // Vanished mid-backup (DROP TABLE etc.); omit, matching wal-g
+            let Some(std_file) = std_file else {
+                tracing::warn!(
+                    target = "backup_push",
+                    "{} vanished during backup; skipping",
+                    e.abs.display(),
+                );
                 return Ok(false);
             };
+
+            // Filter only drops in order, so equal counts ⇒ unchanged set: keep
+            // original header. Otherwise re-encode
+            if kept.len() != cand_count {
+                match increment_class_for_blocks(format, e.size, kept) {
+                    DeltaClass::Skip => {
+                        res.files.insert(
+                            e.tar_path.clone(),
+                            FileDescription {
+                                is_incremented: false,
+                                is_skipped: true,
+                                mtime: mtime_dt(e.mtime),
+                                updates_count: 0,
+                            },
+                        );
+                        return Ok(false);
+                    }
+                    DeltaClass::Increment {
+                        header_bytes: h,
+                        blocks: b,
+                        total_size: t,
+                    } => {
+                        header_bytes = h;
+                        blocks = b;
+                        total_size = t;
+                    }
+                    // Re-encode writes to a Vec so can't fail; ship full
+                    // defensively rather than emit a malformed delta
+                    DeltaClass::Passthrough => {
+                        let file = BufReader::with_capacity(
+                            FILE_READ_BUF,
+                            tokio::fs::File::from_std(std_file),
+                        );
+                        let body = FixedSizeReader::new(file, e.size);
+                        let mut h = header(e, EntryType::Regular, e.size);
+                        builder
+                            .append_data(&mut h, &e.tar_path, body)
+                            .await
+                            .with_context(|| format!("append {}", e.tar_path))?;
+                        res.files.insert(
+                            e.tar_path.clone(),
+                            FileDescription {
+                                is_incremented: false,
+                                is_skipped: false,
+                                mtime: mtime_dt(e.mtime),
+                                updates_count: 0,
+                            },
+                        );
+                        return Ok(true);
+                    }
+                }
+            } else {
+                blocks = kept;
+            }
+
+            let mut file =
+                BufReader::with_capacity(FILE_READ_BUF, tokio::fs::File::from_std(std_file));
             let mut h = header(e, EntryType::Regular, total_size);
             let body = IncrementBodyReader::new(header_bytes, &mut file, blocks, e.size);
             builder
@@ -590,6 +691,35 @@ async fn append_entry(
             Ok(true)
         }
     }
+}
+
+/// Trim the WAL/summary candidate set to blocks whose on-disk page changed
+/// at/after `parent_start_lsn` (wal-g `SelectNewValidPage` selectivity). One
+/// positioned read of the 24-byte page header per candidate; a short read (file
+/// truncated/torn since the walk) keeps the block, so the filter never drops a
+/// possibly-changed page. `blocks` is ascending; the result preserves order, so
+/// the caller can detect "nothing trimmed" by length alone
+fn filter_changed_blocks(
+    file: &std::fs::File,
+    blocks: &[u32],
+    parent_start_lsn: u64,
+) -> std::io::Result<Vec<u32>> {
+    use std::os::unix::fs::FileExt;
+    let mut hdr = [0u8; PG_PAGE_HEADER_SIZE];
+    let mut kept = Vec::with_capacity(blocks.len());
+    for &b in blocks {
+        let offset = b as u64 * delta::PG_PAGE_SIZE;
+        match file.read_exact_at(&mut hdr, offset) {
+            Ok(()) => {
+                if page_changed_since(&hdr, parent_start_lsn) {
+                    kept.push(b);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => kept.push(b),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(kept)
 }
 
 /// Open a walked file, tolerating it vanishing between the walk and the pack:
@@ -695,11 +825,16 @@ async fn build_pg_control_tar(abs: &Path) -> Result<Bytes> {
         .with_context(|| format!("read {}", abs.display()))?;
     let mut b = Builder::new(Vec::new());
     let mut h = Header::new_gnu();
+    // leading-slash name matches wal-g; set_path rejects absolute paths, so
+    // write the name bytes directly (fits in the 100-byte GNU name field)
+    let name = TAR_PG_CONTROL_ENTRY.as_bytes();
+    h.as_old_mut().name[..name.len()].copy_from_slice(name);
     h.set_size(data.len() as u64);
     h.set_mode(0o600);
     h.set_mtime(0);
     h.set_entry_type(EntryType::Regular);
-    b.append_data(&mut h, PG_CONTROL_ENTRY, &data[..])
+    h.set_cksum();
+    b.append(&h, &data[..])
         .await
         .context("append pg_control tee")?;
     b.finish().await.context("finish pg_control tar")?;
@@ -924,8 +1059,19 @@ async fn build_delta_context(
         return None;
     }
     let map = if args.delta_from_wal_summaries {
-        push::build_delta_map_from_summaries(Some(pgdata), timeline, p.start_lsn, start_lsn)
+        push::build_delta_map_from_summaries(
+            settings,
+            storage,
+            Some(pgdata),
+            timeline,
+            p.start_lsn,
+            start_lsn,
+        )
+        .await
     } else {
+        // Serve the walk from the local pg_wal; the archive is the fallback for
+        // segments PG has already recycled
+        let wal_dir = pgdata.join("pg_wal");
         delta::build_delta_map_from_wal(
             settings,
             storage,
@@ -933,6 +1079,7 @@ async fn build_delta_context(
             p.start_lsn,
             start_lsn,
             settings.compression,
+            Some(&wal_dir),
         )
         .await
     };
@@ -947,6 +1094,9 @@ async fn build_delta_context(
                 map: Arc::new(map),
                 format: increment_format,
                 parent_files: p.parent_files.clone(),
+                // fs source reads page headers to trim blocks settled below
+                // the parent (page-LSN final-state filter, wal-g selectivity)
+                parent_start_lsn: NonZeroU64::new(p.start_lsn),
             })
         }
         Err(e) => {
@@ -1337,5 +1487,152 @@ mod tests {
 
         assert!(res.files.contains_key("base/1/1234"));
         assert!(!res.files.contains_key("base/1/5678"));
+    }
+
+    // ─── page-LSN final-state filter (item 3) ───────────────────────────────
+
+    const PAGE: usize = delta::PG_PAGE_SIZE as usize;
+
+    /// One paged relation file with a valid header per block carrying the given
+    /// LSN. Bytes past the header are zero — enough for the filter & wi1 decode
+    fn paged_file_with_lsns(lsns: &[u64]) -> Vec<u8> {
+        let mut body = vec![0u8; lsns.len() * PAGE];
+        for (i, &lsn) in lsns.iter().enumerate() {
+            let o = i * PAGE;
+            body[o..o + 4].copy_from_slice(&((lsn >> 32) as u32).to_le_bytes()); // pd_lsn hi
+            body[o + 4..o + 8].copy_from_slice(&(lsn as u32).to_le_bytes()); // pd_lsn lo
+            body[o + 12..o + 14].copy_from_slice(&24u16.to_le_bytes()); // pd_lower
+            body[o + 14..o + 16].copy_from_slice(&(PAGE as u16).to_le_bytes()); // pd_upper
+            body[o + 16..o + 18].copy_from_slice(&(PAGE as u16).to_le_bytes()); // pd_special
+            body[o + 18..o + 20].copy_from_slice(&(0x2000u16 | 4).to_le_bytes()); // BLCKSZ|v4
+        }
+        body
+    }
+
+    #[test]
+    fn filter_changed_blocks_drops_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rel");
+        std::fs::write(&path, paged_file_with_lsns(&[100, 150, 250, 300])).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+
+        // parent start 200: blocks 0,1 settled below ⇒ dropped; 2,3 kept
+        assert_eq!(
+            filter_changed_blocks(&f, &[0, 1, 2, 3], 200).unwrap(),
+            vec![2, 3]
+        );
+        // all candidates below parent ⇒ empty
+        assert!(filter_changed_blocks(&f, &[0, 1], 200).unwrap().is_empty());
+        // candidate past EOF (file has 4 blocks): short read keeps it
+        assert_eq!(filter_changed_blocks(&f, &[9], 200).unwrap(), vec![9]);
+    }
+
+    fn rel(db: u32, rel_node: u32) -> crate::pg::walparser::RelFileNode {
+        crate::pg::walparser::RelFileNode {
+            spc_node: delta::DEFAULT_SPC_NODE,
+            db_node: db,
+            rel_node,
+        }
+    }
+
+    /// End-to-end through pack_worker: a paged file whose WAL-candidate blocks
+    /// include one settled below the parent (trimmed out of the increment) and a
+    /// file whose only candidate settled below (skipped entirely)
+    #[tokio::test]
+    async fn delta_page_lsn_filter_trims_and_skips() {
+        use crate::pg::backup::delta::PagedFileDeltaMap;
+        use crate::pg::backup::increment::read_increment_header;
+        use crate::pg::walparser::BlockLocation;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pgdata");
+        write_file(&root, "PG_VERSION", b"16");
+        // trimmed: blocks 1 (lsn 150 < 200, drop) & 3 (lsn 300, keep)
+        write_file(
+            &root,
+            "base/16384/16400",
+            &paged_file_with_lsns(&[100, 150, 100, 300]),
+        );
+        // skipped: only dirty block 1 (lsn 150 < 200) settled below parent
+        write_file(&root, "base/16384/16401", &paged_file_with_lsns(&[50, 150]));
+
+        let mut map = PagedFileDeltaMap::new();
+        map.add_location(BlockLocation {
+            rel: rel(16384, 16400),
+            block_no: 1,
+        });
+        map.add_location(BlockLocation {
+            rel: rel(16384, 16400),
+            block_no: 3,
+        });
+        map.add_location(BlockLocation {
+            rel: rel(16384, 16401),
+            block_no: 1,
+        });
+
+        let parent_files: Arc<std::collections::HashSet<String>> = Arc::new(
+            ["base/16384/16400", "base/16384/16401"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let ctx = DeltaContext {
+            map: Arc::new(map),
+            format: IncrementFormat::Wi1,
+            parent_files,
+            parent_start_lsn: NonZeroU64::new(200),
+        };
+
+        let batch_rx = walk_batches(&root, 1 << 30).await;
+        let store_dir = tempfile::tempdir().unwrap();
+        let storage: DynStorage = Arc::new(FsStorage::new(store_dir.path()).unwrap());
+        let settings = Settings {
+            compression: Method::None,
+            ..Default::default()
+        };
+        let name = "base_delta";
+        let res = pack_worker(
+            batch_rx,
+            Arc::new(AtomicU32::new(0)),
+            settings,
+            storage.clone(),
+            name.to_string(),
+            Some(ctx),
+        )
+        .await
+        .unwrap();
+
+        // 16400 trimmed to an increment; 16401 settled-only ⇒ skipped
+        let m400 = res.files.get("base/16384/16400").expect("16400 meta");
+        assert!(m400.is_incremented && !m400.is_skipped);
+        let m401 = res.files.get("base/16384/16401").expect("16401 meta");
+        assert!(m401.is_skipped && !m401.is_incremented);
+
+        // Decode the 16400 increment from the emitted parts: only block 3 survives
+        let mut inc_blocks = None;
+        for file_no in 1..=res.max_file_no {
+            let key = tar_part_key(name, file_no, "");
+            let mut bytes = Vec::new();
+            storage
+                .get(&key)
+                .await
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .await
+                .unwrap();
+            let mut ar = tar::Archive::new(&bytes[..]);
+            for e in ar.entries().unwrap() {
+                let mut e = e.unwrap();
+                if e.path().unwrap().to_string_lossy() == "base/16384/16400" {
+                    let mut body = Vec::new();
+                    e.read_to_end(&mut body).unwrap();
+                    let h = read_increment_header(&body[..]).unwrap();
+                    inc_blocks = Some(h.blocks);
+                }
+                // 16401 was skipped: it must not appear in any part
+                assert_ne!(e.path().unwrap().to_string_lossy(), "base/16384/16401");
+            }
+        }
+        assert_eq!(inc_blocks, Some(vec![3]), "settled block 1 must be trimmed");
     }
 }

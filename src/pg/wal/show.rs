@@ -6,6 +6,7 @@
 //! parse identically
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -53,8 +54,8 @@ pub struct GapInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupRef {
     pub name: String,
-    pub start_lsn: Option<u64>,
-    pub finish_lsn: Option<u64>,
+    pub start_lsn: Option<NonZeroU64>,
+    pub finish_lsn: Option<NonZeroU64>,
 }
 
 pub async fn handle(storage: DynStorage, format: Format) -> Result<()> {
@@ -190,10 +191,13 @@ fn print_plain(timelines: &[TimelineInfo]) {
             println!("  gap: {} -> {} (missing {})", g.from, g.to, g.missing);
         }
         for b in &t.backups {
-            let start = b.start_lsn.map(format_pg_lsn).unwrap_or_else(|| "-".into());
+            let start = b
+                .start_lsn
+                .map(|l| format_pg_lsn(l.get()).to_string())
+                .unwrap_or_else(|| "-".into());
             let finish = b
                 .finish_lsn
-                .map(format_pg_lsn)
+                .map(|l| format_pg_lsn(l.get()).to_string())
                 .unwrap_or_else(|| "-".into());
             println!("  backup: {} start={} finish={}", b.name, start, finish);
         }
@@ -374,5 +378,90 @@ mod tests {
         assert_eq!(t2.gaps.len(), 1);
         assert_eq!(t2.gaps[0].missing, 1);
         assert_eq!(t2.status, TimelineStatus::Lost);
+    }
+
+    // print_plain has no return value; exercising it confirms the range / gap /
+    // backup formatting (incl. both the present-LSN and the missing-LSN "-"
+    // arms) runs without panicking
+    #[test]
+    fn print_plain_renders_range_gaps_and_backups() {
+        let timelines = vec![TimelineInfo {
+            timeline: 1,
+            start_segment: Some("000000010000000000000001".into()),
+            end_segment: Some("000000010000000000000005".into()),
+            segments_count: 3,
+            gaps: vec![GapInfo {
+                from: "000000010000000000000002".into(),
+                to: "000000010000000000000004".into(),
+                missing: 1,
+            }],
+            backups: vec![
+                BackupRef {
+                    name: "base_000000010000000000000001".into(),
+                    start_lsn: NonZeroU64::new(0x0100_0000),
+                    finish_lsn: NonZeroU64::new(0x0100_1000),
+                },
+                // both LSNs absent -> the "-" fallback arms
+                BackupRef {
+                    name: "base_000000010000000000000003".into(),
+                    start_lsn: None,
+                    finish_lsn: None,
+                },
+            ],
+            status: TimelineStatus::Lost,
+        }];
+        print_plain(&timelines);
+    }
+
+    #[tokio::test]
+    async fn gaps_by_timeline_returns_only_lossy_timelines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        // tli 1 contiguous (no gap), tli 2 has a hole at seg 6
+        for k in [
+            "wal_005/000000010000000000000001",
+            "wal_005/000000010000000000000002",
+            "wal_005/000000020000000000000005",
+            "wal_005/000000020000000000000007",
+        ] {
+            store.put(k, empty_body(), None).await.unwrap();
+        }
+        let gaps = gaps_by_timeline(store).await.unwrap();
+        assert_eq!(gaps.len(), 1, "only the lossy timeline is reported");
+        let g = gaps.get(&2).unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].missing, 1);
+    }
+
+    #[tokio::test]
+    async fn integrity_for_backup_absent_timeline_reports_na() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        store
+            .put("wal_005/000000010000000000000001", empty_body(), None)
+            .await
+            .unwrap();
+        // timeline 9 has no archived segments at all
+        let gaps = integrity_for_backup(store, 0, 9).await.unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].from, "n/a");
+        assert_eq!(gaps[0].missing, 0);
+    }
+
+    // a sentinel whose name carries a non-hex timeline must be skipped by
+    // collect rather than producing a bogus timeline (the `continue` arm)
+    #[tokio::test]
+    async fn collect_skips_backup_with_unparseable_timeline() {
+        use crate::pg::backup::BackupSentinelDtoV2;
+        use crate::pg::backup::test_fixtures::{fs_store, put_sentinel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(dir.path());
+        put_sentinel(&store, "base_ZZZZZZZZ0000", &BackupSentinelDtoV2::default()).await;
+        let tlis = collect(store).await.unwrap();
+        assert!(
+            tlis.is_empty(),
+            "unparseable backup name yields no timeline"
+        );
     }
 }

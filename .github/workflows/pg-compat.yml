@@ -83,18 +83,28 @@ jobs:
           - backup_show
           - wal_overwrite
           - daemon
+          - delta_sidecar
           - cross_tool_forward
           - cross_tool_reverse
+          - cross_tool_stream
           - cross_tool_encryption
           - cross_tool_retention
           - cross_tool_lzma
           - cross_tool_delta
+        exclude:
+          # wal-g v3.0.8 streams only the pre-PG15 BASE_BACKUP protocol; the
+          # PG15+ tagged-CopyData parser landed post-release (wal-g#2262), so
+          # streaming interop stays on 13/14 until the next wal-g release
+          - { pg: 15, test: cross_tool_stream }
+          - { pg: 16, test: cross_tool_stream }
+          - { pg: 17, test: cross_tool_stream }
         include:
           - { pg: 18, test: full_backup }
           - { pg: 18, test: backup_mark }
           - { pg: 18, test: backup_show }
           - { pg: 18, test: wal_overwrite }
           - { pg: 18, test: daemon }
+          - { pg: 18, test: delta_sidecar }
     steps:
       - uses: actions/checkout@v7
 

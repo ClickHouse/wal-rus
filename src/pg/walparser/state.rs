@@ -315,6 +315,61 @@ pub fn extract_locations_from_wal_file<R: Read>(
     }
 }
 
+/// Boundary fragments left by a per-segment parse, so a record crossing into an
+/// adjacent segment can be stitched back together. `leading_tail` is the
+/// headless continuation of a record that began in the prior segment;
+/// `trailing_head` is the head of a record continuing into the next.
+/// `trailing_is_record_start` is false when the segment ends still buffering a
+/// record begun more than one segment back (a record longer than a segment) —
+/// the per-segment model can't represent that span, so the caller must fall
+/// back to a threaded walk
+pub struct SegmentBoundary {
+    pub leading_tail: Vec<u8>,
+    pub trailing_head: Vec<u8>,
+    pub trailing_is_record_start: bool,
+    pub page_magic: u16,
+}
+
+/// Parse one WAL segment buffer with a fresh parser, emitting in-segment block
+/// locations through `f` and returning the boundary fragments. Independent of
+/// any other segment (no threaded parser state carried in), so a full-range
+/// reparse can fan these across cores and union the results; records crossing a
+/// boundary are reconstructed by the caller from
+/// `trailing_head[i] ++ leading_tail[i+1]`. Shares
+/// [`process_locations_from_page`]'s allocation-light location-only walk.
+/// Mirrors wal-g's per-segment `WalDeltaRecordingReader`
+pub fn walk_segment_locations<F: FnMut(BlockLocation)>(
+    bytes: &[u8],
+    mut f: F,
+) -> Result<SegmentBoundary, ExtractError> {
+    let mut parser = WalParser::new();
+    let mut leading_tail: Option<Vec<u8>> = None;
+    let page = WAL_PAGE_SIZE as usize;
+    let mut off = 0;
+    while off < bytes.len() {
+        let end = (off + page).min(bytes.len());
+        if let Some(tail) = process_locations_from_page(&mut parser, &bytes[off..end], &mut f)
+            .map_err(parse_to_extract)?
+        {
+            if leading_tail.is_some() {
+                // Second discarded tail mid-segment: wal-g's
+                // CantDiscardWalDataError. Only one record can continue in from
+                // the prior segment, so this is corruption — surface as a parse
+                // error so the caller skips this segment like the serial walk
+                return Err(ExtractError::Parse(ParseError::ContinuationNotFound));
+            }
+            leading_tail = Some(tail);
+        }
+        off = end;
+    }
+    Ok(SegmentBoundary {
+        leading_tail: leading_tail.unwrap_or_default(),
+        trailing_head: parser.current_record_data().to_vec(),
+        trailing_is_record_start: parser.has_current_record_beginning(),
+        page_magic: parser.page_magic(),
+    })
+}
+
 /// Locations-only sibling of [`WalParser::parse_records_from_page`].
 /// Walks the same page-/record-stitching state machine but emits
 /// `BlockLocation`s through `f` instead of materialising every record's
@@ -322,20 +377,25 @@ pub fn extract_locations_from_wal_file<R: Read>(
 /// allocation cost of `extract_locations_from_wal_file` from
 /// O(record bodies) to O(#records) header-walks + the existing partial
 /// record stitching buffer
+///
+/// Returns the drained orphan tail when this page completes a record whose
+/// *beginning* the parser never saw (a segment-leading continuation): those
+/// bytes can't be parsed headless, so a per-segment walk surfaces them to
+/// stitch onto the prior segment's trailing head. `None` on every other page
 pub fn process_locations_from_page<F: FnMut(BlockLocation)>(
     parser: &mut WalParser,
     page_data: &[u8],
     mut f: F,
-) -> Result<(), ParsePageError> {
+) -> Result<Option<Vec<u8>>, ParsePageError> {
     if page_data.len() < WAL_PAGE_SIZE as usize / 2 {
-        return Ok(());
+        return Ok(None);
     }
     let mut cursor: &[u8] = page_data;
     let header = match read_xlog_page_header(&mut cursor) {
         Ok(h) => h,
         Err(ParseError::ZeroPageHeader) => {
             if all_zero(page_data) {
-                return Ok(());
+                return Ok(None);
             }
             return Err(ParseError::ZeroPageHeader.into());
         }
@@ -358,7 +418,7 @@ pub fn process_locations_from_page<F: FnMut(BlockLocation)>(
     // & wait for the next page (matches parse_records_from_page)
     if remaining_data.len() != header.remaining_data_len as usize {
         parser.current_record_data.extend_from_slice(remaining_data);
-        return Ok(());
+        return Ok(None);
     }
 
     // Stitch buffered head (if any) with this page's trailing bytes.
@@ -380,11 +440,17 @@ pub fn process_locations_from_page<F: FnMut(BlockLocation)>(
         if rec_header.resource_manager_id == RmId::Xlog as u8
             && (rec_header.info & !XLR_INFO_MASK) == X_LOG_SWITCH
         {
-            return Ok(());
+            return Ok(None);
         }
+        walk_locations_xlog_page_inner(parser, &mut ar, page_magic, f)?;
+        return Ok(None);
     }
 
-    walk_locations_xlog_page_inner(parser, &mut ar, page_magic, f)
+    // No buffered beginning: `stitched` is the tail of a record that began
+    // before this parser started. Walk the page's own records, then surface
+    // the orphan tail for cross-segment stitching
+    walk_locations_xlog_page_inner(parser, &mut ar, page_magic, f)?;
+    Ok((!stitched.is_empty()).then_some(stitched))
 }
 
 fn walk_locations_xlog_page_inner<F: FnMut(BlockLocation)>(
@@ -744,6 +810,113 @@ mod tests {
         assert_eq!(recs2[0].main_data_len, 9000);
         assert_eq!(recs2[0].main_data.len(), 9000);
         assert!(!parser.has_current_record_beginning());
+    }
+
+    /// Build a record that references base block 7 and is `total` bytes long
+    /// (24 header + 20 block-0 header + 5 LONG main-data marker + main data)
+    fn block_record(total: usize) -> Vec<u8> {
+        let main_len = total - X_LOG_RECORD_HEADER_SIZE - 20 - 5;
+        let mut r = Vec::new();
+        r.extend_from_slice(&(total as u32).to_le_bytes()); // total_record_length
+        r.extend_from_slice(&0u32.to_le_bytes()); // xact
+        r.extend_from_slice(&0u64.to_le_bytes()); // prev
+        r.push(0u8); // info
+        r.push(RmId::Heap as u8);
+        r.push(0);
+        r.push(0);
+        r.extend_from_slice(&0u32.to_le_bytes()); // crc
+        // block 0 header: no image, no data
+        r.push(0u8); // block id 0
+        r.push(0u8); // fork_flags
+        r.extend_from_slice(&0u16.to_le_bytes()); // data_length
+        r.extend_from_slice(&100u32.to_le_bytes()); // spc
+        r.extend_from_slice(&200u32.to_le_bytes()); // db
+        r.extend_from_slice(&300u32.to_le_bytes()); // rel
+        r.extend_from_slice(&7u32.to_le_bytes()); // block_no
+        r.push(XLR_BLOCK_ID_DATA_LONG);
+        r.extend_from_slice(&(main_len as u32).to_le_bytes());
+        r.extend_from_slice(&vec![0x5Au8; main_len]);
+        assert_eq!(r.len(), total);
+        r
+    }
+
+    /// A record carrying a block reference whose body spans a segment boundary:
+    /// its head fills segment A, its tail opens segment B. The serial threaded
+    /// walk and the per-segment walk + boundary stitch must surface the same
+    /// block location, neither segment seeing it alone
+    #[test]
+    fn segment_boundary_record_stitches_like_serial_walk() {
+        use crate::pg::walparser::parse::extract_block_locations;
+        let total = 9049;
+        let record = block_record(total);
+        let split = 8152; // record bytes that fit on segment A after header+align
+
+        let mut seg_a = long_page_header(0);
+        seg_a.extend_from_slice(&[0u8; 4]); // 36 -> 40 alignment pad
+        seg_a.extend_from_slice(&record[..split]);
+        assert_eq!(seg_a.len(), PAGE);
+
+        let mut seg_b = short_page_header(XLP_FIRST_IS_CONT_RECORD, (total - split) as u32);
+        seg_b.extend_from_slice(&[0u8; 4]); // 20 -> 24 alignment pad
+        seg_b.extend_from_slice(&record[split..]);
+        seg_b.resize(PAGE, 0);
+
+        let want = vec![BlockLocation::new(100, 200, 300, 7)];
+
+        // Serial threaded walk across both segments (mirrors walk_segments_pipelined)
+        let mut p = WalParser::new();
+        let mut serial =
+            extract_locations_from_wal_file(&mut p, std::io::Cursor::new(seg_a.clone())).unwrap();
+        serial.extend(
+            extract_locations_from_wal_file(&mut p, std::io::Cursor::new(seg_b.clone())).unwrap(),
+        );
+        assert_eq!(serial, want);
+
+        // Per-segment walk: A leaves the head, B the tail; neither sees the block
+        let mut locs_a = Vec::new();
+        let a = walk_segment_locations(&seg_a, |l| locs_a.push(l)).unwrap();
+        assert!(locs_a.is_empty(), "record incomplete in segment A");
+        assert!(a.leading_tail.is_empty());
+        assert!(!a.trailing_head.is_empty());
+        assert!(a.trailing_is_record_start);
+
+        let mut locs_b = Vec::new();
+        let b = walk_segment_locations(&seg_b, |l| locs_b.push(l)).unwrap();
+        assert!(locs_b.is_empty(), "tail alone yields no in-segment record");
+        assert!(!b.leading_tail.is_empty());
+        assert!(b.trailing_head.is_empty());
+
+        // Stitch head + tail → the boundary record's block
+        let mut data = a.trailing_head.clone();
+        data.extend_from_slice(&b.leading_tail);
+        let rec = parse_record_from_bytes(&data, a.page_magic).unwrap();
+        assert_eq!(extract_block_locations(std::slice::from_ref(&rec)), want);
+    }
+
+    /// A record longer than a segment leaves a middle segment buffering a
+    /// headless continuation to EOF: trailing head set but not a record start,
+    /// the signal that pairwise stitching can't represent the span
+    #[test]
+    fn segment_fully_inside_record_flags_multi_segment_span() {
+        let total = 20049;
+        let record = block_record(total);
+        let head_on_a = 8152; // bytes on segment A after long header+align
+        let mid_on_b = 8168; // bytes on segment B after short header+align
+
+        let mut seg_b = short_page_header(XLP_FIRST_IS_CONT_RECORD, (total - head_on_a) as u32);
+        seg_b.extend_from_slice(&[0u8; 4]);
+        seg_b.extend_from_slice(&record[head_on_a..head_on_a + mid_on_b]);
+        assert_eq!(seg_b.len(), PAGE);
+
+        let mut locs = Vec::new();
+        let b = walk_segment_locations(&seg_b, |l| locs.push(l)).unwrap();
+        assert!(locs.is_empty());
+        assert!(b.leading_tail.is_empty());
+        assert!(!b.trailing_head.is_empty());
+        assert!(
+            !b.trailing_is_record_start,
+            "middle of an oversize record is not a record start"
+        );
     }
 
     #[test]

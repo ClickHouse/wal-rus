@@ -4,12 +4,15 @@
 /.venv/
 __pycache__/
 
-# rust build artifacts
+# rust build artifacts + source tarballs from make_source_tarball.sh
 /tools/target/
+/walrus-src-*.tar.gz
 
-# terraform state + generated SSH key + run log (never commit)
+# terraform state + generated SSH key + run log + local var overrides (never commit)
+/terraform/tfplan
 /terraform/.terraform/
 /terraform/*.tfstate
 /terraform/*.tfstate.*
+/terraform/*.tfvars
 /terraform/walrus_bench_key.pem
-/terraform/apply.log
+/terraform/*.log

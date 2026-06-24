@@ -156,4 +156,68 @@ mod tests {
         let args = parse_args(&body).unwrap();
         assert_eq!(args, vec!["000000010000000000000001", "/dst/path"]);
     }
+
+    #[test]
+    fn from_byte_maps_all_types_and_rejects_unknown() {
+        assert_eq!(MessageType::from_byte(b'C'), Some(MessageType::Check));
+        assert_eq!(MessageType::from_byte(b'O'), Some(MessageType::Ok));
+        assert_eq!(MessageType::from_byte(b'E'), Some(MessageType::Error));
+        assert_eq!(
+            MessageType::from_byte(b'N'),
+            Some(MessageType::ArchiveNonExistence)
+        );
+        assert_eq!(MessageType::from_byte(b'F'), Some(MessageType::WalPush));
+        assert_eq!(MessageType::from_byte(b'f'), Some(MessageType::WalFetch));
+        assert_eq!(MessageType::from_byte(b'?'), None);
+    }
+
+    #[tokio::test]
+    async fn read_message_rejects_length_below_header() {
+        // total_len=2 is < the 3-byte header, so body math would underflow
+        let bytes = vec![b'O', 0x00, 0x02];
+        let mut cur = Cursor::new(bytes);
+        assert!(read_message(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_message_rejects_unknown_type_byte() {
+        let bytes = vec![b'?', 0x00, 0x03];
+        let mut cur = Cursor::new(bytes);
+        assert!(read_message(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_message_rejects_oversized_body() {
+        // one arg pushes total past u16::MAX
+        let big = "x".repeat(u16::MAX as usize);
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(
+            write_message(&mut buf, MessageType::WalPush, &[&big])
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn encode_args_rejects_too_many_and_too_long() {
+        let many: Vec<&str> = vec!["x"; 256];
+        assert!(encode_args(&many).is_err());
+        let long = "y".repeat(u16::MAX as usize + 1);
+        assert!(encode_args(&[&long]).is_err());
+    }
+
+    #[test]
+    fn parse_args_empty_body_is_no_args() {
+        assert!(parse_args(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_args_rejects_truncation_and_trailing() {
+        // count=2 but no length bytes follow
+        assert!(parse_args(&[2]).is_err());
+        // declares a 5-byte arg with only 1 byte present
+        assert!(parse_args(&[1, 0, 5, b'a']).is_err());
+        // a valid 1-byte arg followed by a stray trailing byte
+        assert!(parse_args(&[1, 0, 1, b'a', b'x']).is_err());
+    }
 }

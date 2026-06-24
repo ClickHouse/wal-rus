@@ -165,4 +165,32 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
+
+    #[test]
+    fn backoff_jitter_stays_within_capped_window() {
+        let policy = RetryPolicy {
+            max_attempts: 8,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(30),
+            jitter: true,
+        };
+        // full-jitter draws uniform [0, capped); attempt 1 caps at base_delay
+        for _ in 0..64 {
+            assert!(policy.backoff(1) < policy.base_delay);
+        }
+        // late attempts saturate at max_delay; jitter keeps them under it
+        assert!(policy.backoff(20) < policy.max_delay);
+    }
+
+    #[test]
+    fn backoff_jitter_zero_window_returns_capped() {
+        // max_delay 0 -> capped is zero, the ms==0 guard returns it verbatim
+        let policy = RetryPolicy {
+            max_attempts: 4,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::ZERO,
+            jitter: true,
+        };
+        assert_eq!(policy.backoff(1), Duration::ZERO);
+    }
 }

@@ -30,6 +30,7 @@
 //! `archive_command`-driven pushes.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -417,7 +418,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     // recycle WAL below this, so a gap is possible if we fall behind, traded for
     // not pinning primary WAL
     let start_lsn = match slot_name.as_deref() {
-        Some(_) if slot.exists => slot.restart_lsn.unwrap_or(xlogpos),
+        Some(_) if slot.exists => slot.restart_lsn.map_or(xlogpos, |l| l.get()),
         Some(name) => {
             conn.create_physical_replication_slot(name).await?;
             tracing::info!(target = "wal_receive", "created replication slot {name}");
@@ -569,7 +570,7 @@ fn validate_slot_name(name: &str) -> Result<()> {
 /// Physical replication slot state read from `pg_replication_slots`
 struct SlotInfo {
     exists: bool,
-    restart_lsn: Option<u64>,
+    restart_lsn: Option<NonZeroU64>,
 }
 
 /// `wal_segment_size` from `pg_settings`. PG 10 and below report it in 8 KiB
@@ -612,7 +613,8 @@ async fn query_slot_info(q: &mut ReplicationConn, slot_name: &str) -> Result<Slo
                 .get(1)
                 .and_then(|c| c.as_deref())
                 .map(parse_pg_lsn)
-                .transpose()?;
+                .transpose()?
+                .and_then(NonZeroU64::new);
             Ok(SlotInfo {
                 exists: true,
                 restart_lsn,
@@ -1045,6 +1047,59 @@ mod tests {
             seg_size,
             "after upload completes, flush catches up to received"
         );
+    }
+
+    #[tokio::test]
+    async fn write_at_nonzero_offset_seeks_and_zero_pads() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        let mut acc = test_acc(dir.path(), seg_size).await;
+        // First byte lands at offset 4 (bytes_written is still 0), forcing the
+        // seek-to-offset path; bytes 0..4 stay as the pre-extend zero pad
+        acc.write(4, &[0xAB; 4]).await.unwrap();
+        let cur = acc.current.as_ref().unwrap();
+        assert_eq!(cur.bytes_written, 8);
+        let name = cur.name.format();
+        acc.finalize_partial().await.unwrap();
+        let bytes = std::fs::read(dir.path().join(format!("{name}.partial"))).unwrap();
+        assert_eq!(&bytes[..4], &[0; 4], "gap before offset stays zero");
+        assert_eq!(&bytes[4..8], &[0xAB; 4]);
+    }
+
+    #[tokio::test]
+    async fn flush_position_floors_at_current_partial_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        let mut acc = test_acc(dir.path(), seg_size).await;
+        // partial write: segment open, nothing rotated, no upload in flight
+        acc.write(0, &[0xCD; 4]).await.unwrap();
+        assert_eq!(acc.write_position(), 4, "received high-water tracks bytes");
+        assert_eq!(
+            acc.flush_position(),
+            0,
+            "flush floors at the open partial's start (not yet durable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_history_ships_uncompressed_under_wal_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let settings = test_settings(&store);
+        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
+        upload_history(
+            &settings,
+            &storage,
+            dir.path(),
+            "00000002.history",
+            b"1\t0/3000000\t\n",
+        )
+        .await
+        .unwrap();
+        // history lands under wal_005/<name>, staging copy removed
+        let archived = store.join(crate::pg::WAL_FOLDER).join("00000002.history");
+        assert_eq!(std::fs::read(&archived).unwrap(), b"1\t0/3000000\t\n");
+        assert!(!dir.path().join("00000002.history").exists());
     }
 
     #[tokio::test]

@@ -152,14 +152,14 @@ fn print_plain(name: &str, s: &BackupSentinelDtoV2, files: Option<&FilesMetadata
         "start_lsn         {}",
         s.sentinel
             .backup_start_lsn
-            .map(format_pg_lsn)
+            .map(|l| format_pg_lsn(l.get()).to_string())
             .unwrap_or_else(|| "-".into())
     );
     println!(
         "finish_lsn        {}",
         s.sentinel
             .backup_finish_lsn
-            .map(format_pg_lsn)
+            .map(|l| format_pg_lsn(l.get()).to_string())
             .unwrap_or_else(|| "-".into())
     );
     println!("uncompressed_size {}", s.sentinel.uncompressed_size);
@@ -193,6 +193,8 @@ fn print_plain(name: &str, s: &BackupSentinelDtoV2, files: Option<&FilesMetadata
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
     use crate::pg::backup::test_fixtures::{fs_store, put_files_metadata, put_sentinel};
     use crate::pg::backup::{BackupSentinelDto, FileDescription, LATEST, TablespaceSpec};
@@ -202,8 +204,8 @@ mod tests {
     fn sentinel() -> BackupSentinelDtoV2 {
         BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(0x0200_0000),
-                backup_finish_lsn: Some(0x0200_1000),
+                backup_start_lsn: NonZeroU64::new(0x0200_0000),
+                backup_finish_lsn: NonZeroU64::new(0x0200_1000),
                 pg_version: 160003,
                 system_identifier: Some(7_000_000_000_000_000_000),
                 uncompressed_size: 2048,

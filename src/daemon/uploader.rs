@@ -396,6 +396,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_segment_file_pushed_straight_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let up = uploader(dir, 2);
+        // a .history file isn't a segment: bypasses look-ahead/dedup
+        let hist = dir.join("00000002.history");
+        std::fs::write(&hist, b"1\t0/3000000\t\n").unwrap();
+        up.wal_push(&hist).await.unwrap();
+        let archived = dir
+            .join("store")
+            .join(crate::pg::WAL_FOLDER)
+            .join("00000002.history");
+        assert_eq!(std::fs::read(&archived).unwrap(), b"1\t0/3000000\t\n");
+    }
+
+    #[tokio::test]
+    async fn foreground_joins_inflight_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let segs = seed_segments(dir, 1);
+        let up = uploader(dir, 1); // no look-ahead
+        // Pre-register the segment as in-flight (no driver); the foreground
+        // wal_push must join this shared future rather than start a duplicate
+        {
+            let fut = up.make_upload(dir.join(segs[0].format()));
+            up.state.lock().unwrap().inflight.insert(segs[0], fut);
+        }
+        up.wal_push(&dir.join(segs[0].format())).await.unwrap();
+        assert!(archived(dir, &segs[0]));
+    }
+
+    #[tokio::test]
+    async fn scan_ready_missing_dir_and_non_ready_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let after = SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: 0,
+        };
+        // no archive_status/ dir yet -> empty
+        assert!(scan_ready(dir, after).await.is_empty());
+        // a non-.ready entry is ignored
+        let status = dir.join("archive_status");
+        std::fs::create_dir_all(&status).unwrap();
+        std::fs::write(status.join("000000010000000000000001.done"), b"").unwrap();
+        std::fs::write(status.join("000000010000000000000002.ready"), b"").unwrap();
+        let got = scan_ready(dir, after).await;
+        assert_eq!(got.len(), 1, "only the .ready marker is a candidate");
+        assert_eq!(got[0].seg_no, 2);
+    }
+
+    #[test]
+    fn mark_done_evicts_oldest_past_cap() {
+        let mut st = State {
+            inflight: HashMap::new(),
+            done: HashSet::new(),
+            done_order: VecDeque::new(),
+        };
+        let seg = |n| SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: n,
+        };
+        st.mark_done(seg(1), 2);
+        st.mark_done(seg(2), 2);
+        st.mark_done(seg(3), 2); // evicts seg 1
+        assert!(!st.done.contains(&seg(1)), "oldest evicted at cap");
+        assert!(st.done.contains(&seg(2)));
+        assert!(st.done.contains(&seg(3)));
+        assert_eq!(st.done_order.len(), 2);
+        // re-marking an existing entry is a no-op (no spurious growth)
+        st.mark_done(seg(3), 2);
+        assert_eq!(st.done_order.len(), 2);
+    }
+
+    #[tokio::test]
     async fn lookahead_capped_by_cumulative_inflight() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();

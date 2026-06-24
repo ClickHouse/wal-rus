@@ -307,6 +307,66 @@ mod tests {
         assert!(matches!(p.credentials().await, Err(StorageError::Auth(_))));
     }
 
+    #[tokio::test]
+    async fn credential_source_imds_fetches_and_identity_is_constant() {
+        let exp = (Utc::now() + chrono::Duration::hours(6)).to_rfc3339();
+        let (p, _) = provider(exp, true).await;
+        let src = CredentialSource::Imds(Arc::new(p));
+        // identity folds to a constant so rotating IMDS keys don't break copy
+        assert_eq!(src.identity(), "imds");
+        let c = src.get().await.unwrap();
+        assert_eq!(c.access_key, "ASIAEXAMPLE");
+    }
+
+    #[test]
+    fn static_identity_is_the_access_key() {
+        let src = CredentialSource::Static(Credentials {
+            access_key: "AKIAEXAMPLE".into(),
+            secret_key: "secret".into(),
+            session_token: None,
+            expires_at: None,
+        });
+        assert_eq!(src.identity(), "AKIAEXAMPLE");
+    }
+
+    #[tokio::test]
+    async fn http_error_surfaces_when_role_fetch_fails() {
+        // token PUT succeeds; the IAM role GET 500s, so get() returns Http
+        let base = serve(|req: &Req| match (req.method.as_str(), req.path.as_str()) {
+            ("PUT", TOKEN_PATH) => Resp::new(200).body(b"TOKEN".to_vec()),
+            ("GET", IAM_PATH) => Resp::new(500).body(b"boom".to_vec()),
+            _ => Resp::new(404),
+        })
+        .await;
+        let p = ImdsProvider::with_endpoint(base).unwrap();
+        assert!(matches!(
+            p.credentials().await,
+            Err(StorageError::Http { status: 500, .. })
+        ));
+    }
+
+    #[test]
+    fn expires_within_honors_margin_and_static_keys() {
+        let soon = Credentials {
+            access_key: "a".into(),
+            secret_key: "b".into(),
+            session_token: Some("t".into()),
+            expires_at: Some(SystemTime::now() + Duration::from_secs(60)),
+        };
+        assert!(soon.expires_within(REFRESH_MARGIN));
+        let far = Credentials {
+            expires_at: Some(SystemTime::now() + Duration::from_secs(REFRESH_MARGIN.as_secs() * 4)),
+            ..soon.clone()
+        };
+        assert!(!far.expires_within(REFRESH_MARGIN));
+        // static keys never expire
+        let stat = Credentials {
+            expires_at: None,
+            ..soon
+        };
+        assert!(!stat.expires_within(REFRESH_MARGIN));
+    }
+
     #[test]
     fn parse_creds_rejects_non_success_code() {
         // all key fields present so deserialization passes and the Code guard

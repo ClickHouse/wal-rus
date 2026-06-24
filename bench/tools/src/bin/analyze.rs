@@ -1,15 +1,13 @@
-//! bench-analyze — plot + summarize walrus vs wal-g vs pgbackrest runs
-//! (Rust port of plot.py; tiny-skia rasterizes the canvas, ab_glyph draws text,
-//! tiny-skia's png-format writes the PNG).
+//! bench-analyze, plot + summarize walrus vs wal-g vs pgbackrest runs
 //!
-//! Reads the 1 Hz sampler CSVs for one or more run dirs and emits, into --out:
+//! Reads sampler CSVs and emits:
 //!   mem_over_time.png  two panels: VmRSS (top), VmPeak (bottom)
 //!   backlog.png        *.ready backlog over time (archive keep-up)
 //!   upload_rate.png    tx_bytes upload rate (MB/s)
 //!   cpu.png            daemon CPU % over time
-//! Replicas of a variant are aggregated: bold = median, band = min..max.
+//! Replicas aggregate to median, band = min..max
 //!
-//! Plus self-describing raw exports (every row carries run metadata):
+//! Raw exports:
 //!   samples_<stamp>.csv  long table, one row per sample per run
 //!   summary_<stamp>.csv  one row per run: metadata + aggregates
 //!   summary.json         same per-run aggregates as JSON
@@ -17,17 +15,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use anyhow::{Context, Result};
 use clap::Parser;
-use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, Path as SkPath, PathBuilder, Pixmap, Rect, Stroke,
-    StrokeDash, Transform,
+use tiny_skia::{Color, Pixmap};
+
+use bench_tools::viz::{
+    FG, Fonts, HEADER_H, MUTED, SEL, Style, W, fill_poly, fmt_num, load_fonts, median, nice_ticks,
+    stroke_poly, style_for, text_at, text_center, text_left_mid, text_right, text_vert, text_width,
+    variant_of, variants_ordered,
 };
 
 const KB: f64 = 1024.0;
 const MB: f64 = 1024.0 * 1024.0;
-const WAL_SEG_MB: f64 = 16.0; // archived_count -> MB approximation
+const WAL_SEG_MB: f64 = 16.0; // archived_count to MB
 
 const META_KEYS: [&str; 7] = [
     "daemon",
@@ -59,43 +59,16 @@ const SAMPLE_COLS: [&str; 17] = [
     "archived_mb",
 ];
 
-#[derive(Clone, Copy)]
-struct Rgb(u8, u8, u8);
-
-const BG: Rgb = Rgb(0x29, 0x25, 0x22);
-const FLOAT: Rgb = Rgb(0x34, 0x30, 0x2C);
-const SEL: Rgb = Rgb(0x40, 0x3A, 0x36);
-const MUTED: Rgb = Rgb(0xC1, 0xA7, 0x8E);
-const FG: Rgb = Rgb(0xEC, 0xE1, 0xD7);
-
-fn variant_color(variant: &str) -> Option<Rgb> {
-    match variant {
-        "walrus" | "walrus-serial" => Some(Rgb(0xFA, 0xFF, 0x69)),
-        "walg" => Some(Rgb(0xFC, 0x3F, 0x1D)),
-        "pgbackrest" => Some(Rgb(0x27, 0x68, 0x9D)),
-        _ => None,
-    }
-}
-
-const FALLBACK: [Rgb; 6] = [
-    Rgb(0xA3, 0xA9, 0xCE),
-    Rgb(0x85, 0xB6, 0x95),
-    Rgb(0xCF, 0x9B, 0xC2),
-    Rgb(0x89, 0xB3, 0xB6),
-    Rgb(0xE4, 0x9B, 0x5D),
-    Rgb(0xB3, 0x80, 0xB0),
-];
-
 #[derive(Parser)]
 #[command(about = "plot + summarize bench runs")]
 struct Args {
-    /// run directory (repeatable; pair with --label in order)
+    /// run directory, repeatable
     #[arg(long = "run", required = true)]
     runs: Vec<String>,
-    /// label for the matching --run (repeatable)
+    /// label matching --run, repeatable
     #[arg(long = "label", required = true)]
     labels: Vec<String>,
-    /// output directory for plots + exports
+    /// output directory
     #[arg(long)]
     out: String,
     /// timestamp tag for output filenames (default: now, UTC)
@@ -109,27 +82,6 @@ struct Args {
 fn pf(s: Option<&String>) -> Option<f64> {
     let t = s?.trim();
     if t.is_empty() { None } else { t.parse().ok() }
-}
-
-fn variant_of(label: &str) -> String {
-    // strip a trailing -b<digits>
-    if let Some(idx) = label.rfind("-b") {
-        let suffix = &label[idx + 2..];
-        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
-            return label[..idx].to_string();
-        }
-    }
-    label.to_string()
-}
-
-fn box_of(label: &str) -> String {
-    if let Some(idx) = label.rfind("-b") {
-        let suffix = &label[idx + 2..];
-        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
-            return suffix.to_string();
-        }
-    }
-    "0".to_string()
 }
 
 fn read_provenance(dir: &Path) -> HashMap<String, String> {
@@ -225,7 +177,7 @@ impl Sample {
     }
 }
 
-/// Extracts a plotted metric from a sample (None = absent at that tick).
+/// Plotted metric getter
 type Getter = Box<dyn Fn(&Sample) -> Option<f64>>;
 
 struct Run {
@@ -239,8 +191,7 @@ struct Run {
 
 fn load_run(dir: &str, label: &str) -> Option<Run> {
     let d = Path::new(dir);
-    // Degraded cells (failed burst workers, receiver shipped nothing) are stamped
-    // INVALID by the drivers; exclude them so a weaker workload is not averaged in.
+    // Skip degraded cells
     if d.join("INVALID").exists() {
         eprintln!("warning: {dir} marked INVALID, skipping");
         return None;
@@ -275,7 +226,7 @@ fn load_run(dir: &str, label: &str) -> Option<Run> {
         })
         .collect();
 
-    // tx upload rate: derivative over consecutive net samples, keyed by later ts.
+    // Upload rate from consecutive net samples
     let mut net: HashMap<String, Option<f64>> = HashMap::new();
     let (mut prev_ts, mut prev_tx): (Option<f64>, Option<f64>) = (None, None);
     for r in read_csv(d, "net.csv").unwrap_or_default() {
@@ -293,7 +244,7 @@ fn load_run(dir: &str, label: &str) -> Option<Run> {
     }
 
     let variant = variant_of(label);
-    let boxid = box_of(label);
+    let boxid = bench_tools::viz::box_of(label);
     let ts0 = pf(mem[0].get("ts")).unwrap_or(0.0);
     let div = |r: &HashMap<String, String>, k: &str, denom: f64| pf(r.get(k)).map(|v| v / denom);
 
@@ -341,41 +292,6 @@ fn load_run(dir: &str, label: &str) -> Option<Run> {
 // --------------------------------------------------------------------------
 // Aggregation
 // --------------------------------------------------------------------------
-#[derive(Clone)]
-struct Style {
-    color: Rgb,
-    dashed: bool,
-    z: i32,
-}
-
-fn style_for(variant: &str, idx: usize) -> Style {
-    Style {
-        color: variant_color(variant).unwrap_or(FALLBACK[idx % FALLBACK.len()]),
-        dashed: variant.ends_with("-serial"),
-        z: if variant.starts_with("walrus") { 10 } else { 4 },
-    }
-}
-
-fn variants_ordered(labels: &[String]) -> Vec<String> {
-    let mut vs: Vec<String> = labels.iter().map(|l| variant_of(l)).collect();
-    vs.sort();
-    vs.dedup();
-    vs.sort_by_key(|v| (!v.starts_with("walrus"), v.clone()));
-    vs
-}
-
-fn median(xs: &mut [f64]) -> f64 {
-    xs.sort_by(f64::total_cmp);
-    let n = xs.len();
-    if n == 0 {
-        0.0
-    } else if n % 2 == 1 {
-        xs[n / 2]
-    } else {
-        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
-    }
-}
-
 struct Series {
     label: String,
     xs: Vec<f64>,
@@ -391,7 +307,7 @@ fn panel_series(
     style_map: &HashMap<String, Style>,
     get: impl Fn(&Sample) -> Option<f64>,
 ) -> Vec<Series> {
-    // variant -> elapsed-second -> values
+    // variant -> elapsed second -> values
     let mut buckets: HashMap<&str, BTreeMap<i64, Vec<f64>>> = HashMap::new();
     for s in samples {
         if let Some(v) = get(s) {
@@ -429,12 +345,7 @@ fn panel_series(
 }
 
 // --------------------------------------------------------------------------
-// Rendering (tiny-skia raster + ab_glyph text)
-//
-// We own a small canvas: tiny-skia gives AA strokes/fills and the PNG encoder
-// (png-format feature); ab_glyph rasterizes glyph coverage that we blend in.
-// No plotters, no `image`. Dashing is tiny-skia's native StrokeDash (pixel
-// space), so the old data-space dash_segments hack is gone.
+// Rendering
 // --------------------------------------------------------------------------
 struct Panel {
     title: String,
@@ -442,310 +353,7 @@ struct Panel {
     series: Vec<Series>,
 }
 
-const W: u32 = 1180;
-const HEADER_H: u32 = 48;
 const PANEL_H: u32 = 340;
-
-struct Fonts {
-    regular: FontRef<'static>,
-    bold: FontRef<'static>,
-}
-
-fn load_fonts() -> Result<Fonts> {
-    let load = |b: &'static [u8]| {
-        FontRef::try_from_slice(b).map_err(|_| anyhow::anyhow!("embedded font parse failed"))
-    };
-    Ok(Fonts {
-        regular: load(dejavu::sans::regular())?,
-        bold: load(dejavu::sans::bold())?,
-    })
-}
-
-fn paint_rgb(c: Rgb, a: u8) -> Paint<'static> {
-    let mut p = Paint::default();
-    p.set_color_rgba8(c.0, c.1, c.2, a);
-    p.anti_alias = true;
-    p
-}
-
-fn polyline(pts: &[(f32, f32)]) -> Option<SkPath> {
-    let mut pb = PathBuilder::new();
-    let (x0, y0) = *pts.first()?;
-    pb.move_to(x0, y0);
-    for &(x, y) in &pts[1..] {
-        pb.line_to(x, y);
-    }
-    pb.finish()
-}
-
-fn stroke_poly(
-    pm: &mut Pixmap,
-    pts: &[(f32, f32)],
-    c: Rgb,
-    a: u8,
-    width: f32,
-    dash: Option<[f32; 2]>,
-) {
-    let Some(path) = polyline(pts) else { return };
-    let mut stroke = Stroke {
-        width,
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    };
-    if let Some([on, off]) = dash {
-        stroke.dash = StrokeDash::new(vec![on, off], 0.0);
-    }
-    pm.stroke_path(
-        &path,
-        &paint_rgb(c, a),
-        &stroke,
-        Transform::identity(),
-        None,
-    );
-}
-
-fn fill_poly(pm: &mut Pixmap, pts: &[(f32, f32)], c: Rgb, a: u8) {
-    let mut pb = PathBuilder::new();
-    let Some(&(x0, y0)) = pts.first() else { return };
-    pb.move_to(x0, y0);
-    for &(x, y) in &pts[1..] {
-        pb.line_to(x, y);
-    }
-    pb.close();
-    let Some(path) = pb.finish() else { return };
-    pm.fill_path(
-        &path,
-        &paint_rgb(c, a),
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
-}
-
-fn fill_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Rgb, a: u8) {
-    if let Some(r) = Rect::from_xywh(x, y, w, h) {
-        pm.fill_rect(r, &paint_rgb(c, a), Transform::identity(), None);
-    }
-}
-
-fn stroke_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Rgb, width: f32) {
-    stroke_poly(
-        pm,
-        &[(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)],
-        c,
-        255,
-        width,
-        None,
-    );
-}
-
-/// "Nice" axis ticks: a round step (1/2/5 x 10^k) spanning [lo, hi].
-fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<f64> {
-    if hi <= lo || target == 0 {
-        return vec![lo];
-    }
-    let raw = (hi - lo) / target as f64;
-    let mag = 10f64.powf(raw.log10().floor());
-    let norm = raw / mag;
-    let step = mag
-        * if norm < 1.5 {
-            1.0
-        } else if norm < 3.0 {
-            2.0
-        } else if norm < 7.0 {
-            5.0
-        } else {
-            10.0
-        };
-    let mut t = (lo / step).ceil() * step;
-    let mut out = Vec::new();
-    while t <= hi + step * 1e-9 {
-        out.push(t);
-        t += step;
-    }
-    out
-}
-
-// --- text: rasterize a string into a premultiplied pixmap, then blit ----------
-fn text_width(font: &FontRef<'static>, px: f32, text: &str) -> f32 {
-    let sf = font.as_scaled(PxScale::from(px));
-    let mut w = 0.0;
-    let mut prev = None;
-    for ch in text.chars() {
-        let g = font.glyph_id(ch);
-        if let Some(p) = prev {
-            w += sf.kern(p, g);
-        }
-        w += sf.h_advance(g);
-        prev = Some(g);
-    }
-    w
-}
-
-fn text_pixmap(font: &FontRef<'static>, px: f32, text: &str, c: Rgb) -> Option<Pixmap> {
-    let sf = font.as_scaled(PxScale::from(px));
-    let w = (text_width(font, px, text).ceil() as u32 + 2).max(1);
-    let h = ((sf.ascent() - sf.descent()).ceil() as u32 + 2).max(1);
-    let mut pm = Pixmap::new(w, h)?;
-    let baseline = sf.ascent() + 1.0;
-    let data = pm.data_mut();
-    let mut caret = 1.0f32;
-    let mut prev = None;
-    for ch in text.chars() {
-        let gid = font.glyph_id(ch);
-        if let Some(p) = prev {
-            caret += sf.kern(p, gid);
-        }
-        let glyph = gid.with_scale_and_position(PxScale::from(px), point(caret, baseline));
-        caret += sf.h_advance(gid);
-        prev = Some(gid);
-        let Some(og) = font.outline_glyph(glyph) else {
-            continue;
-        };
-        let bb = og.px_bounds();
-        og.draw(|gx, gy, cov| {
-            let x = bb.min.x as i32 + gx as i32;
-            let y = bb.min.y as i32 + gy as i32;
-            if x < 0 || y < 0 || x as u32 >= w || y as u32 >= h {
-                return;
-            }
-            let a = (cov.clamp(0.0, 1.0) * 255.0).round() as u8;
-            if a == 0 {
-                return;
-            }
-            let i = ((y as u32 * w + x as u32) * 4) as usize;
-            // glyph boxes can overlap; keep the stronger coverage. premultiplied.
-            if a >= data[i + 3] {
-                let pre = |v: u8| ((v as u16 * a as u16) / 255) as u8;
-                data[i] = pre(c.0);
-                data[i + 1] = pre(c.1);
-                data[i + 2] = pre(c.2);
-                data[i + 3] = a;
-            }
-        });
-    }
-    Some(pm)
-}
-
-/// Blit a premultiplied src onto an opaque dst (src-over keeps dst opaque).
-/// rotate_ccw=true places src rotated 90° counter-clockwise (vertical y-labels).
-fn blit(dst: &mut Pixmap, src: &Pixmap, dx: i32, dy: i32, rotate_ccw: bool) {
-    let (dw, dh) = (dst.width(), dst.height());
-    let (sw, sh) = (src.width(), src.height());
-    let s = src.data();
-    let d = dst.data_mut();
-    for sy in 0..sh {
-        for sx in 0..sw {
-            let si = ((sy * sw + sx) * 4) as usize;
-            let a = s[si + 3];
-            if a == 0 {
-                continue;
-            }
-            let (rx, ry) = if rotate_ccw {
-                (sy as i32, (sw - 1 - sx) as i32)
-            } else {
-                (sx as i32, sy as i32)
-            };
-            let (px_, py_) = (dx + rx, dy + ry);
-            if px_ < 0 || py_ < 0 || px_ as u32 >= dw || py_ as u32 >= dh {
-                continue;
-            }
-            let di = ((py_ as u32 * dw + px_ as u32) * 4) as usize;
-            let inv = (255 - a) as u16;
-            for k in 0..3 {
-                d[di + k] = (s[si + k] as u16 + d[di + k] as u16 * inv / 255) as u8;
-            }
-            d[di + 3] = 255;
-        }
-    }
-}
-
-fn text_at(
-    pm: &mut Pixmap,
-    font: &FontRef<'static>,
-    x: f32,
-    top: f32,
-    px: f32,
-    text: &str,
-    c: Rgb,
-) {
-    if let Some(t) = text_pixmap(font, px, text, c) {
-        blit(pm, &t, x.round() as i32, top.round() as i32, false);
-    }
-}
-
-fn text_center(
-    pm: &mut Pixmap,
-    font: &FontRef<'static>,
-    cx: f32,
-    top: f32,
-    px: f32,
-    text: &str,
-    c: Rgb,
-) {
-    if let Some(t) = text_pixmap(font, px, text, c) {
-        blit(
-            pm,
-            &t,
-            (cx - t.width() as f32 / 2.0).round() as i32,
-            top.round() as i32,
-            false,
-        );
-    }
-}
-
-fn text_right(
-    pm: &mut Pixmap,
-    font: &FontRef<'static>,
-    right: f32,
-    cy: f32,
-    px: f32,
-    text: &str,
-    c: Rgb,
-) {
-    if let Some(t) = text_pixmap(font, px, text, c) {
-        let x = (right - t.width() as f32).round() as i32;
-        let y = (cy - t.height() as f32 / 2.0).round() as i32;
-        blit(pm, &t, x, y, false);
-    }
-}
-
-fn text_left_mid(
-    pm: &mut Pixmap,
-    font: &FontRef<'static>,
-    x: f32,
-    cy: f32,
-    px: f32,
-    text: &str,
-    c: Rgb,
-) {
-    if let Some(t) = text_pixmap(font, px, text, c) {
-        blit(
-            pm,
-            &t,
-            x.round() as i32,
-            (cy - t.height() as f32 / 2.0).round() as i32,
-            false,
-        );
-    }
-}
-
-fn text_vert(
-    pm: &mut Pixmap,
-    font: &FontRef<'static>,
-    left: f32,
-    cy: f32,
-    px: f32,
-    text: &str,
-    c: Rgb,
-) {
-    if let Some(t) = text_pixmap(font, px, text, c) {
-        // rotated box is t.height() wide x t.width() tall; center on cy.
-        let top = (cy - t.width() as f32 / 2.0).round() as i32;
-        blit(pm, &t, left.round() as i32, top, true);
-    }
-}
 
 fn render(
     panels: &[Panel],
@@ -765,7 +373,12 @@ fn render(
         .max(1.0);
 
     let mut pm = Pixmap::new(W, height).context("alloc pixmap")?;
-    pm.fill(Color::from_rgba8(BG.0, BG.1, BG.2, 255));
+    pm.fill(Color::from_rgba8(
+        bench_tools::viz::BG.0,
+        bench_tools::viz::BG.1,
+        bench_tools::viz::BG.2,
+        255,
+    ));
     text_at(&mut pm, &fonts.bold, 24.0, 8.0, 20.0, header, FG);
     if !suffix.is_empty() {
         text_at(&mut pm, &fonts.regular, 24.0, 30.0, 14.0, suffix, MUTED);
@@ -834,7 +447,7 @@ fn draw_panel(
             MUTED,
         );
     }
-    // axis spines (left + bottom), slightly heavier
+    // Axis spines
     stroke_poly(
         pm,
         &[(left, top), (left, bottom), (right, bottom)],
@@ -863,7 +476,7 @@ fn draw_panel(
         MUTED,
     );
 
-    // bands first (under every line)
+    // Bands below lines
     for s in &panel.series {
         if s.xs.len() < 2 {
             continue;
@@ -877,7 +490,7 @@ fn draw_panel(
         fill_poly(pm, &poly, s.style.color, 36);
     }
 
-    // median lines by ascending z (walrus rides on top)
+    // Higher z draws on top
     let mut ordered: Vec<&Series> = panel.series.iter().collect();
     ordered.sort_by_key(|s| s.style.z);
     for s in ordered {
@@ -903,8 +516,8 @@ fn draw_legend(pm: &mut Pixmap, series: &[Series], x: f32, y: f32, fonts: &Fonts
         .fold(0.0_f32, f32::max);
     let bw = pad + swatch + gap + tw + pad;
     let bh = pad * 2.0 + row * series.len() as f32;
-    fill_rect(pm, x, y, bw, bh, FLOAT, 255);
-    stroke_rect(pm, x, y, bw, bh, SEL, 1.0);
+    bench_tools::viz::fill_rect(pm, x, y, bw, bh, bench_tools::viz::FLOAT, 255);
+    bench_tools::viz::stroke_rect(pm, x, y, bw, bh, SEL, 1.0);
     for (i, s) in series.iter().enumerate() {
         let cy = y + pad + row * i as f32 + row / 2.0;
         let lx = x + pad;
@@ -924,17 +537,6 @@ fn draw_legend(pm: &mut Pixmap, series: &[Series], x: f32, y: f32, fonts: &Fonts
 // --------------------------------------------------------------------------
 // Summary + formatting
 // --------------------------------------------------------------------------
-fn fmt_num(v: f64) -> String {
-    if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        // %g-ish: trim trailing zeros from a 6-sig-figure rendering.
-        let s = format!("{v:.6}");
-        let s = s.trim_end_matches('0').trim_end_matches('.');
-        s.to_string()
-    }
-}
-
 fn summarize(run: &Run) -> Vec<(String, serde_json::Value)> {
     use serde_json::json;
     let collect = |get: &dyn Fn(&Sample) -> Option<f64>| -> Vec<f64> {
@@ -1155,7 +757,7 @@ fn main() -> Result<()> {
     w.flush()?;
 
     let rows: Vec<Vec<(String, serde_json::Value)>> = runs.iter().map(summarize).collect();
-    // CSV field order = first-seen union across rows.
+    // CSV field order follows first-seen union
     let mut fields: Vec<String> = Vec::new();
     for row in &rows {
         for (k, _) in row {
@@ -1178,7 +780,7 @@ fn main() -> Result<()> {
     }
     sw.flush()?;
 
-    // summary.json: BTreeMap-backed objects => keys sorted (matches sort_keys).
+    // BTreeMap keeps summary.json keys sorted
     let runs_json: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
@@ -1197,37 +799,4 @@ fn main() -> Result<()> {
         summary_csv.display()
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn variant_and_box() {
-        assert_eq!(variant_of("walrus-serial-b0"), "walrus-serial");
-        assert_eq!(box_of("walrus-serial-b0"), "0");
-        assert_eq!(variant_of("walrus-r1"), "walrus-r1"); // -r1 is not -b<N>
-        assert_eq!(box_of("walrus"), "0");
-        assert_eq!(variant_of("pgbackrest-b12"), "pgbackrest");
-        assert_eq!(box_of("pgbackrest-b12"), "12");
-    }
-
-    #[test]
-    fn median_odd_even() {
-        assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
-        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
-    }
-
-    #[test]
-    fn fmt_num_int_vs_float() {
-        assert_eq!(fmt_num(42.0), "42");
-        assert_eq!(fmt_num(2.5), "2.5");
-    }
-
-    #[test]
-    fn variant_order_walrus_first() {
-        let v = variants_ordered(&["walg-b0".into(), "walrus-b0".into(), "pgbackrest-b0".into()]);
-        assert_eq!(v[0], "walrus");
-    }
 }

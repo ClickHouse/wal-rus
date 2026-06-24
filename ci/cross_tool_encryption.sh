@@ -11,11 +11,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Exported so the archive_command + restore_command subprocesses inherit it too
 export WALG_LIBSODIUM_KEY='walrus_test_libsodium_key_32byte'
 
-cross_roundtrip "$WALRUS_BIN" "$WALG_BIN"
+cross_roundtrip "$WALRUS_BIN" "$WALG_BIN" "$PGDATA"
 echo "cross_tool_encryption forward OK"
 
 bucket_reset
-cross_roundtrip "$WALG_BIN" "$WALRUS_BIN"
+cross_roundtrip "$WALG_BIN" "$WALRUS_BIN" "$PGDATA"
 echo "cross_tool_encryption reverse OK"
 
 echo "cross_tool_encryption OK"

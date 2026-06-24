@@ -191,6 +191,8 @@ async fn collect_wal_keys(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
     use crate::pg::backup::{
         BackupSentinelDto, BackupSentinelDtoV2, format_backup_name, sentinel_key,
@@ -215,8 +217,8 @@ mod tests {
     async fn seed_backup(store: &DynStorage, name: &str, start_lsn: u64, finish_lsn: u64) {
         let v2 = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(start_lsn),
-                backup_finish_lsn: Some(finish_lsn),
+                backup_start_lsn: NonZeroU64::new(start_lsn),
+                backup_finish_lsn: NonZeroU64::new(finish_lsn),
                 pg_version: 160003,
                 ..Default::default()
             },

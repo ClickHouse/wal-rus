@@ -3,6 +3,7 @@
 //! covered. cargo-llvm-cov merges coverage from spawned instrumented children
 //! via LLVM_PROFILE_FILE.
 
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::process::Command;
 
@@ -26,8 +27,8 @@ const BACKUP: &str = "base_000000010000000000000002";
 fn seed_store(dir: &Path) {
     let sentinel = BackupSentinelDtoV2 {
         sentinel: BackupSentinelDto {
-            backup_start_lsn: Some(0x0200_0000),
-            backup_finish_lsn: Some(0x0200_1000),
+            backup_start_lsn: NonZeroU64::new(0x0200_0000),
+            backup_finish_lsn: NonZeroU64::new(0x0200_1000),
             pg_version: 160003,
             uncompressed_size: 2048,
             compressed_size: 1024,

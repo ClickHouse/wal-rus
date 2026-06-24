@@ -14,7 +14,8 @@
 //! `Archive` / `Builder`; per-part output flows over an mpsc of `Bytes` that
 //! the caller reads as an `AsyncRead` (see `ChannelReader`)
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +73,13 @@ pub struct DeltaContext {
     /// Paths present in the increment-base backup. Files absent here are new
     /// since the parent and must ship in full, not as increments
     pub parent_files: Arc<HashSet<String>>,
+    /// Parent backup's start LSN, for the page-LSN final-state filter. `Some`
+    /// only on the filesystem push path, which has random page access to read
+    /// each candidate block's on-disk page header; the WAL/summary candidate
+    /// set is trimmed to blocks whose page changed at/after this LSN (wal-g's
+    /// selectivity). `None` on the BASE_BACKUP stream path (no random access),
+    /// leaving the candidate set unfiltered
+    pub parent_start_lsn: Option<NonZeroU64>,
 }
 
 impl Default for StreamerOpts {
@@ -339,34 +347,103 @@ pub(crate) fn classify_for_delta(
     // Filter to blocks that actually exist in the current file. Blocks past
     // entry_size/BLCKSZ would underflow the wi1/native reader on apply
     let file_blocks = (entry_size / PG_PAGE_SIZE) as u32;
-    let filtered: BTreeSet<u32> = match lookup {
-        Some(s) => s.into_iter().filter(|b| *b < file_blocks).collect(),
+    let blocks_vec: Vec<u32> = match lookup {
+        Some(s) => s.into_iter().take_while(|b| *b < file_blocks).collect(),
         None => return DeltaClass::Skip,
     };
-    if filtered.is_empty() {
+    increment_class_for_blocks(ctx.format, entry_size, blocks_vec)
+}
+
+/// Encode the increment class for a final block set (already filtered to the
+/// file's range, ascending). Empty → `Skip`; a header-encoding failure degrades
+/// to `Passthrough` (ship full), matching `classify_for_delta`. Split out so the
+/// fs push path can rebuild the class after the page-LSN filter trims blocks
+pub(crate) fn increment_class_for_blocks(
+    format: IncrementFormat,
+    entry_size: u64,
+    blocks: Vec<u32>,
+) -> DeltaClass {
+    if blocks.is_empty() {
         return DeltaClass::Skip;
     }
-    let blocks_vec: Vec<u32> = filtered.into_iter().collect();
     let mut header_bytes = Vec::new();
-    match ctx.format {
+    match format {
         IncrementFormat::Wi1 => {
-            if write_increment_header(&mut header_bytes, entry_size, &blocks_vec).is_err() {
+            if write_increment_header(&mut header_bytes, entry_size, &blocks).is_err() {
                 return DeltaClass::Passthrough;
             }
         }
         IncrementFormat::Native => {
-            let trunc = file_blocks;
-            if write_native_increment_header(&mut header_bytes, trunc, &blocks_vec).is_err() {
+            let trunc = (entry_size / PG_PAGE_SIZE) as u32;
+            if write_native_increment_header(&mut header_bytes, trunc, &blocks).is_err() {
                 return DeltaClass::Passthrough;
             }
         }
     }
-    let total_size = header_bytes.len() as u64 + (blocks_vec.len() as u64) * PG_PAGE_SIZE;
+    let total_size = header_bytes.len() as u64 + (blocks.len() as u64) * PG_PAGE_SIZE;
     DeltaClass::Increment {
         header_bytes,
-        blocks: blocks_vec,
+        blocks,
         total_size,
     }
+}
+
+// ─── PG page header (page-LSN final-state filter) ───────────────────────────
+
+/// Bytes of the postgres page header consulted by the page-LSN filter. `pd_lsn`
+/// occupies the first 8 (`xlogid` high u32, `xrecoff` low u32, native-endian);
+/// validity checks reach through `pd_pagesize_version` at offset 18
+pub(crate) const PG_PAGE_HEADER_SIZE: usize = 24;
+
+/// wal-g `postgres_page_header.go` constants
+const PAGE_VALID_FLAGS: u16 = 7;
+const PAGE_LAYOUT_VERSION: u16 = 5;
+
+fn page_lsn(h: &[u8]) -> u64 {
+    let hi = u32::from_le_bytes(h[0..4].try_into().unwrap()) as u64;
+    let lo = u32::from_le_bytes(h[4..8].try_into().unwrap()) as u64;
+    (hi << 32) | lo
+}
+
+/// `PageIsNew`: `pd_upper == 0` (offset 14). A vacuumed/never-initialised page
+fn page_is_new(h: &[u8]) -> bool {
+    u16::from_le_bytes(h[14..16].try_into().unwrap()) == 0
+}
+
+/// Mirrors wal-g `PageHeader.isValid`: flag/offset sanity plus a non-zero LSN
+/// and a `BLCKSZ`-matching size/version. A page failing this is torn or not a
+/// standard heap page, so its LSN can't be trusted for the filter
+fn page_is_valid(h: &[u8]) -> bool {
+    let pd_flags = u16::from_le_bytes(h[10..12].try_into().unwrap());
+    let pd_lower = u16::from_le_bytes(h[12..14].try_into().unwrap());
+    let pd_upper = u16::from_le_bytes(h[14..16].try_into().unwrap());
+    let pd_special = u16::from_le_bytes(h[16..18].try_into().unwrap());
+    let pd_pagesize_version = u16::from_le_bytes(h[18..20].try_into().unwrap());
+    (pd_flags & PAGE_VALID_FLAGS) == pd_flags
+        && pd_lower >= PG_PAGE_HEADER_SIZE as u16
+        && pd_lower <= pd_upper
+        && pd_upper <= pd_special
+        && pd_special as u64 <= PG_PAGE_SIZE
+        && page_lsn(h) != 0
+        && (pd_pagesize_version & 0xFF00) as u64 == PG_PAGE_SIZE
+        && (pd_pagesize_version & 0x00FF) <= PAGE_LAYOUT_VERSION
+}
+
+/// Should a candidate block stay in the increment, given its on-disk page header
+/// and the parent backup's start LSN? Mirrors wal-g `SelectNewValidPage`: keep a
+/// new/empty page, keep an unparseable/torn page, and keep any page whose LSN is
+/// at/after the parent (changed since). Drop only a valid, non-new page settled
+/// strictly below the parent — that block is byte-identical to the parent's copy,
+/// so the WAL-derived candidate set over-counted it. Never drops a block that
+/// might have changed, so the increment stays correct
+pub(crate) fn page_changed_since(header: &[u8], parent_start_lsn: u64) -> bool {
+    if header.len() < PG_PAGE_HEADER_SIZE {
+        return true;
+    }
+    if page_is_new(header) || !page_is_valid(header) {
+        return true;
+    }
+    page_lsn(header) >= parent_start_lsn
 }
 
 /// `AsyncRead` impl that emits a pre-encoded increment header followed by the
@@ -918,6 +995,44 @@ mod tests {
         assert!(res.files.contains_key(real_path), "{:?}", res.files);
     }
 
+    // ─── page-LSN final-state filter ────────────────────────────────────────
+
+    /// Valid 24-byte heap page header carrying `lsn` (pd_upper non-zero ⇒ not
+    /// new, size/version/offsets all in range so `page_is_valid` holds)
+    fn page_header(lsn: u64) -> [u8; PG_PAGE_HEADER_SIZE] {
+        let mut h = [0u8; PG_PAGE_HEADER_SIZE];
+        h[0..4].copy_from_slice(&((lsn >> 32) as u32).to_le_bytes()); // pd_lsn high
+        h[4..8].copy_from_slice(&(lsn as u32).to_le_bytes()); // pd_lsn low
+        h[10..12].copy_from_slice(&0u16.to_le_bytes()); // pd_flags
+        h[12..14].copy_from_slice(&(PG_PAGE_HEADER_SIZE as u16).to_le_bytes()); // pd_lower
+        h[14..16].copy_from_slice(&(PG_PAGE_SIZE as u16).to_le_bytes()); // pd_upper
+        h[16..18].copy_from_slice(&(PG_PAGE_SIZE as u16).to_le_bytes()); // pd_special
+        h[18..20].copy_from_slice(&(0x2000u16 | 4).to_le_bytes()); // BLCKSZ | layout v4
+        h
+    }
+
+    #[test]
+    fn page_filter_keeps_changed_and_drops_settled() {
+        let parent = 200u64;
+        // settled strictly below parent → identical to parent's copy → drop
+        assert!(!page_changed_since(&page_header(100), parent));
+        // changed at/after parent → keep
+        assert!(page_changed_since(&page_header(200), parent));
+        assert!(page_changed_since(&page_header(300), parent));
+    }
+
+    #[test]
+    fn page_filter_keeps_new_invalid_and_short() {
+        // all-zero (vacuumed/new) page: pd_upper == 0 ⇒ kept despite lsn 0
+        assert!(page_changed_since(&[0u8; PG_PAGE_HEADER_SIZE], 200));
+        // non-new but invalid (bad size/version) ⇒ lsn untrustworthy ⇒ kept
+        let mut bad = page_header(50);
+        bad[18..20].copy_from_slice(&0u16.to_le_bytes()); // wipe pd_pagesize_version
+        assert!(page_changed_since(&bad, 200));
+        // truncated header ⇒ kept
+        assert!(page_changed_since(&[0u8; 8], 200));
+    }
+
     // ─── delta mode ─────────────────────────────────────────────────────────
 
     /// Parent-backup file set for delta tests: the paths the increment base
@@ -961,6 +1076,7 @@ mod tests {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
                     parent_files: parent_set(&[rel_path]),
+                    parent_start_lsn: None,
                 }),
                 ..Default::default()
             },
@@ -1014,6 +1130,7 @@ mod tests {
                     map: Arc::new(map),
                     format: IncrementFormat::Native,
                     parent_files: parent_set(&[rel_path]),
+                    parent_start_lsn: None,
                 }),
                 ..Default::default()
             },
@@ -1061,6 +1178,7 @@ mod tests {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
                     parent_files: parent_set(&[rel_path]),
+                    parent_start_lsn: None,
                 }),
                 ..Default::default()
             },
@@ -1103,6 +1221,7 @@ mod tests {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
                     parent_files: parent_set(&[rel_path]),
+                    parent_start_lsn: None,
                 }),
                 ..Default::default()
             },
@@ -1145,6 +1264,7 @@ mod tests {
                     format: IncrementFormat::Wi1,
                     // parent did NOT contain this file
                     parent_files: parent_set(&["base/16384/99999"]),
+                    parent_start_lsn: None,
                 }),
                 ..Default::default()
             },
@@ -1188,6 +1308,7 @@ mod tests {
                     map: Arc::new(map),
                     format: IncrementFormat::Wi1,
                     parent_files: parent_set(&[rel_path]),
+                    parent_start_lsn: None,
                 }),
                 ..Default::default()
             },

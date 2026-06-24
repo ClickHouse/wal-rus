@@ -22,9 +22,11 @@
 //! RelFileNode. Block numbers in the delta map are global (segment id ×
 //! `BLOCKS_IN_REL_FILE` + intra-segment offset)
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use roaring::RoaringBitmap;
@@ -32,16 +34,20 @@ use thiserror::Error;
 use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
+use crate::concurrency::BoundedTasks;
 use crate::pg::backup::fetch::fetch_sentinel;
 use crate::pg::backup::wal_delta::{
     WAL_FILES_IN_DELTA, delta_group_name, delta_group_no, delta_storage_key, seg_name_from_global,
 };
-use crate::pg::backup::{BackupSentinelDtoV2, increment, name_from_sentinel_key};
+use crate::pg::backup::{BackupSentinelDtoV2, format_pg_lsn, increment, name_from_sentinel_key};
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::walparser::{
-    BlockLocation, ParsePageError, RelFileNode, WalParser, extract_locations_from_wal_file,
+    BlockLocation, ParsePageError, RelFileNode, SegmentBoundary, WalParser,
+    extract_block_locations, extract_locations_from_wal_file, parse_record_from_bytes,
+    walk_segment_locations,
 };
-use crate::storage::DynStorage;
+use crate::retry::{RetryPolicy, with_retry};
+use crate::storage::{DynStorage, StorageError};
 
 pub const PG_PAGE_SIZE: u64 = 8192;
 /// PG's per-file size cap before splitting into `<rel>.<n>` segments
@@ -100,11 +106,19 @@ impl PagedFileDeltaMap {
         }
     }
 
-    /// Return the bitmap of changed blocks for a paged-file path. Returns
+    /// Per-rel set union of another map. Disjoint LSN sub-ranges of one delta
+    /// (eg summaries + a raw-walked gap) compose by changed-block union
+    pub fn merge(&mut self, other: PagedFileDeltaMap) {
+        for (rel, blocks) in other.by_rel {
+            *self.by_rel.entry(rel).or_default() |= blocks;
+        }
+    }
+
+    /// Return the changed blocks for a paged-file path, ascending. Returns
     /// `None` if the rel isn't in the map (file unchanged).
     /// Blocks are returned in *segment-relative* offsets (0..BLOCKS_IN_REL_FILE)
     /// for the segment id derived from the trailing `.<n>` of `path`
-    pub fn blocks_for(&self, path: &str) -> Result<Option<BTreeSet<u32>>, DeltaError> {
+    pub fn blocks_for(&self, path: &str) -> Result<Option<Vec<u32>>, DeltaError> {
         let rel = get_rel_file_node_from(path)?;
         let Some(blocks) = self.by_rel.get(&rel) else {
             return Ok(None);
@@ -112,7 +126,7 @@ impl PagedFileDeltaMap {
         let seg_id = get_rel_file_id_from(path)?;
         let lo = seg_id as u32 * BLOCKS_IN_REL_FILE;
         let hi = lo.saturating_add(BLOCKS_IN_REL_FILE);
-        let shifted: BTreeSet<u32> = blocks.range(lo..hi).map(|b| b - lo).collect();
+        let shifted: Vec<u32> = blocks.range(lo..hi).map(|b| b - lo).collect();
         Ok(Some(shifted))
     }
 
@@ -342,9 +356,14 @@ pub async fn configure_delta_parent(
         start_lsn: effective_v2
             .sentinel
             .backup_start_lsn
-            .ok_or_else(|| anyhow!("parent BackupStartLSN missing after revalidation"))?,
+            .ok_or_else(|| anyhow!("parent BackupStartLSN missing after revalidation"))?
+            .get(),
         timeline,
-        finish_lsn: effective_v2.sentinel.backup_finish_lsn.unwrap_or(start_lsn),
+        finish_lsn: effective_v2
+            .sentinel
+            .backup_finish_lsn
+            .unwrap_or(start_lsn)
+            .get(),
         increment_full_name: effective_v2
             .sentinel
             .increment_full_name
@@ -465,9 +484,15 @@ async fn find_by_user_data(
 /// groups (O(touched relations)) and parses only the trailing partial group's
 /// raw WAL. Mirrors wal-g `getDeltaMap`.
 ///
-/// Falls back to a full raw-WAL walk if any sidecar is missing — wal-g hard
-/// errors here, but the fallback keeps buckets archived without
-/// `WALG_USE_WAL_DELTA` working unchanged
+/// A missing sidecar for a complete group is raw-walked in place (one group's
+/// reparse); only an unreadable sidecar or raw-walk failure falls back to a full
+/// raw-WAL walk of the range — wal-g hard errors here, but the fallback keeps
+/// buckets archived without `WALG_USE_WAL_DELTA` working unchanged
+///
+/// `wal_dir` is the local `pg_wal` when the push reads a local data dir; raw
+/// segments are served from there (uncompressed, no S3 round-trip), falling
+/// back to the archive only for segments PG has already recycled. `None` for a
+/// remote replication source, which has no local WAL
 pub async fn build_delta_map_from_wal(
     settings: &crate::config::Settings,
     storage: &DynStorage,
@@ -475,6 +500,7 @@ pub async fn build_delta_map_from_wal(
     start_lsn: u64,
     end_lsn: u64,
     compression: compression::Method,
+    wal_dir: Option<&Path>,
 ) -> Result<PagedFileDeltaMap> {
     if end_lsn <= start_lsn {
         return Ok(PagedFileDeltaMap::new());
@@ -486,6 +512,7 @@ pub async fn build_delta_map_from_wal(
         start_lsn,
         end_lsn,
         compression,
+        wal_dir,
     )
     .await
     {
@@ -493,7 +520,9 @@ pub async fn build_delta_map_from_wal(
         Err(e) => {
             tracing::warn!(
                 target = "backup_push",
-                "delta sidecars unusable ({e:#}); re-parsing raw WAL [{start_lsn:X}, {end_lsn:X})",
+                "delta sidecars unusable ({e:#}); re-parsing raw WAL [{}, {})",
+                format_pg_lsn(start_lsn),
+                format_pg_lsn(end_lsn),
             );
             build_delta_map_from_wal_full(
                 settings,
@@ -502,16 +531,33 @@ pub async fn build_delta_map_from_wal(
                 start_lsn,
                 end_lsn,
                 compression,
+                wal_dir,
             )
             .await
         }
     }
 }
 
-/// Sidecar-driven build: delta files for whole groups + a raw-WAL walk of the
-/// final partial group, seeded from the last sidecar's parser state so records
-/// crossing the group boundary stitch correctly. Any missing sidecar errors so
-/// the caller can fall back
+/// Sidecar-driven build: a raw-WAL walk of the leading partial group, delta
+/// files for the whole groups between, and a raw-WAL walk of the trailing
+/// partial group. One `WalParser` threads across every group so a sidecar-less
+/// group's raw walk stitches its leading boundary record from the prior group's
+/// trailing head; a fold adopts the sidecar's own saved parser, authoritative
+/// whichever path produced the previous group.
+///
+/// A complete group whose sidecar is absent is raw-walked rather than erroring
+/// the whole range. The archiver can't finalize a group whose preceding segment
+/// it never recorded (no prev_head to seed) — the first complete group after a
+/// recording start that lands on a group boundary — so that one object is
+/// legitimately missing; walking it raw costs one group's reparse instead of a
+/// full-range fallback. Other errors (corrupt/undecodable sidecar) still
+/// propagate so the caller falls back to the full walk.
+///
+/// `start_lsn` lands mid-group, so its group's sidecar would cover pre-`start_lsn`
+/// segments the parent full never archived (the group never finalized, so no
+/// object exists). First usable sidecar is the next group-aligned boundary; the
+/// leading partial is walked raw, mirroring wal-g `getDeltaMap` which uses a
+/// delta file only for a segment beginning a complete in-range group
 async fn build_delta_map_from_sidecars(
     settings: &crate::config::Settings,
     storage: &DynStorage,
@@ -519,44 +565,90 @@ async fn build_delta_map_from_sidecars(
     start_lsn: u64,
     end_lsn: u64,
     compression: compression::Method,
+    wal_dir: Option<&Path>,
 ) -> Result<PagedFileDeltaMap> {
     let seg_size = wal_segment_size();
     let n = WAL_FILES_IN_DELTA;
-    let first_used_delta = delta_group_no(lsn_to_seg(start_lsn, seg_size));
+    let start_seg = lsn_to_seg(start_lsn, seg_size);
     let first_not_used_delta = delta_group_no(lsn_to_seg(end_lsn, seg_size));
     if first_not_used_delta < n {
-        anyhow::bail!("range [{start_lsn:X}, {end_lsn:X}) has no complete delta group ahead of it");
+        anyhow::bail!(
+            "range [{}, {}) has no complete delta group ahead of it",
+            format_pg_lsn(start_lsn),
+            format_pg_lsn(end_lsn)
+        );
     }
     let last_complete_group = first_not_used_delta - n;
 
+    // First group-aligned boundary at/after start_seg; leading partial walked raw
+    let lead_group = delta_group_no(start_seg);
+    let first_complete = if start_seg == lead_group {
+        lead_group
+    } else {
+        lead_group + n
+    };
+    if first_complete > last_complete_group {
+        anyhow::bail!(
+            "range [{}, {}) spans no complete delta group",
+            format_pg_lsn(start_lsn),
+            format_pg_lsn(end_lsn)
+        );
+    }
+
+    let ctx = WalWalkCtx {
+        settings,
+        storage,
+        timeline,
+        seg_size,
+        compression,
+        wal_dir,
+    };
     let mut delta = PagedFileDeltaMap::new();
-    // Complete groups strictly before the last
-    let mut g = first_used_delta;
-    while g < last_complete_group {
+    // Threaded across every group: a sidecar-less group's raw walk stitches its
+    // leading boundary record from the prior group's trailing head; a fold
+    // replaces it with the sidecar's self-contained saved parser
+    let mut parser = WalParser::new();
+
+    // Leading partial group: raw WAL from start_seg to the first aligned group.
+    // Records attribute by start position, so this and the first sidecar partition
+    // cleanly
+    if start_seg < first_complete {
+        walk_segments_pipelined(&ctx, start_seg, first_complete - 1, &mut parser, &mut delta)
+            .await?;
+    }
+
+    // Every complete group: fold its sidecar when present, else raw-walk the
+    // group (the archiver leaves no sidecar for a group it started recording on a
+    // boundary, with no preceding segment to seed prev_head)
+    let mut g = first_complete;
+    while g <= last_complete_group {
         let name = delta_group_name(timeline, g, seg_size);
-        delta = fold_sidecar_into_map(settings, storage, &name, compression, delta)
+        let key = delta_storage_key(&name, compression);
+        if storage
+            .exists(&key)
             .await
-            .with_context(|| format!("delta sidecar {name}"))?
-            .0;
+            .with_context(|| format!("stat {key}"))?
+        {
+            let (d, p) = fold_sidecar_into_map(settings, storage, &name, compression, delta)
+                .await
+                .with_context(|| format!("delta sidecar {name}"))?;
+            delta = d;
+            parser = p;
+        } else {
+            tracing::info!(
+                target = "backup_push",
+                "delta sidecar {name} absent; raw-walking group"
+            );
+            walk_segments_pipelined(&ctx, g, g + n - 1, &mut parser, &mut delta).await?;
+        }
         g += n;
     }
-    // Last complete group: its locations + parser seed for the tail walk
-    let last_name = delta_group_name(timeline, last_complete_group, seg_size);
-    let (d, mut parser) = fold_sidecar_into_map(settings, storage, &last_name, compression, delta)
-        .await
-        .with_context(|| format!("delta sidecar {last_name}"))?;
-    delta = d;
 
-    // Trailing partial group: raw WAL from the group start up to end_lsn
+    // Trailing partial group: raw WAL from the group start up to end_lsn, seeded
+    // from the last complete group's trailing head
     let tail_first = first_not_used_delta;
     let tail_last = lsn_to_seg(end_lsn.saturating_sub(1), seg_size);
-    for s in tail_first..=tail_last {
-        let name = seg_name_from_global(timeline, s, seg_size).format();
-        let locations = fetch_and_parse_segment(settings, storage, &name, compression, &mut parser)
-            .await
-            .with_context(|| format!("tail wal segment {name}"))?;
-        delta.add_locations(locations);
-    }
+    walk_segments_pipelined(&ctx, tail_first, tail_last, &mut parser, &mut delta).await?;
     Ok(delta)
 }
 
@@ -585,7 +677,10 @@ async fn fold_sidecar_into_map(
 }
 
 /// Sync side of [`fold_sidecar_into_map`]: read tuples until the all-zero
-/// terminator (or EOF), then the parser state
+/// terminator, then the parser state. EOF before the terminator means a
+/// truncated sidecar (interrupted upload/finalization) — error rather than
+/// accept a partial map and a bogus empty parser, so the caller falls back to
+/// a complete raw-WAL walk
 fn fold_sidecar_stream(
     decoded: compression::AsyncReader,
     mut map: PagedFileDeltaMap,
@@ -596,7 +691,7 @@ fn fold_sidecar_stream(
         match r.read_exact(&mut buf) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Ok((map, WalParser::new()));
+                anyhow::bail!("sidecar truncated: EOF before terminal tuple")
             }
             Err(e) => return Err(anyhow::Error::from(e).context("read sidecar tuple")),
         }
@@ -615,7 +710,16 @@ fn fold_sidecar_stream(
 }
 
 /// Full raw-WAL walk of `[start_lsn, end_lsn)`: parse every segment. Fallback
-/// when sidecars are absent; O(WAL volume). Bad segments are skipped (logged)
+/// when sidecars are absent; O(WAL volume). A missing or corrupt segment errors:
+/// the whole range is required WAL, so the caller takes a full backup rather than
+/// recording a delta that silently omits the skipped segment's pages
+///
+/// Each segment parses independently with a fresh parser, fanned across cores,
+/// so the changed-block walk scales past the single-thread CPU bound the serial
+/// walk hit. Records crossing a segment boundary are stitched from the saved
+/// head/tail fragments. Degrades to the serial threaded walk when a record
+/// spans more than one segment (longer than a segment), which the per-segment
+/// model can't represent
 async fn build_delta_map_from_wal_full(
     settings: &crate::config::Settings,
     storage: &DynStorage,
@@ -623,75 +727,317 @@ async fn build_delta_map_from_wal_full(
     start_lsn: u64,
     end_lsn: u64,
     compression: compression::Method,
+    wal_dir: Option<&Path>,
 ) -> Result<PagedFileDeltaMap> {
     let seg_size = wal_segment_size();
-    let mut delta = PagedFileDeltaMap::new();
-    let mut parser = WalParser::new();
     if end_lsn <= start_lsn {
-        return Ok(delta);
+        return Ok(PagedFileDeltaMap::new());
     }
     let first_seg = lsn_to_seg(start_lsn, seg_size);
     let last_seg = lsn_to_seg(end_lsn.saturating_sub(1), seg_size);
-    for seg in first_seg..=last_seg {
-        let name = seg_name_from_global(timeline, seg, seg_size).format();
-        let locations =
-            match fetch_and_parse_segment(settings, storage, &name, compression, &mut parser).await
-            {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(target = "backup_push", "segment {name}: {e:#}; skipping");
-                    continue;
-                }
-            };
-        delta.add_locations(locations);
+    let ctx = WalWalkCtx {
+        settings,
+        storage,
+        timeline,
+        seg_size,
+        compression,
+        wal_dir,
+    };
+    if let Some(delta) = parse_segments_parallel(&ctx, first_seg, last_seg).await? {
+        return Ok(delta);
     }
+    tracing::warn!(
+        target = "backup_push",
+        "parallel reparse hit a record spanning >1 segment; serial walk [{first_seg}, {last_seg}]",
+    );
+    let mut delta = PagedFileDeltaMap::new();
+    let mut parser = WalParser::new();
+    walk_segments_pipelined(&ctx, first_seg, last_seg, &mut parser, &mut delta).await?;
     Ok(delta)
+}
+
+/// Shared, `'static` slice of [`WalWalkCtx`] for the spawned fetch+parse tasks
+struct SegFetch {
+    settings: crate::config::Settings,
+    storage: DynStorage,
+    timeline: u32,
+    seg_size: u64,
+    compression: compression::Method,
+    wal_dir: Option<PathBuf>,
+}
+
+/// One segment's parse result, tagged by its offset from `first_seg` so the
+/// completion handler can place fragments in segment order for boundary stitch
+struct SegOut {
+    rel: usize,
+    result: Result<(Vec<BlockLocation>, SegmentBoundary)>,
+}
+
+/// Parse `[first_seg, last_seg]` raw WAL concurrently: fetch + parse each
+/// segment independently on a bounded fan-out, union the per-segment changed
+/// blocks, then stitch the record crossing each segment boundary back together
+/// from the saved head/tail fragments.
+///
+/// Returns `Ok(None)` when the range holds a record spanning more than one
+/// segment boundary — the per-segment model can't reconstruct it, so the caller
+/// re-runs the threaded serial walk. A missing or corrupt segment is a hard
+/// error: every segment in the range is required WAL, so skipping one would drop
+/// its changed pages from the increment and silently restore stale parent data
+async fn parse_segments_parallel(
+    ctx: &WalWalkCtx<'_>,
+    first_seg: u64,
+    last_seg: u64,
+) -> Result<Option<PagedFileDeltaMap>> {
+    let count = (last_seg - first_seg + 1) as usize;
+    let fetch = Arc::new(SegFetch {
+        settings: ctx.settings.clone(),
+        storage: ctx.storage.clone(),
+        timeline: ctx.timeline,
+        seg_size: ctx.seg_size,
+        compression: ctx.compression,
+        wal_dir: ctx.wal_dir.map(Path::to_path_buf),
+    });
+
+    let mut delta = PagedFileDeltaMap::new();
+    let mut fragments: Vec<Option<SegmentBoundary>> = (0..count).map(|_| None).collect();
+
+    let concurrency = ctx.settings.download_concurrency + 1;
+    {
+        let delta = &mut delta;
+        let fragments = &mut fragments;
+        let timeline = ctx.timeline;
+        let seg_size = ctx.seg_size;
+        let mut tasks = BoundedTasks::new(concurrency, "wal-parse", move |out: SegOut| {
+            let rel = out.rel;
+            let (locs, boundary) = out.result.with_context(|| {
+                let name = seg_name_from_global(timeline, first_seg + rel as u64, seg_size);
+                format!("wal segment {}", name.format())
+            })?;
+            delta.add_locations(locs);
+            fragments[rel] = Some(boundary);
+            Ok(())
+        });
+        for seg in first_seg..=last_seg {
+            let fetch = fetch.clone();
+            let rel = (seg - first_seg) as usize;
+            tasks
+                .spawn(async move {
+                    let result = fetch_and_walk_segment(&fetch, seg).await;
+                    SegOut { rel, result }
+                })
+                .await?;
+        }
+        tasks.join().await?;
+    }
+
+    // A fragment ending mid-record but not at a record start means a record
+    // spans more than this segment + the next — pairwise stitching can't
+    // recover it. Bail to the threaded serial walk
+    if fragments
+        .iter()
+        .flatten()
+        .any(|f| !f.trailing_is_record_start && !f.trailing_head.is_empty())
+    {
+        return Ok(None);
+    }
+
+    // Stitch each boundary record: head of segment i + leading tail of i+1.
+    // Every fragment is present: a fetch/parse error aborts join() above, so a
+    // None here is an internal invariant break, not a recoverable gap
+    for rel in 0..count.saturating_sub(1) {
+        let (Some(head), Some(tail)) = (&fragments[rel], &fragments[rel + 1]) else {
+            anyhow::bail!("missing parsed WAL fragment at offset {rel} after successful walk");
+        };
+        if head.trailing_head.is_empty() {
+            continue; // record ended exactly at the boundary
+        }
+        let mut data = Vec::with_capacity(head.trailing_head.len() + tail.leading_tail.len());
+        data.extend_from_slice(&head.trailing_head);
+        data.extend_from_slice(&tail.leading_tail);
+        match parse_record_from_bytes(&data, head.page_magic) {
+            Ok(rec) => delta.add_locations(extract_block_locations(std::slice::from_ref(&rec))),
+            Err(e) => {
+                let name = seg_name_from_global(ctx.timeline, first_seg + rel as u64, ctx.seg_size)
+                    .format();
+                tracing::warn!(
+                    target = "backup_push",
+                    "boundary record after segment {name} unparseable ({e}); serial walk",
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(delta))
+}
+
+/// Fetch one segment and parse it with a fresh per-segment parser on the
+/// blocking pool, returning its in-segment block locations + boundary fragments
+async fn fetch_and_walk_segment(
+    fetch: &SegFetch,
+    seg: u64,
+) -> Result<(Vec<BlockLocation>, SegmentBoundary)> {
+    let name = seg_name_from_global(fetch.timeline, seg, fetch.seg_size).format();
+    let buf = fetch_segment(
+        &fetch.settings,
+        &fetch.storage,
+        fetch.compression,
+        fetch.wal_dir.as_deref(),
+        &name,
+    )
+    .await?;
+    tokio::task::spawn_blocking(move || {
+        let mut locs = Vec::new();
+        let boundary = walk_segment_locations(&buf, |l| locs.push(l))
+            .with_context(|| format!("parse segment {name}"))?;
+        Ok((locs, boundary))
+    })
+    .await
+    .context("join segment parse")?
 }
 
 fn lsn_to_seg(lsn: u64, seg_size: u64) -> u64 {
     lsn / seg_size
 }
 
-async fn fetch_and_parse_segment(
+/// Per-walk invariants shared across every segment of a raw-WAL walk
+struct WalWalkCtx<'a> {
+    settings: &'a crate::config::Settings,
+    storage: &'a DynStorage,
+    timeline: u32,
+    seg_size: u64,
+    compression: compression::Method,
+    /// Local `pg_wal` to read raw segments from before falling back to the
+    /// archive; `None` when the push has no local data dir
+    wal_dir: Option<&'a Path>,
+}
+
+/// Walk raw WAL segments `[first_seg, last_seg]` into `delta`, prefetching the
+/// next segment's bytes while parsing the current one (download+decode overlaps
+/// the CPU-bound parse). Parsing stays serial: WAL records span segment
+/// boundaries, so `parser` state threads across iterations. A missing or corrupt
+/// segment is a hard error: every segment in the range is required WAL, so
+/// skipping one would silently drop its changed pages from the increment
+async fn walk_segments_pipelined(
+    ctx: &WalWalkCtx<'_>,
+    first_seg: u64,
+    last_seg: u64,
+    parser: &mut WalParser,
+    delta: &mut PagedFileDeltaMap,
+) -> Result<()> {
+    if first_seg > last_seg {
+        return Ok(());
+    }
+    let name = |s: u64| seg_name_from_global(ctx.timeline, s, ctx.seg_size).format();
+
+    // Prime the pipeline, then carry each prefetch into the next iteration; the
+    // prefetch yields None past the last segment, ending the loop
+    let mut pending = Some(
+        fetch_segment(
+            ctx.settings,
+            ctx.storage,
+            ctx.compression,
+            ctx.wal_dir,
+            &name(first_seg),
+        )
+        .await,
+    );
+    let mut seg = first_seg;
+    while let Some(fetched) = pending.take() {
+        let cur = name(seg);
+        let buf = fetched.with_context(|| format!("wal segment {cur}"))?;
+        // Parse current segment on the blocking pool while the next prefetches.
+        // Parser is moved in and returned via the join handle so cross-segment
+        // record-stitching state survives
+        let parser_in = std::mem::take(parser);
+        let parse_handle = tokio::task::spawn_blocking(move || {
+            let mut parser_in = parser_in;
+            let res = extract_locations_from_wal_file(&mut parser_in, io::Cursor::new(buf));
+            (parser_in, res)
+        });
+
+        let (joined, next) = tokio::join!(parse_handle, async {
+            if seg < last_seg {
+                Some(
+                    fetch_segment(
+                        ctx.settings,
+                        ctx.storage,
+                        ctx.compression,
+                        ctx.wal_dir,
+                        &name(seg + 1),
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        });
+
+        let (parser_out, locs) = joined.context("join segment walk")?;
+        *parser = parser_out;
+        delta.add_locations(locs.with_context(|| format!("parse segment {cur}"))?);
+
+        pending = next;
+        seg += 1;
+    }
+    Ok(())
+}
+
+/// Read one WAL segment fully into memory so the next segment can prefetch while
+/// this one parses. Bounded at ~2 × seg_size in flight.
+/// Bounded wait for the archiver to ship a just-switched-out WAL segment.
+/// full-jitter, ~11s worst case (sum of capped backoffs over 10 attempts)
+const WAL_ARCHIVE_WAIT: RetryPolicy = RetryPolicy {
+    max_attempts: 10,
+    base_delay: Duration::from_millis(100),
+    max_delay: Duration::from_secs(2),
+    jitter: true,
+};
+
+async fn fetch_segment(
     settings: &crate::config::Settings,
     storage: &DynStorage,
-    name: &str,
     compression: compression::Method,
-    parser: &mut WalParser,
-) -> Result<Vec<BlockLocation>> {
+    wal_dir: Option<&Path>,
+    name: &str,
+) -> Result<Vec<u8>> {
+    if let Some(dir) = wal_dir {
+        match tokio::fs::read(dir.join(name)).await {
+            Ok(buf) => return Ok(buf),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("read local wal segment {name}")),
+        }
+    }
     let ext = compression.extension();
     let key = if ext.is_empty() {
         format!("{}/{}", crate::pg::WAL_FOLDER, name)
     } else {
         format!("{}/{}.{}", crate::pg::WAL_FOLDER, name, ext)
     };
-    let r = storage
-        .get(&key)
-        .await
-        .with_context(|| format!("get {key}"))?;
-    let decrypted = settings.decrypt(r);
-    let decoded = compression::decode(compression, decrypted);
-
-    // Bridge the async reader to sync inside spawn_blocking so
-    // extract_locations_from_wal_file streams page-by-page rather than
-    // materialising the 16 MiB segment in a Vec. Parser is moved in and
-    // returned via the join handle so caller-side stitching state
-    // survives across segments
-    let parser_in = std::mem::take(parser);
-    let (parser_out, locs) = tokio::task::spawn_blocking(move || {
-        let mut parser_in = parser_in;
-        let sync_r = SyncIoBridge::new(decoded);
-        let res = extract_locations_from_wal_file(&mut parser_in, sync_r);
-        (parser_in, res)
-    })
+    // A delta range's trailing segment is the one BASE_BACKUP forced a switch out
+    // of at start (PG do_pg_backup_start -> RequestXLogSwitch), so PG's async
+    // archive_command may not have shipped it to the bucket yet. It is switched
+    // out, so it will arrive — wait out archiver lag on NotFound before the caller
+    // gives up to a full backup. Transient errors are already retried in storage
+    let r = with_retry(
+        &WAL_ARCHIVE_WAIT,
+        |e: &StorageError| matches!(e, StorageError::NotFound(_)),
+        || async { storage.get(&key).await },
+    )
     .await
-    .context("join segment walk")?;
-    *parser = parser_out;
-    locs.with_context(|| format!("parse segment {name}"))
+    .with_context(|| format!("get {key}"))?;
+    let decrypted = settings.decrypt(r);
+    let mut decoded = compression::decode(compression, decrypted);
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut decoded, &mut buf)
+        .await
+        .with_context(|| format!("read segment {name}"))?;
+    Ok(buf)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
     use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
@@ -706,14 +1052,14 @@ mod tests {
 
         let sentinel = |from: Option<&str>, fmt: increment::Format| BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(seg),
-                increment_from_lsn: from.map(|_| seg / 2),
+                backup_start_lsn: NonZeroU64::new(seg),
+                increment_from_lsn: from.and_then(|_| NonZeroU64::new(seg / 2)),
                 increment_from: from.map(String::from),
                 increment_full_name: from.map(String::from),
                 increment_count: from.map(|_| 1),
                 increment_format: fmt,
                 pg_version: 170000,
-                backup_finish_lsn: Some(seg + 1),
+                backup_finish_lsn: NonZeroU64::new(seg + 1),
                 ..Default::default()
             },
             hostname: "h".into(),
@@ -814,13 +1160,13 @@ mod tests {
         });
 
         let seg0 = m.blocks_for("base/16384/16385").unwrap().unwrap();
-        assert_eq!(seg0, [5].iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(seg0, vec![5u32]);
 
         let seg1 = m.blocks_for("base/16384/16385.1").unwrap().unwrap();
-        assert_eq!(seg1, [3].iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(seg1, vec![3u32]);
 
         let seg2 = m.blocks_for("base/16384/16385.2").unwrap().unwrap();
-        assert_eq!(seg2, [9].iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(seg2, vec![9u32]);
 
         let seg3 = m.blocks_for("base/16384/16385.3").unwrap().unwrap();
         assert!(seg3.is_empty()); // file has segment but no dirty blocks
@@ -868,8 +1214,8 @@ mod tests {
         use crate::pg::backup::{BackupSentinelDto, sentinel_key};
         let v2 = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
-                backup_start_lsn: Some(DEFAULT_WAL_SEG_SIZE),
-                backup_finish_lsn: Some(DEFAULT_WAL_SEG_SIZE + 1),
+                backup_start_lsn: NonZeroU64::new(DEFAULT_WAL_SEG_SIZE),
+                backup_finish_lsn: NonZeroU64::new(DEFAULT_WAL_SEG_SIZE + 1),
                 pg_version: 170000,
                 user_data: Some(user_data),
                 ..Default::default()
@@ -956,5 +1302,62 @@ mod tests {
         let blocks = map.blocks_for("base/16384/16385").unwrap().unwrap();
         assert_eq!(blocks.into_iter().collect::<Vec<_>>(), vec![7u32]);
         assert!(parser.current_record_data().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fold_sidecar_truncated_before_terminator_errors() {
+        use crate::pg::walparser::write_location_tuples;
+        use crate::storage::fs::FsStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let settings = crate::config::Settings::default();
+        let method = compression::Method::None;
+
+        // Tuples with no terminator + parser state: truncated upload
+        let mut raw = Vec::new();
+        write_location_tuples(
+            &mut raw,
+            &[BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 7)],
+        )
+        .unwrap();
+
+        let group = delta_group_name(1, 0, DEFAULT_WAL_SEG_SIZE);
+        let key = delta_storage_key(&group, method);
+        let len = raw.len() as u64;
+        let r: crate::compression::AsyncReader = Box::pin(std::io::Cursor::new(raw));
+        storage.put(&key, r, Some(len)).await.unwrap();
+
+        let err = fold_sidecar_into_map(
+            &settings,
+            &storage,
+            &group,
+            method,
+            PagedFileDeltaMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+    }
+
+    #[test]
+    fn merge_unions_overlapping_rels() {
+        // Summaries + a raw-walked gap each touch the same rel; merge must union
+        // their blocks, not replace
+        let mut a = PagedFileDeltaMap::new();
+        a.add_location(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 1));
+        a.add_location(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 3));
+        let mut b = PagedFileDeltaMap::new();
+        b.add_location(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 3));
+        b.add_location(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16385, 5));
+        b.add_location(BlockLocation::new(DEFAULT_SPC_NODE, 16384, 16386, 0));
+        a.merge(b);
+        assert_eq!(
+            a.blocks_for("base/16384/16385").unwrap().unwrap(),
+            vec![1u32, 3, 5]
+        );
+        assert_eq!(
+            a.blocks_for("base/16384/16386").unwrap().unwrap(),
+            vec![0u32]
+        );
     }
 }

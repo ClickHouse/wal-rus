@@ -11,6 +11,7 @@
 //! Local PGDATA is optional; absent it, the sentinel records the PG-reported
 //! `data_directory` and we never touch the local filesystem
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -217,16 +218,6 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                 let seg_size = crate::pg::wal::segment::wal_segment_size();
                 let base_name = format_backup_name(info.timeline, info.start_lsn, seg_size);
                 debug_assert!(base_name.starts_with(BACKUP_NAME_PREFIX));
-                // Delta backups get a `_D_<parent-without-base_>` suffix
-                // (wal-g convention). delete/list/show all key off this
-                let resolved_name = match parent.as_ref() {
-                    Some(p) => format!(
-                        "{base_name}_D_{}",
-                        p.name.strip_prefix(BACKUP_NAME_PREFIX).unwrap_or(&p.name),
-                    ),
-                    None => base_name.clone(),
-                };
-                backup_name = Some(resolved_name);
                 tracing::info!(
                     target = "backup_push",
                     "BASE_BACKUP started: lsn={} timeline={} tablespaces={}",
@@ -250,11 +241,15 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                         );
                     } else if args.delta_from_wal_summaries {
                         match build_delta_map_from_summaries(
+                            settings,
+                            &storage,
                             args.pgdata.as_deref(),
                             info.timeline,
                             p.start_lsn,
                             info.start_lsn,
-                        ) {
+                        )
+                        .await
+                        {
                             Ok(map) => {
                                 tracing::info!(
                                     target = "backup_push",
@@ -267,6 +262,8 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                                     map: Arc::new(map),
                                     format: increment_format,
                                     parent_files: p.parent_files.clone(),
+                                    // stream source has no random page access
+                                    parent_start_lsn: None,
                                 });
                             }
                             Err(e) => {
@@ -285,6 +282,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                             p.start_lsn,
                             info.start_lsn,
                             settings.compression,
+                            None,
                         )
                         .await
                         {
@@ -300,6 +298,8 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                                     map: Arc::new(map),
                                     format: increment_format,
                                     parent_files: p.parent_files.clone(),
+                                    // stream source has no random page access
+                                    parent_start_lsn: None,
                                 });
                             }
                             Err(e) => {
@@ -312,6 +312,12 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
                         }
                     }
                 }
+
+                backup_name = Some(resolve_backup_name(
+                    &base_name,
+                    parent.as_ref(),
+                    delta_context.is_some(),
+                ));
             }
             BackupEvent::Archive { meta, body } => {
                 let name = backup_name
@@ -557,31 +563,17 @@ pub(crate) async fn finalize_backup(f: Finalize<'_>) -> Result<()> {
     let hostname = hostname().unwrap_or_default();
     let finish_time = chrono::Utc::now();
 
-    // Wire the parent linkage into the sentinel only when increment
-    // generation actually ran (delta_context is set). If the delta map
-    // build failed earlier, parent stays informational but the sentinel
-    // must claim FULL — otherwise restore would walk a chain whose
-    // increments don't exist
     let (incr_from_lsn, incr_from_name, incr_full_name, incr_count, incr_format) =
-        match (parent, delta_context) {
-            (Some(p), Some(ctx)) => (
-                Some(p.start_lsn),
-                Some(p.name.clone()),
-                Some(resolve_increment_full_name(p)),
-                Some(p.increment_count as i32),
-                ctx.format,
-            ),
-            _ => (None, None, None, None, IncrementFormat::default()),
-        };
+        increment_sentinel_fields(parent, delta_context);
     let sentinel = BackupSentinelDto {
-        backup_start_lsn: Some(start_lsn),
+        backup_start_lsn: NonZeroU64::new(start_lsn),
         increment_from_lsn: incr_from_lsn,
         increment_from: incr_from_name,
         increment_full_name: incr_full_name,
         increment_count: incr_count,
         increment_format: incr_format,
         pg_version,
-        backup_finish_lsn: Some(end_lsn),
+        backup_finish_lsn: NonZeroU64::new(end_lsn),
         system_identifier: Some(system_identifier),
         uncompressed_size,
         compressed_size,
@@ -725,6 +717,26 @@ pub(crate) fn wrap_counted_reader(input: AsyncReader, counter: Arc<AtomicU64>) -
 #[allow(dead_code)]
 fn _bytes_marker(_: BytesMut) {}
 
+/// Resolve the stored backup name. A delta backup gets a
+/// `_D_<parent-without-base_>` suffix (wal-g convention; delete/list/show key
+/// off it), but only when increment generation actually ran (`has_delta`). A
+/// failed delta-map build falls back to a full, so the name must stay plain —
+/// the sentinel reports FULL and a `_D_` name would claim a chain the
+/// increments don't back
+pub(crate) fn resolve_backup_name(
+    base_name: &str,
+    parent: Option<&PrevBackupInfo>,
+    has_delta: bool,
+) -> String {
+    match parent {
+        Some(p) if has_delta => format!(
+            "{base_name}_D_{}",
+            p.name.strip_prefix(BACKUP_NAME_PREFIX).unwrap_or(&p.name),
+        ),
+        _ => base_name.to_string(),
+    }
+}
+
 /// Pick the chain-root name to record under `DeltaFullName`.
 /// `PrevBackupInfo.increment_full_name` is empty when the parent IS the
 /// chain root (no further indirection in V2 sentinel), in which case the
@@ -737,9 +749,50 @@ fn resolve_increment_full_name(p: &PrevBackupInfo) -> String {
     }
 }
 
+/// Sentinel increment linkage `(from_lsn, from_name, full_name, count, format)`,
+/// wired only when increment generation actually ran (`delta_context` set). A
+/// failed delta build leaves `delta_context` None so every field stays empty &
+/// the sentinel reports FULL — restore must not walk a chain whose increments
+/// were never written. Shared by both backup-push source paths via
+/// `finalize_backup`
+fn increment_sentinel_fields(
+    parent: Option<&PrevBackupInfo>,
+    delta_context: Option<&DeltaContext>,
+) -> (
+    Option<NonZeroU64>,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    IncrementFormat,
+) {
+    match (parent, delta_context) {
+        (Some(p), Some(ctx)) => (
+            NonZeroU64::new(p.start_lsn),
+            Some(p.name.clone()),
+            Some(resolve_increment_full_name(p)),
+            Some(p.increment_count as i32),
+            ctx.format,
+        ),
+        _ => (None, None, None, None, IncrementFormat::default()),
+    }
+}
+
 /// PG17 wal-summaries → delta map. Returns an error if local PGDATA is absent
-/// since the summaries live on the server's filesystem
-pub(crate) fn build_delta_map_from_summaries(
+/// since the summaries live on the server's filesystem.
+///
+/// Summaries rarely span the whole `[first_used, first_not_used)` request:
+/// retention drops the oldest (head gap) and the summarizer trails the backup
+/// LSN (tail gap). Each uncovered span is raw-walked from the local `pg_wal`
+/// (archive fallback for recycled segments) and unioned in — a few segments vs
+/// re-uploading the cluster as a full backup, and no summarizer-lag race. Same
+/// WAL walk as the non-summaries path, so segments resolve identically.
+///
+/// No overlapping summaries at all (`NoSummariesForRange`) degrades to the same
+/// raw walk over the entire range rather than failing to a full backup; only a
+/// gap *between* present summaries stays fatal (see `select_for_range`)
+pub(crate) async fn build_delta_map_from_summaries(
+    settings: &Settings,
+    storage: &DynStorage,
     pgdata: Option<&std::path::Path>,
     timeline: u32,
     first_used_lsn: u64,
@@ -747,17 +800,73 @@ pub(crate) fn build_delta_map_from_summaries(
 ) -> Result<crate::pg::backup::delta::PagedFileDeltaMap> {
     let pgdata =
         pgdata.ok_or_else(|| anyhow!("--delta-from-wal-summaries requires local PGDATA"))?;
-    let map = crate::pg::wal_summaries::read_for_range(
+    let (mut map, covered_start, covered_end) = match crate::pg::wal_summaries::read_for_range(
         pgdata,
         timeline,
         first_used_lsn,
         first_not_used_lsn,
-    )
-    .with_context(|| {
-        format!(
-            "read WAL summaries [{first_used_lsn:X}, {first_not_used_lsn:X}) timeline {timeline}"
+    ) {
+        Ok(v) => v,
+        // no summaries overlap range (retention dropped all, or summarizer not
+        // yet caught up): treat whole span as one gap, raw-walked below — same
+        // mechanism as a head/tail gap, just covering everything. A gap *between*
+        // present summaries stays fatal (see select_for_range)
+        Err(crate::pg::wal_summaries::SummaryError::NoSummariesForRange { .. }) => {
+            tracing::info!(
+                target = "backup_push",
+                "no WAL summaries cover [{}, {}) timeline {timeline}; raw-walking whole range",
+                format_pg_lsn(first_used_lsn),
+                format_pg_lsn(first_not_used_lsn),
+            );
+            (
+                crate::pg::backup::delta::PagedFileDeltaMap::new(),
+                first_used_lsn,
+                first_used_lsn,
+            )
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "read WAL summaries [{}, {}) timeline {timeline}",
+                    format_pg_lsn(first_used_lsn),
+                    format_pg_lsn(first_not_used_lsn)
+                )
+            });
+        }
+    };
+    let wal_dir = pgdata.join("pg_wal");
+    for (lo, hi) in [
+        (first_used_lsn, covered_start),
+        (covered_end, first_not_used_lsn),
+    ] {
+        if lo >= hi {
+            continue;
+        }
+        tracing::info!(
+            target = "backup_push",
+            "WAL summaries miss [{}, {}); raw-walking it",
+            format_pg_lsn(lo),
+            format_pg_lsn(hi),
+        );
+        let gap = delta::build_delta_map_from_wal(
+            settings,
+            storage,
+            timeline,
+            lo,
+            hi,
+            settings.compression,
+            Some(&wal_dir),
         )
-    })?;
+        .await
+        .with_context(|| {
+            format!(
+                "raw-walk WAL summary gap [{}, {}) timeline {timeline}",
+                format_pg_lsn(lo),
+                format_pg_lsn(hi)
+            )
+        })?;
+        map.merge(gap);
+    }
     Ok(map)
 }
 
@@ -765,11 +874,155 @@ pub(crate) fn build_delta_map_from_summaries(
 mod tests {
     use super::*;
 
+    fn sample_parent(name: &str) -> PrevBackupInfo {
+        PrevBackupInfo {
+            name: name.into(),
+            start_lsn: 0x0200_0000,
+            timeline: 1,
+            finish_lsn: 0,
+            increment_full_name: String::new(),
+            increment_count: 1,
+            is_permanent: false,
+            system_identifier: None,
+            user_data: None,
+            parent_increment_format: None,
+            parent_files: Arc::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Smallest valid WAL summary: magic, the 24-byte zero sentinel (no entries),
+    /// then the CRC32C over both. Parses to an empty change set with valid
+    /// coverage, isolating downstream gap-walk behaviour from summary contents
+    fn minimal_summary() -> Vec<u8> {
+        // BLOCK_REF_TABLE_MAGIC (postgres common/blkreftable.c)
+        let mut bytes = 0x652b_137bu32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 24]); // sentinel: end of entries
+        let mut h = crate::pg::wal_summaries::Crc32cHasher::new();
+        h.update(&bytes);
+        bytes.extend_from_slice(&h.finalize().to_le_bytes());
+        bytes
+    }
+
     #[test]
-    fn delta_map_from_summaries_requires_pgdata() {
+    fn delta_failure_yields_plain_full_name() {
+        // wal-g `_D_` suffix only when increment generation ran; a failed delta
+        // map build falls back to a full whose name must not claim a chain the
+        // increments don't back
+        let parent = sample_parent("base_000000010000000000000002");
+        let base = "base_000000010000000000000005";
+
+        // Delta map built → `_D_<parent-stripped>` suffix
+        assert_eq!(
+            resolve_backup_name(base, Some(&parent), true),
+            "base_000000010000000000000005_D_000000010000000000000002",
+        );
+        // Delta map build failed → plain full name, never `_D_`
+        let full = resolve_backup_name(base, Some(&parent), false);
+        assert_eq!(full, base);
+        assert!(
+            !full.contains("_D_"),
+            "full fallback must not claim a chain"
+        );
+        // No parent at all → plain full name
+        assert_eq!(resolve_backup_name(base, None, true), base);
+    }
+
+    #[tokio::test]
+    async fn delta_map_from_summaries_requires_pgdata() {
         // Summaries live on the PG host filesystem; without local PGDATA the map
         // can't be read, so the wrapper must bail before touching disk
-        let err = build_delta_map_from_summaries(None, 1, 0x100, 0x200).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::default();
+        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(tmp.path()).unwrap());
+        let err = build_delta_map_from_summaries(&settings, &storage, None, 1, 0x100, 0x200)
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("PGDATA"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn summary_tail_gap_missing_wal_fails_to_full() {
+        // Summaries cover [seg1, seg2); the tail gap [seg2, seg2+100) must raw-walk
+        // segment 2, absent from both local pg_wal and the archive. That walk
+        // errors, so the whole delta-map build fails — the push then takes a full
+        // backup with a plain base name (no `_D_` chain it can't back)
+        let seg = 0x0100_0000u64; // 16 MiB WAL segment
+        let tmp = tempfile::tempdir().unwrap();
+        let pgdata = tmp.path().join("pgdata");
+        let summaries = pgdata.join("pg_wal/summaries");
+        std::fs::create_dir_all(&summaries).unwrap();
+        // timeline 1, start=seg, end=2*seg: covers exactly segment 1, no tail
+        let fname = format!(
+            "{:08X}{:08X}{:08X}{:08X}{:08X}.summary",
+            1u32,
+            0u32,
+            seg as u32,
+            0u32,
+            (2 * seg) as u32,
+        );
+        std::fs::write(summaries.join(fname), minimal_summary()).unwrap();
+
+        let bucket = tmp.path().join("bucket");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&bucket).unwrap());
+        let settings = Settings::default();
+
+        let err = build_delta_map_from_summaries(
+            &settings,
+            &storage,
+            Some(&pgdata),
+            1,
+            seg,           // first_used = parent start
+            2 * seg + 100, // first_not_used: tail gap inside segment 2
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("WAL summary gap"),
+            "tail-gap raw walk must fail on the missing segment: {err:#}"
+        );
+
+        // Build failed → has_delta=false → plain base name, never `_D_`
+        let parent = sample_parent("base_000000010000000000000001");
+        let base = "base_000000010000000000000002";
+        let name = resolve_backup_name(base, Some(&parent), false);
+        assert_eq!(name, base);
+        assert!(
+            !name.contains("_D_"),
+            "full fallback must not claim a chain"
+        );
+    }
+
+    #[test]
+    fn delta_failure_clears_increment_sentinel_fields() {
+        // delta_context None (failed/absent delta build) → every increment
+        // linkage field empty so the sentinel reports FULL. finalize_backup is
+        // shared by the streaming & filesystem paths, so this one gate covers both
+        let parent = sample_parent("base_000000010000000000000002");
+        let (from_lsn, from_name, full_name, count, format) =
+            increment_sentinel_fields(Some(&parent), None);
+        assert!(from_lsn.is_none());
+        assert!(from_name.is_none());
+        assert!(full_name.is_none());
+        assert!(count.is_none());
+        assert_eq!(format, IncrementFormat::default());
+    }
+
+    #[test]
+    fn increment_sentinel_fields_populated_with_delta() {
+        // A real delta build (delta_context set) wires full parent linkage
+        let parent = sample_parent("base_000000010000000000000002");
+        let ctx = DeltaContext {
+            map: Arc::new(crate::pg::backup::delta::PagedFileDeltaMap::new()),
+            format: IncrementFormat::default(),
+            parent_files: Arc::new(std::collections::HashSet::new()),
+            parent_start_lsn: None,
+        };
+        let (from_lsn, from_name, full_name, count, _) =
+            increment_sentinel_fields(Some(&parent), Some(&ctx));
+        assert_eq!(from_lsn, NonZeroU64::new(parent.start_lsn));
+        assert_eq!(from_name.as_deref(), Some(parent.name.as_str()));
+        assert!(full_name.is_some());
+        assert_eq!(count, Some(parent.increment_count as i32));
     }
 }
