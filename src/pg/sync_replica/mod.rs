@@ -5,6 +5,7 @@
 //! - [`controller`] — the runtime owner + primary-poller (sole-acker) + janitor.
 //! - (next) `api` — the mTLS control API the Ubicloud control plane calls.
 
+pub mod api;
 pub mod controller;
 pub mod shared;
 

@@ -50,6 +50,9 @@ rustls-pki-types = "1"
 rustls-pemfile = "2"
 webpki-roots = "1"
 dryoc = { version = "0.8", default-features = false, features = ["u64_backend"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

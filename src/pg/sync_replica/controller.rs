@@ -80,10 +80,43 @@ impl SyncReplicaController {
     async fn serve(self) -> Result<()> {
         let this = Arc::new(self);
         let poller = tokio::spawn(this.clone().primary_poller());
+        let api = this.spawn_control_api().await;
         // bridge: the hot path fires `stop` on SIGINT/SIGTERM
         this.shared.stop.notified().await;
         poller.abort();
+        if let Some(api) = api {
+            api.abort();
+        }
         Ok(())
+    }
+
+    /// Bind + serve the control API (the CP's promote gate). Bind failure is
+    /// non-fatal — the receiver still acks WAL; the CP just degrades to
+    /// promote-at-standby-LSN. `WALG_WAL_RECEIVE_CONTROL_LISTEN` overrides the
+    /// default port (TODO: fold into ReceiveSettings).
+    async fn spawn_control_api(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let listen = std::env::var("WALG_WAL_RECEIVE_CONTROL_LISTEN")
+            .unwrap_or_else(|_| "0.0.0.0:8444".into());
+        let listener = match tokio::net::TcpListener::bind(&listen).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    target = "sync_replica",
+                    "control API bind {listen} failed: {e:#}"
+                );
+                return None;
+            }
+        };
+        tracing::info!(target = "sync_replica", "control API listening on {listen}");
+        let state = Arc::new(super::api::ApiState {
+            shared: self.shared.clone(),
+            partial_dir: self.archive_dir.to_string_lossy().into_owned(),
+        });
+        Some(tokio::spawn(async move {
+            if let Err(e) = super::api::serve(listener, state).await {
+                tracing::warn!(target = "sync_replica", "control API exited: {e:#}");
+            }
+        }))
     }
 
     /// The single primary-poller loop: one side SQL connection, one snapshot per
