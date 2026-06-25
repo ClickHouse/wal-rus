@@ -48,7 +48,7 @@ use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, mes
 use crate::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use crate::pg::wal::push;
 use crate::pg::wal::segment::{self, SegmentName};
-use crate::pg::wal::sync_replica_controller::Shared;
+use crate::pg::wal::sync_replica_controller::{Shared, SyncReplicaController};
 use crate::storage::DynStorage;
 
 /// Status update cadence — wal-g defaults to 10s; we match
@@ -592,6 +592,29 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         },
     )
     .await?;
+
+    // Sync-replica control plane on its OWN runtime/OS thread, isolated from the
+    // hot path. Uploader needs no controller. It observes `shared.stop` to exit
+    let controller = match mode {
+        ReceiveMode::SyncReplica => {
+            let ctl = SyncReplicaController::new(shared.clone(), cfg.clone(), slot_name.clone());
+            Some(
+                std::thread::Builder::new()
+                    .name("sync_replica_controller".into())
+                    .spawn(move || {
+                        if let Err(e) = ctl.run() {
+                            tracing::error!(
+                                target = "wal_receive",
+                                "sync-replica controller: {e:#}"
+                            );
+                        }
+                    })
+                    .context("spawn sync-replica controller")?,
+            )
+        }
+        ReceiveMode::Uploader => None,
+    };
+
     let mut last_status = std::time::Instant::now();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -612,10 +635,12 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                 biased;
                 _ = &mut shutdown => {
                     tracing::info!(target = "wal_receive", "shutdown signal received, flushing");
-                    shared.stop.notify_waiters();
+                    // notify_one stores a permit, so the controller wakes even if
+                    // it hasn't reached `stop.notified()` yet (no lost wakeup)
+                    shared.stop.notify_one();
                     acc.drain_uploads().await?;
                     acc.finalize_partial().await?;
-                    return Ok(());
+                    break 'replication;
                 }
                 // Reap finished uploads so a failure surfaces now, not at the
                 // next rotation. Pattern mismatch on empty set disables the arm
@@ -707,6 +732,12 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         );
         continue 'replication;
     }
+
+    // Graceful shutdown: the controller was woken via `shared.stop`; join it
+    if let Some(handle) = controller {
+        let _ = handle.join();
+    }
+    Ok(())
 }
 
 /// `WALG_SLOTNAME`. Unset or empty -> `None` (slotless replication). wal-g
