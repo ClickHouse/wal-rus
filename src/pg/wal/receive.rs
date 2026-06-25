@@ -584,7 +584,13 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     // hot path. Uploader needs no controller. It observes `shared.stop` to exit
     let controller = match mode {
         ReceiveMode::SyncReplica => {
-            let ctl = SyncReplicaController::new(shared.clone(), cfg.clone(), slot_name.clone());
+            let ctl = SyncReplicaController::new(
+                shared.clone(),
+                cfg.clone(),
+                slot_name.clone(),
+                archive_dir.to_path_buf(),
+                seg_size,
+            );
             Some(
                 std::thread::Builder::new()
                     .name("sync_replica_controller".into())

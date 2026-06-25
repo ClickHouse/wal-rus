@@ -8,6 +8,7 @@
 //!
 //! Design: `sync_pair/docs/sync-replica-controller.md`.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ use tokio::sync::Notify;
 
 use crate::pg::backup::parse_pg_lsn;
 use crate::pg::replication::conn::{PgConfig, ReplicationConn};
+use crate::pg::wal::segment::SegmentName;
 
 /// How often the primary-poller snapshots the primary (sole-acker latency target)
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -24,6 +26,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PEER_STALENESS_MS: u64 = 1500;
 /// Consecutive advancing polls needed to credit a returned peer back
 const PEER_CREDIT_POLLS: u32 = 3;
+/// Run the janitor every N poll ticks (≈30s at the 500ms poll interval)
+const JANITOR_INTERVAL_TICKS: u64 = 60;
+/// Retained segments above this trip back-pressure (freeze the ACK). ~2 GiB at
+/// 16 MiB segments. TODO: source from ReceiveSettings per the mounted disk size
+const RETAIN_BUDGET_SEGS: usize = 128;
+/// Retained segments above this are dropped oldest-first — a last resort that
+/// sacrifices their DR-tail when back-pressure can't brake (healthy peer). ~4 GiB
+const RETAIN_HARD_CAP_SEGS: usize = 256;
 
 /// State shared across the runtime boundary between the receiver hot path and
 /// the sync-replica controller. Every field is single-writer.
@@ -57,16 +67,27 @@ impl Default for Shared {
 pub(crate) struct SyncReplicaController {
     shared: Arc<Shared>,
     cfg: PgConfig,
-    #[allow(dead_code)] // used by the janitor (slot retention) in a later milestone
+    #[allow(dead_code)] // used for slot-retention back-pressure in a later milestone
     slot_name: Option<String>,
+    /// Where the receiver retains `<seg>` files (the janitor prunes here)
+    archive_dir: PathBuf,
+    seg_size: u64,
 }
 
 impl SyncReplicaController {
-    pub(crate) fn new(shared: Arc<Shared>, cfg: PgConfig, slot_name: Option<String>) -> Self {
+    pub(crate) fn new(
+        shared: Arc<Shared>,
+        cfg: PgConfig,
+        slot_name: Option<String>,
+        archive_dir: PathBuf,
+        seg_size: u64,
+    ) -> Self {
         Self {
             shared,
             cfg,
             slot_name,
+            archive_dir,
+            seg_size,
         }
     }
 
@@ -93,13 +114,14 @@ impl SyncReplicaController {
     }
 
     /// The single primary-poller loop: one side SQL connection, one snapshot per
-    /// tick, drives `sole_acker`. (The janitor's prune-gate read + back-pressure
-    /// fold into this same loop in a later milestone.)
+    /// tick. Every tick drives `sole_acker` (fast); every `JANITOR_INTERVAL_TICKS`
+    /// it also runs the janitor (prune retained segments + back-pressure).
     async fn primary_poller(self: Arc<Self>) {
         let mut liveness = PeerLiveness::new(PEER_STALENESS_MS, PEER_CREDIT_POLLS);
         let started = Instant::now();
         let mut tick = tokio::time::interval(POLL_INTERVAL);
         let mut conn: Option<ReplicationConn> = None;
+        let mut n: u64 = 0;
         loop {
             tick.tick().await;
             let now_ms = started.elapsed().as_millis() as u64;
@@ -114,7 +136,8 @@ impl SyncReplicaController {
                     }
                 }
             }
-            let peer = match self.query_primary(conn.as_mut().unwrap()).await {
+            let c = conn.as_mut().unwrap();
+            let peer = match self.query_primary(c).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(target = "sync_replica", "poller query failed: {e:#}");
@@ -126,7 +149,49 @@ impl SyncReplicaController {
             let frontier = self.shared.fsyncd_lsn.load(Ordering::Acquire);
             let sole = liveness.observe(peer, frontier, now_ms);
             self.shared.sole_acker.store(sole, Ordering::Relaxed);
+
+            // janitor: slow cadence, same snapshot connection. A failure here is
+            // non-fatal (sole-acker is the more critical signal)
+            if n.is_multiple_of(JANITOR_INTERVAL_TICKS)
+                && let Err(e) = self.run_janitor(conn.as_mut().unwrap()).await
+            {
+                tracing::warn!(target = "sync_replica", "janitor sweep failed: {e:#}");
+            }
+            n = n.wrapping_add(1);
         }
+    }
+
+    /// Read the primary's archived-WAL gate, then prune retained segments and
+    /// set the back-pressure ceiling. The fs work runs on the blocking pool so a
+    /// slow unlink can't stall the fast sole-acker cadence.
+    async fn run_janitor(&self, conn: &mut ReplicationConn) -> Result<()> {
+        let last_archived = self.last_archived_wal(conn).await?;
+        let frontier = self.shared.fsyncd_lsn.load(Ordering::Acquire);
+        let dir = self.archive_dir.clone();
+        let seg_size = self.seg_size;
+        let ceiling = tokio::task::spawn_blocking(move || {
+            janitor_sweep(&dir, seg_size, last_archived, frontier)
+        })
+        .await
+        .context("janitor sweep join")??;
+        self.shared.ack_ceiling.store(ceiling, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The primary's `pg_stat_archiver.last_archived_wal` — the segment up to
+    /// which the primary has shipped WAL (our retained copies below it are
+    /// redundant). `None` when the archiver hasn't archived anything.
+    async fn last_archived_wal(&self, conn: &mut ReplicationConn) -> Result<Option<SegmentName>> {
+        let rows = conn
+            .query_rows("SELECT last_archived_wal FROM pg_stat_archiver")
+            .await?;
+        let cell = rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|c| c.as_deref());
+        Ok(cell
+            .filter(|s| !s.is_empty())
+            .and_then(|s| SegmentName::parse(s).ok()))
     }
 
     /// On any poll error, assume sole acker — the safe side (per-frame fsync)
@@ -154,6 +219,109 @@ impl SyncReplicaController {
             Some(lsn) => Ok(Some(parse_pg_lsn(lsn)?)),
         }
     }
+}
+
+/// One janitor pass (runs on the blocking pool): prune retained `<seg>` files the
+/// primary has already archived, drop the oldest beyond the hard cap, and return
+/// the back-pressure ceiling (`frontier` to freeze the ACK, else `u64::MAX`).
+fn janitor_sweep(
+    dir: &Path,
+    seg_size: u64,
+    last_archived: Option<SegmentName>,
+    frontier: u64,
+) -> Result<u64> {
+    let retained = scan_retained(dir, seg_size)?;
+
+    // 1. archiver-gated prune: the primary has shipped these, our copy is redundant
+    let p1 = prunable(&retained, last_archived);
+    if !p1.is_empty() {
+        let n = remove_segments(dir, &p1);
+        tracing::info!(
+            target = "sync_replica",
+            "janitor pruned {n} archived segment(s)"
+        );
+    }
+    let after_p1 = &retained[p1.len()..]; // `prunable` returns a sorted prefix
+
+    // 2. hard cap: last resort, sacrifice the oldest DR-tail to save the disk
+    let p2 = hard_cap_drop(after_p1, RETAIN_HARD_CAP_SEGS);
+    if !p2.is_empty() {
+        let n = remove_segments(dir, &p2);
+        tracing::warn!(
+            target = "sync_replica",
+            "janitor hard-cap dropped {n} retained segment(s) — DR-tail sacrificed"
+        );
+    }
+
+    // 3. back-pressure from what remains
+    let remaining = after_p1.len() - p2.len();
+    Ok(if remaining > RETAIN_BUDGET_SEGS {
+        frontier
+    } else {
+        u64::MAX
+    })
+}
+
+/// Complete retained `<seg>` files (bare name, size == `seg_size`) in `dir`,
+/// sorted ascending. Absent dir ⇒ empty.
+fn scan_retained(dir: &Path, seg_size: u64) -> Result<Vec<SegmentName>> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).context("scan retained dir"),
+    };
+    let mut segs = Vec::new();
+    for entry in rd {
+        let entry = entry?;
+        let Some(seg) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| SegmentName::parse(n).ok())
+        else {
+            continue; // `.partial`, `.history`, etc. are rejected by parse
+        };
+        let meta = entry.metadata()?;
+        if meta.is_file() && meta.len() == seg_size {
+            segs.push(seg);
+        }
+    }
+    segs.sort();
+    Ok(segs)
+}
+
+/// Retained segments at or below the primary's last archived segment. `None`
+/// gate ⇒ nothing prunable. `retained` must be sorted ascending.
+fn prunable(retained: &[SegmentName], last_archived: Option<SegmentName>) -> Vec<SegmentName> {
+    let Some(gate) = last_archived else {
+        return Vec::new();
+    };
+    retained
+        .iter()
+        .copied()
+        .take_while(|s| *s <= gate)
+        .collect()
+}
+
+/// The oldest retained segments to drop when over `hard_cap`. `retained` must be
+/// sorted ascending (oldest first).
+fn hard_cap_drop(retained: &[SegmentName], hard_cap: usize) -> Vec<SegmentName> {
+    if retained.len() <= hard_cap {
+        return Vec::new();
+    }
+    retained[..retained.len() - hard_cap].to_vec()
+}
+
+/// Remove the named segment files; returns how many were unlinked.
+fn remove_segments(dir: &Path, segs: &[SegmentName]) -> usize {
+    let mut removed = 0;
+    for s in segs {
+        let path = dir.join(s.format());
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(target = "sync_replica", "prune {}: {e}", s.format()),
+        }
+    }
+    removed
 }
 
 /// Tracks whether a peer sync standby is making progress, deciding whether this
@@ -225,6 +393,48 @@ impl PeerLiveness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seg(n: u32) -> SegmentName {
+        SegmentName {
+            timeline: 1,
+            log_id: 0,
+            seg_no: n,
+        }
+    }
+
+    #[test]
+    fn prunable_takes_segments_at_or_below_the_gate() {
+        let retained = vec![seg(1), seg(2), seg(3), seg(4)];
+        assert_eq!(prunable(&retained, Some(seg(2))), vec![seg(1), seg(2)]);
+        assert_eq!(prunable(&retained, Some(seg(9))), retained);
+        assert!(prunable(&retained, Some(seg(0))).is_empty());
+        assert!(prunable(&retained, None).is_empty()); // archiver hasn't shipped anything
+    }
+
+    #[test]
+    fn hard_cap_drops_only_the_oldest_over_cap() {
+        let retained = vec![seg(1), seg(2), seg(3), seg(4), seg(5)];
+        assert_eq!(hard_cap_drop(&retained, 3), vec![seg(1), seg(2)]);
+        assert!(hard_cap_drop(&retained, 5).is_empty());
+        assert!(hard_cap_drop(&retained, 10).is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_retained_finds_complete_segments_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_size = 16u64;
+        // complete retained segment
+        std::fs::write(dir.path().join(seg(3).format()), vec![0u8; 16]).unwrap();
+        // in-progress partial (rejected by parse) + wrong-size file (skipped)
+        std::fs::write(
+            dir.path().join(format!("{}.partial", seg(4).format())),
+            vec![0u8; 16],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(seg(5).format()), vec![0u8; 4]).unwrap();
+        let found = scan_retained(dir.path(), seg_size).unwrap();
+        assert_eq!(found, vec![seg(3)]);
+    }
 
     #[test]
     fn present_peer_advancing_is_not_sole() {
