@@ -40,6 +40,10 @@ impl PgConfig {
             .map_err(|_| anyhow!("PGUSER not set"))?;
         let password = std::env::var("PGPASSWORD").ok();
         let database = std::env::var("PGDATABASE").unwrap_or_else(|_| user.clone());
+        let application_name = resolve_application_name(
+            std::env::var("WALG_APPLICATION_NAME").ok(),
+            std::env::var("PGAPPNAME").ok(),
+        );
         let sslmode = SslMode::from_env()?;
         Ok(Self {
             host,
@@ -47,10 +51,22 @@ impl PgConfig {
             user,
             password,
             database,
-            application_name: "walrus".into(),
+            application_name,
             sslmode,
         })
     }
+}
+
+/// Resolve the replication `application_name`: `WALG_APPLICATION_NAME`, else the
+/// libpq-standard `PGAPPNAME`, else `walrus`. It is load-bearing for synchronous
+/// replication — PG matches it against `synchronous_standby_names`, so a sync
+/// standby must announce the exact name the primary expects (e.g. `<ubid>_receiver`)
+fn resolve_application_name(walg: Option<String>, pgappname: Option<String>) -> String {
+    [walg, pgappname]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| "walrus".into())
 }
 
 pub struct ReplicationConn {
@@ -568,6 +584,18 @@ mod tests {
         assert_eq!(parse_server_version("18"), Some(180000));
         assert_eq!(parse_server_version("17beta1"), Some(170000));
         assert_eq!(parse_server_version("9.6.24"), Some(90624));
+    }
+
+    #[test]
+    fn application_name_precedence() {
+        let s = |x: &str| Some(x.to_string());
+        // WALG_APPLICATION_NAME wins, then PGAPPNAME, then the default
+        assert_eq!(resolve_application_name(s("recv"), s("pg")), "recv");
+        assert_eq!(resolve_application_name(None, s("pg")), "pg");
+        assert_eq!(resolve_application_name(None, None), "walrus");
+        // empty values are skipped, not treated as a set name
+        assert_eq!(resolve_application_name(s(""), s("pg")), "pg");
+        assert_eq!(resolve_application_name(s(""), None), "walrus");
     }
 
     #[test]
