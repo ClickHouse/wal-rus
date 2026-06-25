@@ -118,10 +118,6 @@ struct SegmentAccumulator {
     /// Highest WAL LSN received (write position). Reset to the restart LSN on a
     /// timeline switch
     received_lsn: u64,
-    /// Highest fsync'd-to-disk LSN — the durable frontier, raised by `sync`.
-    /// Shared with the controller (`Shared::fsyncd_lsn`) so it can be read across
-    /// the runtime boundary
-    highest_fsyncd_lsn: Arc<AtomicU64>,
 }
 
 /// In-progress segment. Written to `<seg>.partial` (pg_receivewal convention),
@@ -150,8 +146,6 @@ struct AccumulatorConfig {
     upload: bool,
     /// Capability to coalesce frames into one fsync per batch
     enable_batching: bool,
-    /// Durable fsync frontier, shared with the controller (`Shared::fsyncd_lsn`)
-    fsyncd_lsn: Arc<AtomicU64>,
 }
 
 impl SegmentAccumulator {
@@ -167,13 +161,10 @@ impl SegmentAccumulator {
         let AccumulatorConfig {
             upload,
             enable_batching,
-            fsyncd_lsn,
         } = config;
         fs::create_dir_all(&archive_dir)
             .await
             .with_context(|| format!("create_dir_all {}", archive_dir.display()))?;
-        // seed the shared frontier at the resume point
-        fsyncd_lsn.store(start_lsn, Ordering::Release);
         let upload_sem = Arc::new(Semaphore::new(settings.upload_concurrency.max(1)));
         Ok(Self {
             seg_size,
@@ -188,7 +179,6 @@ impl SegmentAccumulator {
             upload_sem,
             in_flight: BTreeSet::new(),
             received_lsn: start_lsn,
-            highest_fsyncd_lsn: fsyncd_lsn,
         })
     }
 
@@ -471,9 +461,11 @@ impl SegmentAccumulator {
             .map_or(current_floor, |oldest| oldest.min(current_floor))
     }
 
-    /// fsync the open partial and raise the durable frontier to the synced
-    /// write cursor.
-    async fn sync(&mut self) -> Result<()> {
+    /// fsync the open partial and raise the durable `frontier` to the synced
+    /// write cursor. The frontier is shared state (`Shared::fsyncd_lsn`) the hot
+    /// path passes in — the accumulator computes the durable LSN here, where it's
+    /// known, and publishes it without owning the cross-runtime atomic.
+    async fn sync(&mut self, frontier: &AtomicU64) -> Result<()> {
         let Some(cur) = self.current.as_ref() else {
             return Ok(());
         };
@@ -481,15 +473,9 @@ impl SegmentAccumulator {
         let durable = cur.name.start_lsn(self.seg_size) + cur.bytes_written;
         // single writer (the hot path), so load Relaxed + store Release; the max
         // guards a reconnect re-streaming a partial from a lower offset
-        let raised = self.highest_fsyncd_lsn.load(Ordering::Relaxed).max(durable);
-        self.highest_fsyncd_lsn.store(raised, Ordering::Release);
+        let raised = frontier.load(Ordering::Relaxed).max(durable);
+        frontier.store(raised, Ordering::Release);
         Ok(())
-    }
-
-    /// Highest fsync'd-to-disk LSN — the durable frontier, reported as the flush
-    /// position in SyncReplica mode
-    fn fsyncd_position(&self) -> u64 {
-        self.highest_fsyncd_lsn.load(Ordering::Acquire)
     }
 }
 
@@ -575,9 +561,11 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         format_pg_lsn(next_start),
     );
 
-    // State bridged to the (future) sync-replica controller across the runtime
-    // boundary. Default ⇒ sole_acker=false ⇒ batching gate unaffected
+    // State bridged to the sync-replica controller across the runtime boundary.
+    // Default ⇒ sole_acker=false, ack_ceiling=MAX ⇒ hot path unaffected
     let shared = Arc::new(Shared::default());
+    // seed the durable frontier at the resume point
+    shared.fsyncd_lsn.store(next_start, Ordering::Release);
     let mut acc = SegmentAccumulator::new(
         timeline,
         archive_dir.to_path_buf(),
@@ -588,7 +576,6 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         AccumulatorConfig {
             upload,
             enable_batching,
-            fsyncd_lsn: shared.fsyncd_lsn.clone(),
         },
     )
     .await?;
@@ -627,7 +614,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
             // Periodic standby status keeps a quiet client connected (wal-g
             // pings every 10s) and, with a slot, advances its restart_lsn
             if last_status.elapsed() >= STATUS_UPDATE_INTERVAL {
-                send_status(&mut conn, &acc, mode).await?;
+                send_status(&mut conn, &acc, mode, &shared).await?;
                 last_status = std::time::Instant::now();
             }
 
@@ -673,12 +660,12 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                                 } else {
                                     DrainStop::Bound
                                 };
-                                acc.sync().await?;
+                                acc.sync(&shared.fsyncd_lsn).await?;
                                 match stop {
                                     DrainStop::Bound => {}
                                     DrainStop::Keepalive { reply_requested } => {
                                         if reply_requested {
-                                            send_status(&mut conn, &acc, mode).await?;
+                                            send_status(&mut conn, &acc, mode, &shared).await?;
                                             last_status = std::time::Instant::now();
                                         }
                                     }
@@ -688,7 +675,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                         },
                         Frame::Keepalive(k) => {
                             if k.reply_requested {
-                                send_status(&mut conn, &acc, mode).await?;
+                                send_status(&mut conn, &acc, mode, &shared).await?;
                                 last_status = std::time::Instant::now();
                             }
                         }
@@ -1008,11 +995,16 @@ async fn send_status(
     conn: &mut ReplicationConn,
     acc: &SegmentAccumulator,
     mode: ReceiveMode,
+    shared: &Shared,
 ) -> Result<()> {
     let write = acc.write_position();
     let flush = match mode {
         ReceiveMode::Uploader => acc.flush_position(),
-        ReceiveMode::SyncReplica => acc.fsyncd_position(),
+        // durable frontier, capped by the janitor's back-pressure ceiling
+        ReceiveMode::SyncReplica => shared
+            .fsyncd_lsn
+            .load(Ordering::Acquire)
+            .min(shared.ack_ceiling.load(Ordering::Relaxed)),
     }
     .min(write);
     let payload = build_status_update(write, flush, flush);
@@ -1129,7 +1121,6 @@ mod tests {
             AccumulatorConfig {
                 upload,
                 enable_batching: false,
-                fsyncd_lsn: Arc::new(AtomicU64::new(0)),
             },
         )
         .await
@@ -1347,10 +1338,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seg_size = 16u64;
         let mut acc = test_acc(dir.path(), seg_size).await;
+        let frontier = AtomicU64::new(0);
         acc.write(0, &[0xAB; 4]).await.unwrap();
-        assert_eq!(acc.fsyncd_position(), 0, "buffered, not yet fsync'd");
-        acc.sync().await.unwrap();
-        assert_eq!(acc.fsyncd_position(), 4, "frontier = fsync'd write cursor");
+        assert_eq!(
+            frontier.load(Ordering::Relaxed),
+            0,
+            "buffered, not yet fsync'd"
+        );
+        acc.sync(&frontier).await.unwrap();
+        assert_eq!(
+            frontier.load(Ordering::Relaxed),
+            4,
+            "frontier = fsync'd write cursor"
+        );
     }
 
     #[tokio::test]

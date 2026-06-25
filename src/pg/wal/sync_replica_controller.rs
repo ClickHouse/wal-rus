@@ -27,16 +27,29 @@ const PEER_CREDIT_POLLS: u32 = 3;
 
 /// State shared across the runtime boundary between the receiver hot path and
 /// the sync-replica controller. Every field is single-writer.
-#[derive(Default)]
 pub(crate) struct Shared {
-    /// Durable fsync frontier. WRITER: hot path (`acc.sync`). READER: controller.
-    /// `Arc` so the accumulator can hold just the frontier, not all of `Shared`
-    pub fsyncd_lsn: Arc<AtomicU64>,
+    /// Durable fsync frontier. WRITER: hot path (`acc.sync` writes it at fsync
+    /// time). READERS: controller (poller) + hot path `send_status`
+    pub fsyncd_lsn: AtomicU64,
     /// Receiver is the only live sync acker. WRITER: primary-poller (controller).
     /// READER: hot path drain gate (sole acker ⇒ per-frame fsync)
     pub sole_acker: AtomicBool,
+    /// Max flush the hot path may advertise (back-pressure). `u64::MAX` = no cap.
+    /// WRITER: janitor (controller). READER: hot path `send_status`
+    pub ack_ceiling: AtomicU64,
     /// Shutdown. WRITER: hot path on SIGINT/SIGTERM. READER: controller `serve`
     pub stop: Notify,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            fsyncd_lsn: AtomicU64::new(0),
+            sole_acker: AtomicBool::new(false),
+            ack_ceiling: AtomicU64::new(u64::MAX),
+            stop: Notify::new(),
+        }
+    }
 }
 
 /// The sync-replica control plane. Built by the receiver, run on a dedicated OS
