@@ -1,0 +1,23 @@
+apiVersion: walg.io/v1
+kind: WalReceiver
+metadata:
+  name: walg-recv-demo
+  namespace: walg-receivers
+  labels:
+    app.kubernetes.io/name: wal-receive-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  postgresUbid: pvda4whfnm2y2gp0tkt8e2w5rs
+  tenantName: async-ha-demo
+  primaryTier: m8gd.4xlarge
+  credentialsSecretRef: walg-recv-demo-secrets
+  primary:
+    host: 10.0.1.20
+    user: ubi_replication
+    slotName: walg_sync
+  # The standby DR-push target is supplied at push-time by the control plane
+  # (POST /v1/dr-catchup); it is not part of the CR spec.
+  # Optional: pin the receiver pod to a specific AWS AZ (in addition to
+  # the walg.io/local-nvme node constraint). Empty/omitted = any NVMe node.
+  # placement:
+  #   zone: us-west-2b
