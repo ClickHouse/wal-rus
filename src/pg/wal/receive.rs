@@ -32,6 +32,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -47,6 +48,7 @@ use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, mes
 use crate::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use crate::pg::wal::push;
 use crate::pg::wal::segment::{self, SegmentName};
+use crate::pg::wal::sync_replica_controller::Shared;
 use crate::storage::DynStorage;
 
 /// Status update cadence — wal-g defaults to 10s; we match
@@ -116,8 +118,10 @@ struct SegmentAccumulator {
     /// Highest WAL LSN received (write position). Reset to the restart LSN on a
     /// timeline switch
     received_lsn: u64,
-    /// Highest fsync'd-to-disk LSN — the durable frontier, raised by `sync`
-    highest_fsyncd_lsn: u64,
+    /// Highest fsync'd-to-disk LSN — the durable frontier, raised by `sync`.
+    /// Shared with the controller (`Shared::fsyncd_lsn`) so it can be read across
+    /// the runtime boundary
+    highest_fsyncd_lsn: Arc<AtomicU64>,
 }
 
 /// In-progress segment. Written to `<seg>.partial` (pg_receivewal convention),
@@ -146,6 +150,8 @@ struct AccumulatorConfig {
     upload: bool,
     /// Capability to coalesce frames into one fsync per batch
     enable_batching: bool,
+    /// Durable fsync frontier, shared with the controller (`Shared::fsyncd_lsn`)
+    fsyncd_lsn: Arc<AtomicU64>,
 }
 
 impl SegmentAccumulator {
@@ -161,10 +167,13 @@ impl SegmentAccumulator {
         let AccumulatorConfig {
             upload,
             enable_batching,
+            fsyncd_lsn,
         } = config;
         fs::create_dir_all(&archive_dir)
             .await
             .with_context(|| format!("create_dir_all {}", archive_dir.display()))?;
+        // seed the shared frontier at the resume point
+        fsyncd_lsn.store(start_lsn, Ordering::Release);
         let upload_sem = Arc::new(Semaphore::new(settings.upload_concurrency.max(1)));
         Ok(Self {
             seg_size,
@@ -179,7 +188,7 @@ impl SegmentAccumulator {
             upload_sem,
             in_flight: BTreeSet::new(),
             received_lsn: start_lsn,
-            highest_fsyncd_lsn: start_lsn,
+            highest_fsyncd_lsn: fsyncd_lsn,
         })
     }
 
@@ -470,14 +479,17 @@ impl SegmentAccumulator {
         };
         cur.file.sync_data().await?;
         let durable = cur.name.start_lsn(self.seg_size) + cur.bytes_written;
-        self.highest_fsyncd_lsn = self.highest_fsyncd_lsn.max(durable);
+        // single writer (the hot path), so load Relaxed + store Release; the max
+        // guards a reconnect re-streaming a partial from a lower offset
+        let raised = self.highest_fsyncd_lsn.load(Ordering::Relaxed).max(durable);
+        self.highest_fsyncd_lsn.store(raised, Ordering::Release);
         Ok(())
     }
 
     /// Highest fsync'd-to-disk LSN — the durable frontier, reported as the flush
     /// position in SyncReplica mode
     fn fsyncd_position(&self) -> u64 {
-        self.highest_fsyncd_lsn
+        self.highest_fsyncd_lsn.load(Ordering::Acquire)
     }
 }
 
@@ -563,6 +575,9 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         format_pg_lsn(next_start),
     );
 
+    // State bridged to the (future) sync-replica controller across the runtime
+    // boundary. Default ⇒ sole_acker=false ⇒ batching gate unaffected
+    let shared = Arc::new(Shared::default());
     let mut acc = SegmentAccumulator::new(
         timeline,
         archive_dir.to_path_buf(),
@@ -573,6 +588,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         AccumulatorConfig {
             upload,
             enable_batching,
+            fsyncd_lsn: shared.fsyncd_lsn.clone(),
         },
     )
     .await?;
@@ -596,6 +612,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                 biased;
                 _ = &mut shutdown => {
                     tracing::info!(target = "wal_receive", "shutdown signal received, flushing");
+                    shared.stop.notify_waiters();
                     acc.drain_uploads().await?;
                     acc.finalize_partial().await?;
                     return Ok(());
@@ -623,7 +640,10 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                             ReceiveMode::Uploader => acc.write(w.start_lsn, w.data).await?,
                             ReceiveMode::SyncReplica => {
                                 acc.write(w.start_lsn, w.data).await?;
-                                let stop = if acc.enable_batching {
+                                // sole acker ⇒ skip batching ⇒ per-frame fsync
+                                let batch = acc.enable_batching
+                                    && !shared.sole_acker.load(Ordering::Relaxed);
+                                let stop = if batch {
                                     drain_wal_batch(&mut conn, &mut acc, DRAIN_BOUNDS).await?
                                 } else {
                                     DrainStop::Bound
@@ -1078,6 +1098,7 @@ mod tests {
             AccumulatorConfig {
                 upload,
                 enable_batching: false,
+                fsyncd_lsn: Arc::new(AtomicU64::new(0)),
             },
         )
         .await

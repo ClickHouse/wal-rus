@@ -6,4 +6,5 @@ pub mod restore;
 pub mod segment;
 pub mod segment_file;
 pub mod show;
+pub mod sync_replica_controller;
 pub mod verify;
