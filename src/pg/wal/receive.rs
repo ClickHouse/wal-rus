@@ -46,9 +46,9 @@ use crate::config::Settings;
 use crate::pg::backup::{format_pg_lsn, parse_pg_lsn};
 use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
 use crate::pg::replication::stream::{Frame, build_status_update, decode_frame};
+use crate::pg::sync_replica::{Shared, SyncReplicaController};
 use crate::pg::wal::push;
 use crate::pg::wal::segment::{self, SegmentName};
-use crate::pg::wal::sync_replica_controller::{Shared, SyncReplicaController};
 use crate::storage::DynStorage;
 
 /// Status update cadence — wal-g defaults to 10s; we match

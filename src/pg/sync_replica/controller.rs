@@ -10,12 +10,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::sync::Notify;
 
+use super::Shared;
 use crate::pg::backup::parse_pg_lsn;
 use crate::pg::replication::conn::{PgConfig, ReplicationConn};
 use crate::pg::wal::segment::SegmentName;
@@ -34,33 +34,6 @@ const RETAIN_BUDGET_SEGS: usize = 128;
 /// Retained segments above this are dropped oldest-first — a last resort that
 /// sacrifices their DR-tail when back-pressure can't brake (healthy peer). ~4 GiB
 const RETAIN_HARD_CAP_SEGS: usize = 256;
-
-/// State shared across the runtime boundary between the receiver hot path and
-/// the sync-replica controller. Every field is single-writer.
-pub(crate) struct Shared {
-    /// Durable fsync frontier. WRITER: hot path (`acc.sync` writes it at fsync
-    /// time). READERS: controller (poller) + hot path `send_status`
-    pub fsyncd_lsn: AtomicU64,
-    /// Receiver is the only live sync acker. WRITER: primary-poller (controller).
-    /// READER: hot path drain gate (sole acker ⇒ per-frame fsync)
-    pub sole_acker: AtomicBool,
-    /// Max flush the hot path may advertise (back-pressure). `u64::MAX` = no cap.
-    /// WRITER: janitor (controller). READER: hot path `send_status`
-    pub ack_ceiling: AtomicU64,
-    /// Shutdown. WRITER: hot path on SIGINT/SIGTERM. READER: controller `serve`
-    pub stop: Notify,
-}
-
-impl Default for Shared {
-    fn default() -> Self {
-        Self {
-            fsyncd_lsn: AtomicU64::new(0),
-            sole_acker: AtomicBool::new(false),
-            ack_ceiling: AtomicU64::new(u64::MAX),
-            stop: Notify::new(),
-        }
-    }
-}
 
 /// The sync-replica control plane. Built by the receiver, run on a dedicated OS
 /// thread that owns the controller's tokio runtime.
@@ -161,20 +134,28 @@ impl SyncReplicaController {
         }
     }
 
-    /// Read the primary's archived-WAL gate, then prune retained segments and
-    /// set the back-pressure ceiling. The fs work runs on the blocking pool so a
-    /// slow unlink can't stall the fast sole-acker cadence.
+    /// Read the primary's archived-WAL gate — a quick single-row query that
+    /// shares the poller connection — then fire the prune + back-pressure update
+    /// as a DETACHED task, so the fs sweep never delays the next peer-health poll.
+    /// Only the ~ms gate query is on the poller's critical path; the scan/unlink
+    /// runs concurrently on the controller runtime's second worker + blocking pool.
     async fn run_janitor(&self, conn: &mut ReplicationConn) -> Result<()> {
         let last_archived = self.last_archived_wal(conn).await?;
         let frontier = self.shared.fsyncd_lsn.load(Ordering::Acquire);
         let dir = self.archive_dir.clone();
         let seg_size = self.seg_size;
-        let ceiling = tokio::task::spawn_blocking(move || {
-            janitor_sweep(&dir, seg_size, last_archived, frontier)
-        })
-        .await
-        .context("janitor sweep join")??;
-        self.shared.ack_ceiling.store(ceiling, Ordering::Relaxed);
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || {
+                janitor_sweep(&dir, seg_size, last_archived, frontier)
+            })
+            .await
+            {
+                Ok(Ok(ceiling)) => shared.ack_ceiling.store(ceiling, Ordering::Relaxed),
+                Ok(Err(e)) => tracing::warn!(target = "sync_replica", "janitor sweep: {e:#}"),
+                Err(e) => tracing::warn!(target = "sync_replica", "janitor sweep join: {e:#}"),
+            }
+        });
         Ok(())
     }
 

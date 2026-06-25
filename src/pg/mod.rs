@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod replication;
+pub mod sync_replica;
 pub mod wal;
 pub mod wal_summaries;
 pub mod walparser;
