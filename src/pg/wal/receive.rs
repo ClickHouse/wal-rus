@@ -98,6 +98,10 @@ struct SegmentAccumulator {
     /// Upload completed segments to object storage (Uploader). When false
     /// (SyncReplica), rotated `<seg>` files are fsync'd and retained on disk
     upload: bool,
+    /// Capability to coalesce consecutive WAL frames into one fsync per batch.
+    /// Static config; the hot path gates the live decision on the controller's
+    /// sole-acker signal too (sole acker -> per-frame fsync)
+    enable_batching: bool,
     /// In-flight segment uploads, bounded by `upload_sem`. Each task yields the
     /// start LSN of the segment it shipped so reaping can drop it from
     /// `in_flight`. Receive loop reaps completions each iteration; rotation
@@ -135,6 +139,15 @@ struct Rotated {
     path: PathBuf,
 }
 
+/// Mode-derived behavior `handle` hands to the accumulator (so the constructor
+/// stays a few args). Derived from `ReceiveMode` + env, not the mode itself
+struct AccumulatorConfig {
+    /// Upload completed segments (Uploader) vs retain on disk (SyncReplica)
+    upload: bool,
+    /// Capability to coalesce frames into one fsync per batch
+    enable_batching: bool,
+}
+
 impl SegmentAccumulator {
     async fn new(
         timeline: u32,
@@ -143,8 +156,12 @@ impl SegmentAccumulator {
         settings: Settings,
         storage: DynStorage,
         start_lsn: u64,
-        upload: bool,
+        config: AccumulatorConfig,
     ) -> Result<Self> {
+        let AccumulatorConfig {
+            upload,
+            enable_batching,
+        } = config;
         fs::create_dir_all(&archive_dir)
             .await
             .with_context(|| format!("create_dir_all {}", archive_dir.display()))?;
@@ -157,6 +174,7 @@ impl SegmentAccumulator {
             settings,
             storage,
             upload,
+            enable_batching,
             uploads: JoinSet::new(),
             upload_sem,
             in_flight: BTreeSet::new(),
@@ -467,7 +485,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
     let cfg = PgConfig::from_env()?;
     let slot_name = slot_name_from_env()?;
     let mode = receive_mode_from_env()?;
-    let drain_batching = drain_batching_from_env()?;
+    let enable_batching = enable_batching_from_env()?;
     // Uploader archives completed segments; SyncReplica retains them on disk
     let upload = matches!(mode, ReceiveMode::Uploader);
 
@@ -552,7 +570,10 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
         settings.clone(),
         storage.clone(),
         next_start,
-        upload,
+        AccumulatorConfig {
+            upload,
+            enable_batching,
+        },
     )
     .await?;
     let mut last_status = std::time::Instant::now();
@@ -602,7 +623,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
                             ReceiveMode::Uploader => acc.write(w.start_lsn, w.data).await?,
                             ReceiveMode::SyncReplica => {
                                 acc.write(w.start_lsn, w.data).await?;
-                                let stop = if drain_batching {
+                                let stop = if acc.enable_batching {
                                     drain_wal_batch(&mut conn, &mut acc, DRAIN_BOUNDS).await?
                                 } else {
                                     DrainStop::Bound
@@ -691,9 +712,10 @@ fn receive_mode_from_env() -> Result<ReceiveMode> {
     }
 }
 
-/// `WALG_WAL_RECEIVE_DRAIN_BATCHING`: coalesce consecutive WAL frames into one
-/// fsync per batch (SyncReplica mode only). Off by default
-fn drain_batching_from_env() -> Result<bool> {
+/// `WALG_WAL_RECEIVE_DRAIN_BATCHING`: the accumulator's batching capability —
+/// coalesce consecutive WAL frames into one fsync per batch (SyncReplica only).
+/// Off by default
+fn enable_batching_from_env() -> Result<bool> {
     crate::config::parse_env_bool("WALG_WAL_RECEIVE_DRAIN_BATCHING", false)
 }
 
@@ -1046,9 +1068,20 @@ mod tests {
         let store = dir.join("store");
         let settings = test_settings(&store);
         let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
-        SegmentAccumulator::new(1, dir.to_path_buf(), seg_size, settings, storage, 0, upload)
-            .await
-            .unwrap()
+        SegmentAccumulator::new(
+            1,
+            dir.to_path_buf(),
+            seg_size,
+            settings,
+            storage,
+            0,
+            AccumulatorConfig {
+                upload,
+                enable_batching: false,
+            },
+        )
+        .await
+        .unwrap()
     }
 
     // decode_frame / build_status_update wire coverage lives in the owner
