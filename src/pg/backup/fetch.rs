@@ -66,6 +66,18 @@ pub async fn handle_with_args(
         .await
         .with_context(|| format!("create_dir_all {}", dst.display()))?;
 
+    // PGDATA itself has no tar entry (the push walk emits its contents, not the
+    // root), so its mode would otherwise be the umask default and PG refuses to
+    // start on anything but 0700/0750. Subdir modes come from their tar entries
+    // in unpack_entry
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o700))
+            .await
+            .with_context(|| format!("chmod {}", dst.display()))?;
+    }
+
     // Restore tablespace symlinks BEFORE extracting parts so the tar crate
     // writes through the symlink rather than materializing a real dir at
     // pg_tblspc/<oid>. wal-g does the same in `EnsureSymlinkExist`
@@ -370,13 +382,22 @@ where
         tokio::fs::create_dir_all(parent).await?;
     }
     if etype.is_dir() {
-        return tokio::fs::create_dir(&target).await.or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e.into())
-            }
-        });
+        match tokio::fs::create_dir(&target).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        // Apply the archived directory mode (wal-g chmods restored dirs too).
+        // Without this dirs land at the umask default (0775) and PG rejects the
+        // restored data dir; files already get their mode applied below
+        #[cfg(unix)]
+        if let Ok(mode) = header.mode() {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                .await
+                .with_context(|| format!("chmod dir {}", target.display()))?;
+        }
+        return Ok(());
     }
     if etype.is_symlink() {
         // pg_tblspc/<oid> links are restored up-front from the sentinel
@@ -506,5 +527,58 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("apply increment"), "{msg}");
         assert!(msg.contains("open target"), "{msg}");
+    }
+
+    /// A tar dir entry carries its mode; restore must apply it. PG refuses to
+    /// start on a data dir that isn't 0700/0750, and dirs previously landed at
+    /// the umask default (0775) because only files got their mode set
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restores_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut dh = tar::Header::new_gnu();
+        dh.set_size(0);
+        dh.set_mode(0o700);
+        dh.set_entry_type(tar::EntryType::Directory);
+        builder
+            .append_data(&mut dh, "global", std::io::empty())
+            .unwrap();
+        let data = b"x".to_vec();
+        let mut fh = tar::Header::new_gnu();
+        fh.set_size(data.len() as u64);
+        fh.set_mode(0o600);
+        fh.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut fh, "global/pg_filenode.map", &data[..])
+            .unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let key = "basebackups_005/base_test/tar_partitions/part_001.tar";
+        let len = tar_bytes.len() as u64;
+        let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(tar_bytes));
+        storage.put(key, r, Some(len)).await.unwrap();
+
+        let restore = dir.path().join("restore");
+        let settings = Settings::default();
+        unpack_part(&settings, &storage, key, &restore, Arc::new(HashSet::new()))
+            .await
+            .unwrap();
+
+        let dir_mode = std::fs::metadata(restore.join("global"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "restored dir mode");
+        let file_mode = std::fs::metadata(restore.join("global/pg_filenode.map"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "restored file mode");
     }
 }
