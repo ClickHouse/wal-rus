@@ -2,7 +2,7 @@
 name = "wal-rus"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.90"
 description = "Rust port of wal-g for PostgreSQL, optimized for no-overcommit hosts"
 license = "Apache-2.0"
 repository = "https://github.com/ClickHouse/wal-rus"
@@ -18,7 +18,7 @@ name = "walrus"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "net", "signal", "sync", "time", "process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "signal", "sync", "time", "process"] }
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 futures = "0.3"
 async-trait = "0.1"
@@ -51,6 +51,7 @@ rustls-pemfile = "2"
 webpki-roots = "1"
 dryoc = { version = "0.8", default-features = false, features = ["u64_backend"] }
 libc = "0.2"
+glob = "0.3.3"
 
 [dev-dependencies]
 tempfile = "3"

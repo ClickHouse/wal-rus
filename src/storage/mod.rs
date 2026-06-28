@@ -11,6 +11,7 @@ use futures::Stream;
 use thiserror::Error;
 use tokio::io::AsyncRead;
 
+pub mod check;
 pub mod creds;
 pub mod fs;
 pub mod gcs;
@@ -18,6 +19,7 @@ pub mod retrying;
 pub mod s3;
 #[cfg(test)]
 pub(crate) mod test_http;
+pub mod tools;
 
 pub type AsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 pub type ObjectStream =
