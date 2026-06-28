@@ -1,11 +1,9 @@
 use std::process::ExitCode;
 
-use clap::Parser;
-
 fn main() -> ExitCode {
     walrus::log::init();
 
-    let cli = walrus::cli::Cli::parse();
+    let cli = walrus::cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -16,6 +14,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: walrus::cli::Cli) -> anyhow::Result<()> {
+    if let Some(path) = cli.config.as_deref() {
+        walrus::config::load_env_file(path)?;
+    }
     let threads = cli.worker_threads()?;
     cap_malloc_arenas(threads);
     // current_thread when 1: no worker threads, single glibc malloc arena
