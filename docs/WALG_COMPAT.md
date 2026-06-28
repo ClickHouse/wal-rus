@@ -166,8 +166,6 @@ Accepted by wal-g Postgres config but not used by PG code paths:
 - `AWS_ROLE_ARN`
 - `AWS_ROLE_SESSION_NAME`
 - `AWS_WEB_IDENTITY_TOKEN_FILE`
-- `AWS_ENDPOINT`
-- `AWS_S3_FORCE_PATH_STYLE`
 - `AWS_DUAL_STACK`
 - `WALG_S3_CA_CERT_FILE`
 - `S3_CA_CERT_FILE`

@@ -3,9 +3,9 @@
 //! UNSIGNED-PAYLOAD on HTTPS so we don't buffer or hash request bodies
 //!
 //! Env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-//! AWS_REGION (default us-east-1), AWS_ENDPOINT_URL or WALG_S3_ENDPOINT,
-//! WALG_S3_FORCE_PATH_STYLE. Without static keys, credentials come from the
-//! EC2 metadata service (see [`super::creds`])
+//! AWS_REGION (default us-east-1), endpoint from AWS_ENDPOINT_URL / AWS_ENDPOINT
+//! / WALG_S3_ENDPOINT, path-style from AWS_S3_FORCE_PATH_STYLE. Without static
+//! keys, credentials come from the EC2 metadata service (see [`super::creds`])
 
 use std::io::Cursor;
 use std::sync::Arc;

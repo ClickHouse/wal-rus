@@ -1,5 +1,6 @@
 //! CLI surface mirroring wal-g pg subcommands; only wired ones do real work
 
+use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -39,8 +40,53 @@ pub struct Cli {
     /// WALG_DOWNLOAD_CONCURRENCY), 1 elsewhere
     #[arg(long, global = true, env = "WALG_THREADS")]
     pub threads: Option<NonZeroUsize>,
+    /// load `KEY=VALUE` settings into the environment before running
+    /// (existing env vars win). Accepts wal-g's `wal-g.env` files
+    #[arg(long, global = true, value_name = "FILE")]
+    pub config: Option<PathBuf>,
     #[command(subcommand)]
     pub cmd: Cmd,
+}
+
+/// Parse argv, honoring the `walg-daemon-client` multicall name. wal-g ships a
+/// separate `walg-daemon-client SOCKET COMMAND [ARGS]` binary; when argv[0]'s
+/// basename is `walg-daemon-client` (a symlink to this binary) we expose the
+/// same behavior by rewriting to the native `daemon-client` subcommand
+pub fn parse() -> Cli {
+    parse_from(std::env::args_os())
+}
+
+fn parse_from<I, T>(args: I) -> Cli
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    match walg_daemon_client_argv(&argv) {
+        Some(rewritten) => Cli::parse_from(rewritten),
+        None => Cli::parse_from(argv),
+    }
+}
+
+/// Map `walg-daemon-client SOCKET COMMAND [ARGS]` to the native
+/// `daemon-client --socket SOCKET COMMAND [ARGS]`. Returns `None` for any other
+/// program name. wal-g's `-timeout`/`-connection-timeout` flags are not
+/// translated (archive_command callers never pass them); walrus defaults apply
+fn walg_daemon_client_argv(argv: &[OsString]) -> Option<Vec<OsString>> {
+    let prog = argv.first()?;
+    let name = std::path::Path::new(prog).file_name()?.to_str()?;
+    if name != "walg-daemon-client" {
+        return None;
+    }
+    let socket = argv.get(1)?;
+    let mut out: Vec<OsString> = vec![
+        "walrus".into(),
+        "daemon-client".into(),
+        "--socket".into(),
+        socket.clone(),
+    ];
+    out.extend(argv.iter().skip(2).cloned());
+    Some(out)
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,6 +173,11 @@ pub enum Cmd {
         /// Pass NOVERIFY_CHECKSUMS / VERIFY_CHECKSUMS false to BASE_BACKUP
         #[arg(long)]
         no_verify_checksums: bool,
+        /// wal-g `--verify`/`-v`: accepted for CLI parity. walrus relies on
+        /// BASE_BACKUP server-side checksum verification and does not implement
+        /// wal-g's corrupt-block storing (`WALG_VERIFY_PAGE_CHECKSUMS`)
+        #[arg(long, short = 'v')]
+        verify: bool,
         /// Override `WALG_TAR_SIZE_THRESHOLD` (bytes); 0 = default 1 GiB
         #[arg(long, default_value_t = 0u64, env = "WALG_TAR_SIZE_THRESHOLD")]
         tar_size_threshold: u64,
@@ -193,8 +244,12 @@ pub enum Cmd {
     },
     /// Run as a long-lived daemon over a unix socket
     Daemon {
-        #[arg(long)]
-        socket: PathBuf,
+        /// Socket path. wal-g positional form `daemon <socket>`; `--socket`
+        /// also accepted for the walrus-native form
+        #[arg(value_name = "SOCKET", conflicts_with = "socket_flag")]
+        socket: Option<PathBuf>,
+        #[arg(long = "socket", value_name = "SOCKET")]
+        socket_flag: Option<PathBuf>,
     },
     /// Send a single command to the daemon
     DaemonClient {
@@ -379,7 +434,13 @@ impl Cli {
                 delta_from_wal_summaries,
                 increment_format,
                 full,
+                verify,
             } => {
+                if verify {
+                    tracing::debug!(
+                        "--verify accepted; relying on BASE_BACKUP server-side checksum verification"
+                    );
+                }
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
                 let user_data = user_data
@@ -504,7 +565,13 @@ impl Cli {
                 )
                 .await
             }
-            Cmd::Daemon { socket } => {
+            Cmd::Daemon {
+                socket,
+                socket_flag,
+            } => {
+                let socket = socket
+                    .or(socket_flag)
+                    .ok_or_else(|| anyhow::anyhow!("daemon requires a socket path"))?;
                 let s = Settings::from_env()?;
                 let storage = s.build_storage()?;
                 crate::daemon::serve(&socket, s, storage).await
@@ -546,6 +613,91 @@ mod tests {
             }
             _ => panic!("expected backup-push"),
         }
+    }
+
+    #[test]
+    fn backup_push_accepts_walg_verify_flag() {
+        // ubicloud take-backup passes `--verify`; parity flag, not an error
+        let cli = Cli::parse_from(["walrus", "backup-push", "/dat/18/data", "--verify"]);
+        match cli.cmd {
+            Cmd::BackupPush { verify, .. } => assert!(verify),
+            _ => panic!("expected backup-push"),
+        }
+        assert!(matches!(
+            Cli::parse_from(["walrus", "backup-push", "/d", "-v"]).cmd,
+            Cmd::BackupPush { verify: true, .. }
+        ));
+    }
+
+    #[test]
+    fn config_is_global_after_positionals() {
+        // archive_command/restore_command append `--config` after the subcommand args
+        let cli = Cli::parse_from(["walrus", "wal-push", "/p", "--config", "/etc/walg.env"]);
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/walg.env")));
+        assert!(matches!(cli.cmd, Cmd::WalPush { .. }));
+    }
+
+    #[test]
+    fn walg_daemon_client_name_rewrites_to_daemon_client() {
+        let argv: Vec<OsString> = [
+            "/usr/bin/walg-daemon-client",
+            "/tmp/wal-g",
+            "wal-push",
+            "000000010000000000000001",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let rewritten = walg_daemon_client_argv(&argv).expect("multicall rewrite");
+        match Cli::parse_from(rewritten).cmd {
+            Cmd::DaemonClient { socket, op, .. } => {
+                assert_eq!(socket, PathBuf::from("/tmp/wal-g"));
+                match op {
+                    DaemonOp::WalPush { wal_filepath } => {
+                        assert_eq!(wal_filepath, PathBuf::from("000000010000000000000001"));
+                    }
+                    _ => panic!("expected wal-push op"),
+                }
+            }
+            _ => panic!("expected daemon-client"),
+        }
+    }
+
+    #[test]
+    fn other_program_names_are_not_rewritten() {
+        let argv: Vec<OsString> = ["/usr/bin/wal-g", "wal-show"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(walg_daemon_client_argv(&argv).is_none());
+    }
+
+    #[test]
+    fn daemon_accepts_positional_and_flag_socket() {
+        // wal-g positional form (systemd ExecStart + `wal-g daemon <socket>`)
+        match Cli::parse_from(["walrus", "daemon", "/tmp/wal-g"]).cmd {
+            Cmd::Daemon {
+                socket,
+                socket_flag,
+            } => {
+                assert_eq!(socket, Some(PathBuf::from("/tmp/wal-g")));
+                assert_eq!(socket_flag, None);
+            }
+            _ => panic!("expected daemon"),
+        }
+        // walrus-native flag form stays valid
+        match Cli::parse_from(["walrus", "daemon", "--socket", "/tmp/wal-g"]).cmd {
+            Cmd::Daemon {
+                socket,
+                socket_flag,
+            } => {
+                assert_eq!(socket, None);
+                assert_eq!(socket_flag, Some(PathBuf::from("/tmp/wal-g")));
+            }
+            _ => panic!("expected daemon"),
+        }
+        // both at once is rejected
+        assert!(Cli::try_parse_from(["walrus", "daemon", "/a", "--socket", "/b"]).is_err());
     }
 
     fn worker_threads_of(args: &[&str]) -> usize {

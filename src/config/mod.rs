@@ -264,7 +264,7 @@ fn split_bucket_prefix(rest: &str) -> (String, String) {
 /// fall back to env honoring every wal-g alias so detection & destination
 /// resolution read the same names: AWS_REGION/WALG_S3_REGION,
 /// AWS_ACCESS_KEY_ID/AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY/AWS_SECRET_KEY,
-/// AWS_SESSION_TOKEN, AWS_ENDPOINT_URL/WALG_S3_ENDPOINT, WALG_S3_FORCE_PATH_STYLE
+/// AWS_SESSION_TOKEN, AWS_ENDPOINT_URL/WALG_S3_ENDPOINT, AWS_S3_FORCE_PATH_STYLE
 fn s3_config_from_env(
     bucket: String,
     prefix: String,
@@ -279,10 +279,11 @@ fn s3_config_from_env(
     let endpoint = src
         .and_then(|c| c.endpoint.clone())
         .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
+        .or_else(|| std::env::var("AWS_ENDPOINT").ok())
         .or_else(|| std::env::var("WALG_S3_ENDPOINT").ok());
     let force_path_style = match src {
         Some(c) => c.force_path_style,
-        None => parse_env_bool("WALG_S3_FORCE_PATH_STYLE", endpoint.is_some())?,
+        None => force_path_style_from_env(endpoint.is_some())?,
     };
     Ok(s3::S3Config {
         bucket,
@@ -292,6 +293,61 @@ fn s3_config_from_env(
         endpoint,
         force_path_style,
     })
+}
+
+/// `AWS_S3_FORCE_PATH_STYLE` (wal-g name). Defaults to `endpoint_set` so a
+/// custom endpoint (minio/ceph) gets path-style addressing without an explicit
+/// flag
+fn force_path_style_from_env(endpoint_set: bool) -> Result<bool> {
+    let key = "AWS_S3_FORCE_PATH_STYLE";
+    if std::env::var_os(key).is_some() {
+        return parse_env_bool(key, endpoint_set);
+    }
+    Ok(endpoint_set)
+}
+
+/// Load a wal-g `--config` file into the process environment. The file is
+/// dotenv `KEY=VALUE` (wal-g reads it via viper; the same file doubles as the
+/// systemd `EnvironmentFile`). Existing environment variables take precedence
+/// (viper `AutomaticEnv` semantics), so this only fills gaps.
+///
+/// Must run before the async runtime starts any worker thread: `set_var` is
+/// process-global and unsound to race against concurrent `getenv`
+pub fn load_env_file(path: &std::path::Path) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read config file {}", path.display()))?;
+    for (i, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (key, val) = line
+            .split_once('=')
+            .ok_or_else(|| anyhow!("{}:{}: expected KEY=VALUE", path.display(), i + 1))?;
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("{}:{}: empty key", path.display(), i + 1);
+        }
+        if std::env::var_os(key).is_some() {
+            continue;
+        }
+        let val = unquote(val.trim());
+        // SAFETY: callers invoke this on the main thread before constructing
+        // the tokio runtime, so no other thread can be in getenv/setenv
+        unsafe { std::env::set_var(key, val) };
+    }
+    Ok(())
+}
+
+/// Strip one layer of matching single or double quotes, dotenv-style
+fn unquote(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Pick a credential source: inherit `src`, else explicit static env keys,
@@ -568,7 +624,7 @@ mod tests {
             ("AWS_SESSION_TOKEN", None),
             ("AWS_ENDPOINT_URL", None),
             ("WALG_S3_ENDPOINT", Some("http://minio:9000")),
-            ("WALG_S3_FORCE_PATH_STYLE", Some("true")),
+            ("AWS_S3_FORCE_PATH_STYLE", Some("true")),
         ];
         let _g = EnvGuard::new(&vars);
         let src = StorageSettings::Fs { path: "/x".into() };
@@ -775,7 +831,7 @@ mod tests {
                 ("AWS_SESSION_TOKEN", None),
                 ("AWS_ENDPOINT_URL", None),
                 ("WALG_S3_ENDPOINT", None),
-                ("WALG_S3_FORCE_PATH_STYLE", None),
+                ("AWS_S3_FORCE_PATH_STYLE", None),
             ]);
             match detect_storage().unwrap() {
                 StorageSettings::S3(c) => {
@@ -1000,5 +1056,64 @@ mod tests {
             ("AWS_SECRET_KEY", None),
         ]);
         assert!(s3_credentials(None).is_err());
+    }
+
+    #[test]
+    fn s3_reads_walg_endpoint_and_force_path_style_names() {
+        // ubicloud's wal-g.env uses the wal-g var names AWS_ENDPOINT +
+        // AWS_S3_FORCE_PATH_STYLE (minio / custom S3), not AWS_ENDPOINT_URL
+        let _g = EnvGuard::new(&[
+            ("WALG_FILE_PREFIX", None),
+            ("WALG_GS_PREFIX", None),
+            ("WALG_S3_PREFIX", Some("s3://bkt")),
+            ("AWS_ENDPOINT_URL", None),
+            ("WALG_S3_ENDPOINT", None),
+            ("AWS_ENDPOINT", Some("http://minio:9000")),
+            ("AWS_S3_FORCE_PATH_STYLE", Some("true")),
+            ("AWS_REGION", Some("us-east-1")),
+            ("AWS_ACCESS_KEY_ID", Some("k")),
+            ("AWS_SECRET_ACCESS_KEY", Some("s")),
+        ]);
+        match detect_storage().unwrap() {
+            StorageSettings::S3(c) => {
+                assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
+                assert!(c.force_path_style);
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_env_file_fills_gaps_without_clobbering() {
+        let _g = EnvGuard::new(&[
+            ("WALG_S3_PREFIX", Some("s3://envbkt")), // already set: must survive
+            ("AWS_REGION", None),                    // unset: file supplies
+            ("AWS_ACCESS_KEY_ID", None),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-g.env");
+        std::fs::write(
+            &path,
+            "# region + key, prefix already in env\n\
+             WALG_S3_PREFIX=s3://filebkt\n\
+             \n\
+             export AWS_REGION=eu-west-3\n\
+             AWS_ACCESS_KEY_ID=\"quoted\"\n",
+        )
+        .unwrap();
+        load_env_file(&path).unwrap();
+        assert_eq!(std::env::var("WALG_S3_PREFIX").unwrap(), "s3://envbkt");
+        assert_eq!(std::env::var("AWS_REGION").unwrap(), "eu-west-3");
+        assert_eq!(std::env::var("AWS_ACCESS_KEY_ID").unwrap(), "quoted");
+    }
+
+    #[test]
+    fn load_env_file_rejects_malformed_line() {
+        // guard VALID so the partial application before the error is reverted
+        let _g = EnvGuard::new(&[("VALID", None)]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.env");
+        std::fs::write(&path, "VALID=1\nnot_a_pair\n").unwrap();
+        assert!(load_env_file(&path).is_err());
     }
 }
