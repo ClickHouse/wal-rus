@@ -35,7 +35,7 @@ use uploader::Uploader;
 const PG_WAL: &str = "pg_wal";
 
 /// `WALG_DAEMON_WAL_UPLOAD_TIMEOUT` default, matching wal-g
-const DEFAULT_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-daemon shared state: the standing uploader, the resolved PGDATA used
 /// to turn PG's `%f`/`%p` arguments into absolute paths, and the per-push
@@ -46,13 +46,13 @@ struct Daemon {
     push_timeout: Duration,
 }
 
-pub async fn serve(socket: &Path, settings: Settings, storage: DynStorage) -> Result<()> {
-    // Read config before binding so a bad value fails fast without leaving a
-    // socket behind
-    let push_timeout =
-        crate::config::duration_env("WALG_DAEMON_WAL_UPLOAD_TIMEOUT", DEFAULT_PUSH_TIMEOUT)?;
-    let pgdata = std::env::var_os("PGDATA").map(PathBuf::from);
-
+pub async fn serve(
+    socket: &Path,
+    settings: Settings,
+    storage: DynStorage,
+    push_timeout: Duration,
+    pgdata: Option<PathBuf>,
+) -> Result<()> {
     if socket.exists() {
         std::fs::remove_file(socket)
             .with_context(|| format!("remove stale socket {}", socket.display()))?;

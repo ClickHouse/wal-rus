@@ -369,10 +369,13 @@ impl SegmentAccumulator {
     }
 }
 
-pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path) -> Result<()> {
-    let cfg = PgConfig::from_env()?;
-    let slot_name = slot_name_from_env()?;
-
+pub async fn handle(
+    settings: &Settings,
+    storage: DynStorage,
+    archive_dir: &Path,
+    cfg: PgConfig,
+    slot_name: Option<String>,
+) -> Result<()> {
     // wal_segment_size + slot info come from a normal (non-replication)
     // connection — physical replication mode forbids these queries, so wal-g
     // opens the same kind of side connection in getCurrentWalInfo
@@ -545,11 +548,8 @@ pub async fn handle(settings: &Settings, storage: DynStorage, archive_dir: &Path
 
 /// `WALG_SLOTNAME`. Unset or empty -> `None` (slotless replication). wal-g
 /// instead defaults to a `walg` slot; see WALG_COMPAT.md for the divergence
-fn slot_name_from_env() -> Result<Option<String>> {
-    let Some(name) = std::env::var("WALG_SLOTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
+pub fn slot_name(vars: &crate::config::Vars) -> Result<Option<String>> {
+    let Some(name) = vars.get("WALG_SLOTNAME").filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
     validate_slot_name(&name)?;

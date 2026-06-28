@@ -67,14 +67,19 @@ pub struct PushArgs {
     pub full: bool,
 }
 
-pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) -> Result<()> {
+pub async fn handle(
+    settings: &Settings,
+    storage: DynStorage,
+    args: PushArgs,
+    cfg: PgConfig,
+) -> Result<()> {
     // A local PGDATA directory selects the filesystem source (wal-g
     // semantics): walks the data dir & packs parts concurrently. Without a
     // readable local pgdata, fall through to the single-stream BASE_BACKUP path
     if let Some(pgdata) = args.pgdata.as_deref()
         && super::fs_push::is_pgdata_dir(pgdata)
     {
-        return super::fs_push::handle(settings, storage, args).await;
+        return super::fs_push::handle(settings, storage, args, cfg).await;
     }
 
     let start_time = chrono::Utc::now();
@@ -118,7 +123,6 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         );
     }
 
-    let cfg = PgConfig::from_env()?;
     tracing::info!(
         target = "backup_push",
         "connecting to {}:{} as {} (db={})",

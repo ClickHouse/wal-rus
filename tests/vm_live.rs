@@ -16,8 +16,9 @@
 
 use std::sync::Arc;
 
-use walrus::config::{Settings, StorageSettings};
+use walrus::config::{Settings, StorageSettings, Vars};
 use walrus::pg::backup;
+use walrus::pg::replication::PgConfig;
 use walrus::pg::wal;
 use walrus::storage::Storage;
 use walrus::storage::fs::FsStorage;
@@ -27,6 +28,12 @@ fn settings_for(path: &str) -> Settings {
         storage: StorageSettings::Fs { path: path.into() },
         ..Default::default()
     }
+}
+
+/// PgConfig from PGHOST/PGPORT/PGUSER/PGDATABASE, mirroring the CLI's
+/// `PgConfig::resolve`
+fn pg_cfg() -> PgConfig {
+    PgConfig::resolve(&Vars::default()).expect("resolve PgConfig from env")
 }
 
 #[tokio::test]
@@ -81,7 +88,7 @@ async fn backup_push_fetch_against_live_pg() {
         increment_format: Default::default(),
         full: false,
     };
-    backup::push::handle(&s, store.clone(), args)
+    backup::push::handle(&s, store.clone(), args, pg_cfg())
         .await
         .expect("backup-push against live PG");
 
@@ -200,7 +207,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
         increment_format: Default::default(),
         full: false,
     };
-    let push_res = backup::push::handle(&s, store.clone(), args).await;
+    let push_res = backup::push::handle(&s, store.clone(), args, pg_cfg()).await;
     // Some VM clusters have no user tablespace — that case is exercised by
     // the previous test. Here we tolerate either outcome but require that
     // _if_ we have a user tablespace, the sentinel carries Spec and the
@@ -307,7 +314,7 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
     let s = encrypted_settings_for(storage_dir.to_str().unwrap());
     let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
 
-    backup::push::handle(&s, store.clone(), default_push_args())
+    backup::push::handle(&s, store.clone(), default_push_args(), pg_cfg())
         .await
         .expect("encrypted backup-push against live PG");
 
@@ -377,7 +384,7 @@ async fn retain_full_one_against_live_pg() {
     // Two full backups, serialized. Each backup-push's pg_stop_backup advances
     // the LSN, so the second backup's name sorts strictly after the first
     for _ in 0..2 {
-        backup::push::handle(&s, store.clone(), default_push_args())
+        backup::push::handle(&s, store.clone(), default_push_args(), pg_cfg())
             .await
             .expect("backup-push");
     }
@@ -522,6 +529,7 @@ async fn delta_chain_against_live_pg() {
             full: true,
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect("parent full backup");
@@ -559,6 +567,7 @@ async fn delta_chain_against_live_pg() {
             pgdata: Some(data_dir.clone()),
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect("delta backup");
@@ -588,6 +597,7 @@ async fn delta_chain_against_live_pg() {
             full: true,
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect("baseline full backup");
@@ -661,8 +671,9 @@ async fn wal_receive_archives_segment_against_live_pg() {
     let s_recv = s.clone();
     let store_recv = store.clone();
     let archive_path = archive_dir.clone();
-    let mut receive_task =
-        tokio::spawn(async move { wal::receive::handle(&s_recv, store_recv, &archive_path).await });
+    let mut receive_task = tokio::spawn(async move {
+        wal::receive::handle(&s_recv, store_recv, &archive_path, pg_cfg(), None).await
+    });
 
     // Let START_REPLICATION establish before forcing segment rotations
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -922,6 +933,7 @@ async fn delta_from_summaries_against_live_pg() {
             delta_from_wal_summaries: true,
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect_err("summarize_wal=off must abort --delta-from-wal-summaries");
@@ -952,6 +964,7 @@ async fn delta_from_summaries_against_live_pg() {
             full: true,
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect("parent full backup");
@@ -973,6 +986,7 @@ async fn delta_from_summaries_against_live_pg() {
             delta_from_wal_summaries: true,
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect_err("--delta-from-wal-summaries without local PGDATA must abort");
@@ -1016,6 +1030,7 @@ async fn delta_from_summaries_against_live_pg() {
                 delta_from_wal_summaries: true,
                 ..default_push_args()
             },
+            pg_cfg(),
         )
         .await
         .expect("delta-from-summaries backup");
@@ -1064,6 +1079,7 @@ async fn delta_from_summaries_against_live_pg() {
             full: true,
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect("baseline full backup");
@@ -1152,6 +1168,7 @@ async fn tablespace_backup_restore_against_live_pg() {
             full: true,
             ..default_push_args()
         },
+        pg_cfg(),
     )
     .await
     .expect("full backup with user tablespace");

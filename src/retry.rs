@@ -28,9 +28,9 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    pub fn from_env() -> Self {
+    pub fn resolve(vars: &crate::config::Vars) -> Self {
         let mut p = Self::default();
-        if let Ok(v) = std::env::var("WALG_DOWNLOAD_FILE_RETRIES")
+        if let Some(v) = vars.get("WALG_DOWNLOAD_FILE_RETRIES")
             && let Ok(n) = v.parse::<u32>()
             && n > 0
         {

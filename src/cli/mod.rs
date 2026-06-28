@@ -8,8 +8,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::config::Settings;
+use crate::config::{Settings, Vars};
 use crate::pg::backup;
+use crate::pg::replication::conn::PgConfig;
 use crate::pg::wal;
 
 /// `--increment-format`: delta file wire format. wal-g restores only `wi1`;
@@ -37,11 +38,12 @@ pub struct Cli {
     /// Tokio worker threads; 1 = single-threaded runtime. Defaults per
     /// command: backup-push min(cores, WALG_UPLOAD_CONCURRENCY),
     /// backup-fetch/wal-prefetch/wal-restore min(cores,
-    /// WALG_DOWNLOAD_CONCURRENCY), 1 elsewhere
-    #[arg(long, global = true, env = "WALG_THREADS")]
+    /// WALG_DOWNLOAD_CONCURRENCY), 1 elsewhere. Falls back to WALG_THREADS
+    #[arg(long, global = true)]
     pub threads: Option<NonZeroUsize>,
-    /// load `KEY=VALUE` settings into the environment before running
-    /// (existing env vars win). Accepts wal-g's `wal-g.env` files
+    /// Config file of `KEY=VALUE` (dotenv, also a systemd `EnvironmentFile`) or
+    /// JSON settings. Process env overrides it (viper AutomaticEnv). Accepts
+    /// wal-g's `wal-g.env`
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
     #[command(subcommand)]
@@ -178,8 +180,9 @@ pub enum Cmd {
         /// wal-g's corrupt-block storing (`WALG_VERIFY_PAGE_CHECKSUMS`)
         #[arg(long, short = 'v')]
         verify: bool,
-        /// Override `WALG_TAR_SIZE_THRESHOLD` (bytes); 0 = default 1 GiB
-        #[arg(long, default_value_t = 0u64, env = "WALG_TAR_SIZE_THRESHOLD")]
+        /// Override `WALG_TAR_SIZE_THRESHOLD` (bytes); 0 = fall back to
+        /// WALG_TAR_SIZE_THRESHOLD, then the 1 GiB default
+        #[arg(long, default_value_t = 0u64)]
         tar_size_threshold: u64,
         /// Build the delta map from `$PGDATA/pg_wal/summaries` (PG17+,
         /// requires `summarize_wal=on`) instead of walking archived WAL.
@@ -433,32 +436,36 @@ impl Cli {
     /// Multi-thread only where concurrent CPU work (compress/encrypt/TLS)
     /// exists today; everything else keeps the single-thread footprint
     /// (one malloc arena, no worker stacks)
-    pub fn worker_threads(&self) -> Result<usize> {
-        if let Some(n) = self.threads {
+    pub fn worker_threads(&self, vars: &Vars) -> Result<usize> {
+        if let Some(n) = self.threads.or_else(|| {
+            vars.get("WALG_THREADS")
+                .and_then(|v| v.parse::<NonZeroUsize>().ok())
+        }) {
             return Ok(n.get());
         }
         let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         Ok(match self.cmd {
-            Cmd::BackupPush { .. } => cores.min(crate::config::upload_concurrency_from_env()?),
+            Cmd::BackupPush { .. } => cores.min(crate::config::upload_concurrency(vars)?),
             Cmd::BackupFetch { .. } | Cmd::WalPrefetch { .. } | Cmd::WalRestore { .. } => {
-                cores.min(crate::config::download_concurrency_from_env()?)
+                cores.min(crate::config::download_concurrency(vars)?)
             }
             _ => 1,
         })
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self, vars: Vars) -> Result<()> {
         // WALG_PG_WAL_SIZE applies to every command's segment math (wal-g sets
         // its WalSegmentSize global in the same pre-run hook)
-        wal::segment::configure_from_env()?;
+        wal::segment::configure(&vars)?;
+        let config_path = self.config;
         match self.cmd {
             Cmd::WalPush { wal_filepath } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 wal::push::handle(&s, storage, &wal_filepath).await
             }
             Cmd::WalFetch { name, dst } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 wal::fetch::handle(&s, storage, &name, &dst, wal::fetch::Prefetch::Fork).await
             }
@@ -467,13 +474,13 @@ impl Cli {
                 pg_wal,
                 count,
             } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 let count = count.unwrap_or(s.download_concurrency as u32);
                 wal::prefetch::handle(&s, storage, &seed, &pg_wal, count).await
             }
             Cmd::WalShow { json } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 let format = if json {
                     wal::show::Format::Json
@@ -483,22 +490,24 @@ impl Cli {
                 wal::show::handle(storage, format).await
             }
             Cmd::WalVerify { op } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 wal::verify::run(storage, op).await
             }
             Cmd::WalRestore { dst, timeline } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 wal::restore::handle(&s, storage, &dst, timeline).await
             }
             Cmd::WalReceive { archive_dir } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
-                wal::receive::handle(&s, storage, &archive_dir).await
+                let cfg = PgConfig::resolve(&vars)?;
+                let slot_name = wal::receive::slot_name(&vars)?;
+                wal::receive::handle(&s, storage, &archive_dir, cfg, slot_name).await
             }
             Cmd::BackupList { json } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 let format = if json {
                     backup::list::Format::Json
@@ -512,11 +521,11 @@ impl Cli {
                 name,
                 target_user_data,
             } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 // flag wins, else WALG_FETCH_TARGET_USER_DATA (wal-g parity)
                 let target_user_data =
-                    target_user_data.or_else(|| std::env::var("WALG_FETCH_TARGET_USER_DATA").ok());
+                    target_user_data.or_else(|| vars.get("WALG_FETCH_TARGET_USER_DATA"));
                 let resolved = match (name, target_user_data) {
                     (Some(n), None) => n,
                     (None, Some(ud)) => backup::show::resolve_by_user_data(&storage, &ud).await?,
@@ -546,13 +555,20 @@ impl Cli {
                         "--verify accepted; relying on BASE_BACKUP server-side checksum verification"
                     );
                 }
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
+                let cfg = PgConfig::resolve(&vars)?;
                 let user_data = user_data
                     .as_deref()
                     .map(serde_json::from_str)
                     .transpose()
                     .map_err(|e| anyhow::anyhow!("--user-data is not valid JSON: {e}"))?;
+                // flag wins; 0 falls back to WALG_TAR_SIZE_THRESHOLD
+                let tar_size_threshold = if tar_size_threshold == 0 {
+                    vars.int("WALG_TAR_SIZE_THRESHOLD", 0)?.max(0) as u64
+                } else {
+                    tar_size_threshold
+                };
                 let args = backup::push::PushArgs {
                     pgdata,
                     is_permanent: permanent,
@@ -564,10 +580,10 @@ impl Cli {
                     increment_format: increment_format.into(),
                     full,
                 };
-                backup::push::handle(&s, storage, args).await
+                backup::push::handle(&s, storage, args, cfg).await
             }
             Cmd::BackupShow { name, json } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 let format = if json {
                     backup::show::Format::Json
@@ -581,7 +597,7 @@ impl Cli {
                 impermanent,
                 target_user_data,
             } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 let resolved = match (name, target_user_data) {
                     (Some(n), None) => n,
@@ -596,7 +612,7 @@ impl Cli {
                 backup::show::mark(storage, &resolved, !impermanent).await
             }
             Cmd::Delete { op, confirm } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 let delete_op = match op {
                     DeleteCli::Before { args } => {
@@ -655,9 +671,9 @@ impl Cli {
                 with_history,
                 to,
             } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let src = s.build_storage()?;
-                let dst = s.build_dst_storage(&to)?;
+                let dst = s.build_dst_storage(&vars, &to)?;
                 backup::copy::handle(
                     &s,
                     src,
@@ -677,9 +693,14 @@ impl Cli {
                 let socket = socket
                     .or(socket_flag)
                     .ok_or_else(|| anyhow::anyhow!("daemon requires a socket path"))?;
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
-                crate::daemon::serve(&socket, s, storage).await
+                let push_timeout = vars.duration(
+                    "WALG_DAEMON_WAL_UPLOAD_TIMEOUT",
+                    crate::daemon::DEFAULT_PUSH_TIMEOUT,
+                )?;
+                let pgdata = vars.get_os("PGDATA").map(PathBuf::from);
+                crate::daemon::serve(&socket, s, storage, push_timeout, pgdata).await
             }
             Cmd::DaemonClient {
                 socket,
@@ -688,7 +709,7 @@ impl Cli {
                 connection_timeout,
             } => crate::daemon::client::run(&socket, op, timeout, connection_timeout).await,
             Cmd::St { glob, op } => {
-                let s = Settings::from_env()?;
+                let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 match op {
                     StOp::Cat {
@@ -714,6 +735,7 @@ impl Cli {
                     } => {
                         crate::storage::tools::copy(
                             &s,
+                            &vars,
                             &from,
                             &to,
                             &prefix,
@@ -814,7 +836,6 @@ mod tests {
 
     #[test]
     fn backup_push_accepts_walg_verify_flag() {
-        // ubicloud take-backup passes `--verify`; parity flag, not an error
         let cli = Cli::parse_from(["walrus", "backup-push", "/dat/18/data", "--verify"]);
         match cli.cmd {
             Cmd::BackupPush { verify, .. } => assert!(verify),
@@ -828,7 +849,6 @@ mod tests {
 
     #[test]
     fn config_is_global_after_positionals() {
-        // archive_command/restore_command append `--config` after the subcommand args
         let cli = Cli::parse_from(["walrus", "wal-push", "/p", "--config", "/etc/walg.env"]);
         assert_eq!(cli.config, Some(PathBuf::from("/etc/walg.env")));
         assert!(matches!(cli.cmd, Cmd::WalPush { .. }));
@@ -1110,7 +1130,9 @@ mod tests {
     }
 
     fn worker_threads_of(args: &[&str]) -> usize {
-        Cli::parse_from(args).worker_threads().unwrap()
+        Cli::parse_from(args)
+            .worker_threads(&Vars::default())
+            .unwrap()
     }
 
     #[test]

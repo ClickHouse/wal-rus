@@ -50,16 +50,16 @@ pub trait Crypter: Send + Sync + std::fmt::Debug {
 
 pub type DynCrypter = Arc<dyn Crypter>;
 
-/// Build a crypter from env. Returns Ok(None) when no crypto vars are set
-pub fn from_env() -> Result<Option<DynCrypter>> {
-    forbid_pgp_env()?;
-    libsodium::from_env()
+/// Build a crypter from config. Returns Ok(None) when no crypto vars are set
+pub fn resolve(vars: &crate::config::Vars) -> Result<Option<DynCrypter>> {
+    forbid_pgp(vars)?;
+    libsodium::resolve(vars)
 }
 
-/// Hard-error if any `WALG_PGP_*` env is set. Silently writing plaintext when
-/// the operator believes they configured encryption would be unsafe; the error
-/// directs them to libsodium (or wal-g) explicitly
-pub fn forbid_pgp_env() -> Result<()> {
+/// Hard-error if any `WALG_PGP_*` setting is present. Silently writing plaintext
+/// when the operator believes they configured encryption would be unsafe; the
+/// error directs them to libsodium (or wal-g) explicitly
+pub fn forbid_pgp(vars: &crate::config::Vars) -> Result<()> {
     const PGP_VARS: &[&str] = &[
         "WALG_PGP_KEY",
         "WALG_PGP_KEY_PATH",
@@ -68,7 +68,7 @@ pub fn forbid_pgp_env() -> Result<()> {
     let set: Vec<&str> = PGP_VARS
         .iter()
         .copied()
-        .filter(|v| std::env::var(v).is_ok())
+        .filter(|v| vars.contains(v))
         .collect();
     if !set.is_empty() {
         bail!(
@@ -90,7 +90,7 @@ mod tests {
         unsafe {
             std::env::set_var("WALG_PGP_KEY", "...");
         }
-        let r = forbid_pgp_env();
+        let r = forbid_pgp(&crate::config::Vars::default());
         unsafe {
             std::env::remove_var("WALG_PGP_KEY");
         }

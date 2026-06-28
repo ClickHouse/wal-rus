@@ -1,5 +1,6 @@
 //! Config loading from env, mirroring wal-g WALG_/AWS_/GOOGLE_ vars
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,9 @@ use crate::compression;
 use crate::crypto::{self, DynCrypter};
 use crate::retry::RetryPolicy;
 use crate::storage::{DynStorage, Storage, fs::FsStorage, gcs, retrying::RetryingStorage, s3};
+
+mod vars;
+pub use vars::Vars;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -36,6 +40,12 @@ pub struct Settings {
     /// detection of `WALG_PGP_*` is a hard error so plaintext writes can't
     /// silently happen when the operator intended encryption
     pub crypter: Option<DynCrypter>,
+    /// `WALG_PREFETCH_DIR` override for the `pg_wal`-relative prefetch staging
+    /// dir. Resolved once here so the leaf path helpers stay env-free
+    pub prefetch_dir: Option<PathBuf>,
+    /// `--config` path, forwarded to self-spawned children (wal-prefetch fork)
+    /// so they re-resolve the same file rather than relying on inherited env
+    pub config_path: Option<PathBuf>,
 }
 
 /// Delta-backup config: WALG_DELTA_MAX_STEPS / _ORIGIN / _FROM_NAME / _FROM_USER_DATA
@@ -61,7 +71,7 @@ pub enum StorageSettings {
 
 impl Default for Settings {
     /// Convenience defaults: single-worker fs pipeline at lz4, no throttling
-    /// or encryption. Production constructs via [`Settings::from_env`]; this
+    /// or encryption. Production constructs via [`Settings::resolve`]; this
     /// lets tests vary only the fields they exercise via `..Default::default()`
     fn default() -> Self {
         Settings {
@@ -80,29 +90,35 @@ impl Default for Settings {
             disk_rate_limit: 0,
             delta: DeltaSettings::default(),
             crypter: None,
+            prefetch_dir: None,
+            config_path: None,
         }
     }
 }
 
 impl Settings {
-    pub fn from_env() -> Result<Self> {
-        let storage = detect_storage()?;
-        let compression = match std::env::var("WALG_COMPRESSION_METHOD").ok().as_deref() {
+    pub fn resolve(vars: &Vars, config_path: Option<PathBuf>) -> Result<Self> {
+        let storage = detect_storage(vars)?;
+        let compression = match vars.get("WALG_COMPRESSION_METHOD").as_deref() {
             None => compression::Method::Lz4,
             Some(s) => compression::Method::from_name(s)
                 .ok_or_else(|| anyhow!("unsupported WALG_COMPRESSION_METHOD={s}"))?,
         };
-        let compression_level = parse_env_int("WALG_COMPRESSION_LEVEL", 1)? as i32;
-        let upload_concurrency = upload_concurrency_from_env()?;
-        let upload_queue = parse_env_int("WALG_UPLOAD_QUEUE", 2)?.max(1) as usize;
-        let download_concurrency = download_concurrency_from_env()?;
-        let prevent_wal_overwrite = parse_env_bool("WALG_PREVENT_WAL_OVERWRITE", false)?;
-        let use_wal_delta = parse_env_bool("WALG_USE_WAL_DELTA", false)?;
-        let retry = RetryPolicy::from_env();
-        let network_rate_limit = parse_env_int("WALG_NETWORK_RATE_LIMIT", 0)?.max(0) as u64;
-        let disk_rate_limit = parse_env_int("WALG_DISK_RATE_LIMIT", 0)?.max(0) as u64;
-        let delta = DeltaSettings::from_env()?;
-        let crypter = crypto::from_env()?;
+        let compression_level = vars.int("WALG_COMPRESSION_LEVEL", 1)? as i32;
+        let upload_concurrency = upload_concurrency(vars)?;
+        let upload_queue = vars.int("WALG_UPLOAD_QUEUE", 2)?.max(1) as usize;
+        let download_concurrency = download_concurrency(vars)?;
+        let prevent_wal_overwrite = vars.bool("WALG_PREVENT_WAL_OVERWRITE", false)?;
+        let use_wal_delta = vars.bool("WALG_USE_WAL_DELTA", false)?;
+        let retry = RetryPolicy::resolve(vars);
+        let network_rate_limit = vars.int("WALG_NETWORK_RATE_LIMIT", 0)?.max(0) as u64;
+        let disk_rate_limit = vars.int("WALG_DISK_RATE_LIMIT", 0)?.max(0) as u64;
+        let delta = DeltaSettings::resolve(vars)?;
+        let crypter = crypto::resolve(vars)?;
+        let prefetch_dir = vars
+            .get_os("WALG_PREFETCH_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
         Ok(Settings {
             storage,
             compression,
@@ -117,6 +133,8 @@ impl Settings {
             disk_rate_limit,
             delta,
             crypter,
+            prefetch_dir,
+            config_path,
         })
     }
 
@@ -184,8 +202,8 @@ impl Settings {
     /// `s3://bucket/prefix`, `gs://bucket/prefix`. Inherits credentials &
     /// retry policy from the current Settings; lets `copy` target a different
     /// prefix or bucket without reconfiguring the global env
-    pub fn build_dst_storage(&self, uri: &str) -> Result<DynStorage> {
-        let dst = storage_from_uri(uri, &self.storage)?;
+    pub fn build_dst_storage(&self, vars: &Vars, uri: &str) -> Result<DynStorage> {
+        let dst = storage_from_uri(vars, uri, &self.storage)?;
         Self::build_storage_for(&dst, self.retry)
     }
 
@@ -202,11 +220,7 @@ impl Settings {
                 Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
             }
             StorageSettings::Gcs(c) => {
-                let cfg = gcs::GcsConfig {
-                    bucket: c.bucket.clone(),
-                    prefix: c.prefix.clone(),
-                    credentials_path: c.credentials_path.clone(),
-                };
+                let cfg = c.clone();
                 let s = gcs::GcsStorage::new(cfg).context("init gcs storage")?;
                 Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
             }
@@ -217,7 +231,7 @@ impl Settings {
 /// Build `StorageSettings` from a destination URI, inheriting credentials
 /// from the source settings. Cross-scheme is allowed; cross-bucket within
 /// the same scheme is allowed too. Bare paths (`/tmp/foo`) are treated as fs
-fn storage_from_uri(uri: &str, src: &StorageSettings) -> Result<StorageSettings> {
+fn storage_from_uri(vars: &Vars, uri: &str, src: &StorageSettings) -> Result<StorageSettings> {
     if let Some(rest) = uri.strip_prefix("file://") {
         return Ok(StorageSettings::Fs {
             path: rest.to_string(),
@@ -229,8 +243,8 @@ fn storage_from_uri(uri: &str, src: &StorageSettings) -> Result<StorageSettings>
             StorageSettings::S3(c) => Some(c),
             _ => None,
         };
-        return Ok(StorageSettings::S3(s3_config_from_env(
-            bucket, prefix, s3_src,
+        return Ok(StorageSettings::S3(s3_config(
+            vars, bucket, prefix, s3_src,
         )?));
     }
     if let Some(rest) = uri.strip_prefix("gs://") {
@@ -239,17 +253,31 @@ fn storage_from_uri(uri: &str, src: &StorageSettings) -> Result<StorageSettings>
             StorageSettings::Gcs(c) => c.credentials_path.clone(),
             _ => None,
         }
-        .or_else(|| std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok());
+        .or_else(|| vars.get("GOOGLE_APPLICATION_CREDENTIALS"));
+        let endpoint = match src {
+            StorageSettings::Gcs(c) => c.endpoint.clone(),
+            _ => None,
+        }
+        .or_else(|| gcs_endpoint(vars));
         return Ok(StorageSettings::Gcs(gcs::GcsConfig {
             bucket,
             prefix,
             credentials_path,
+            endpoint,
         }));
     }
     // bare path falls back to fs
     Ok(StorageSettings::Fs {
         path: uri.to_string(),
     })
+}
+
+/// Emulator endpoint for GCS: `WALG_GS_ENDPOINT` then `STORAGE_EMULATOR_HOST`
+/// (fake-gcs-server). Empty values count as unset
+fn gcs_endpoint(vars: &Vars) -> Option<String> {
+    vars.get("WALG_GS_ENDPOINT")
+        .or_else(|| vars.get("STORAGE_EMULATOR_HOST"))
+        .filter(|s| !s.is_empty())
 }
 
 fn split_bucket_prefix(rest: &str) -> (String, String) {
@@ -265,25 +293,26 @@ fn split_bucket_prefix(rest: &str) -> (String, String) {
 /// resolution read the same names: AWS_REGION/WALG_S3_REGION,
 /// AWS_ACCESS_KEY_ID/AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY/AWS_SECRET_KEY,
 /// AWS_SESSION_TOKEN, AWS_ENDPOINT_URL/WALG_S3_ENDPOINT, AWS_S3_FORCE_PATH_STYLE
-fn s3_config_from_env(
+fn s3_config(
+    vars: &Vars,
     bucket: String,
     prefix: String,
     src: Option<&s3::S3Config>,
 ) -> Result<s3::S3Config> {
     let region = src
         .map(|c| c.region.clone())
-        .or_else(|| std::env::var("AWS_REGION").ok())
-        .or_else(|| std::env::var("WALG_S3_REGION").ok())
+        .or_else(|| vars.get("AWS_REGION"))
+        .or_else(|| vars.get("WALG_S3_REGION"))
         .unwrap_or_else(|| "us-east-1".into());
-    let creds = s3_credentials(src)?;
+    let creds = s3_credentials(vars, src)?;
     let endpoint = src
         .and_then(|c| c.endpoint.clone())
-        .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok())
-        .or_else(|| std::env::var("AWS_ENDPOINT").ok())
-        .or_else(|| std::env::var("WALG_S3_ENDPOINT").ok());
+        .or_else(|| vars.get("AWS_ENDPOINT_URL"))
+        .or_else(|| vars.get("AWS_ENDPOINT"))
+        .or_else(|| vars.get("WALG_S3_ENDPOINT"));
     let force_path_style = match src {
         Some(c) => c.force_path_style,
-        None => force_path_style_from_env(endpoint.is_some())?,
+        None => force_path_style(vars, endpoint.is_some())?,
     };
     Ok(s3::S3Config {
         bucket,
@@ -298,85 +327,44 @@ fn s3_config_from_env(
 /// `AWS_S3_FORCE_PATH_STYLE` (wal-g name). Defaults to `endpoint_set` so a
 /// custom endpoint (minio/ceph) gets path-style addressing without an explicit
 /// flag
-fn force_path_style_from_env(endpoint_set: bool) -> Result<bool> {
+fn force_path_style(vars: &Vars, endpoint_set: bool) -> Result<bool> {
     let key = "AWS_S3_FORCE_PATH_STYLE";
-    if std::env::var_os(key).is_some() {
-        return parse_env_bool(key, endpoint_set);
+    if vars.contains(key) {
+        return vars.bool(key, endpoint_set);
     }
     Ok(endpoint_set)
-}
-
-/// Load a wal-g `--config` file into the process environment. The file is
-/// dotenv `KEY=VALUE` (wal-g reads it via viper; the same file doubles as the
-/// systemd `EnvironmentFile`). Existing environment variables take precedence
-/// (viper `AutomaticEnv` semantics), so this only fills gaps.
-///
-/// Must run before the async runtime starts any worker thread: `set_var` is
-/// process-global and unsound to race against concurrent `getenv`
-pub fn load_env_file(path: &std::path::Path) -> Result<()> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read config file {}", path.display()))?;
-    for (i, raw) in content.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let (key, val) = line
-            .split_once('=')
-            .ok_or_else(|| anyhow!("{}:{}: expected KEY=VALUE", path.display(), i + 1))?;
-        let key = key.trim();
-        if key.is_empty() {
-            bail!("{}:{}: empty key", path.display(), i + 1);
-        }
-        if std::env::var_os(key).is_some() {
-            continue;
-        }
-        let val = unquote(val.trim());
-        // SAFETY: callers invoke this on the main thread before constructing
-        // the tokio runtime, so no other thread can be in getenv/setenv
-        unsafe { std::env::set_var(key, val) };
-    }
-    Ok(())
-}
-
-/// Strip one layer of matching single or double quotes, dotenv-style
-fn unquote(s: &str) -> &str {
-    let b = s.as_bytes();
-    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    }
 }
 
 /// Pick a credential source: inherit `src`, else explicit static env keys,
 /// else the EC2 metadata service. IMDS is skipped (surfacing the missing-keys
 /// error) when AWS_EC2_METADATA_DISABLED is set. One static key without the
 /// other is a hard error rather than a silent IMDS fallback
-fn s3_credentials(src: Option<&s3::S3Config>) -> Result<s3::CredentialSource> {
+fn s3_credentials(vars: &Vars, src: Option<&s3::S3Config>) -> Result<s3::CredentialSource> {
     if let Some(c) = src {
         return Ok(c.creds.clone());
     }
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-        .ok()
-        .or_else(|| std::env::var("AWS_ACCESS_KEY").ok());
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .ok()
-        .or_else(|| std::env::var("AWS_SECRET_KEY").ok());
+    let access_key = vars
+        .get("AWS_ACCESS_KEY_ID")
+        .or_else(|| vars.get("AWS_ACCESS_KEY"));
+    let secret_key = vars
+        .get("AWS_SECRET_ACCESS_KEY")
+        .or_else(|| vars.get("AWS_SECRET_KEY"));
     match (access_key, secret_key) {
         (Some(access_key), Some(secret_key)) => Ok(s3::CredentialSource::Static(s3::Credentials {
             access_key,
             secret_key,
-            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            session_token: vars.get("AWS_SESSION_TOKEN"),
             expires_at: None,
         })),
-        (None, None) if parse_env_bool("AWS_EC2_METADATA_DISABLED", false)? => {
+        (None, None) if vars.bool("AWS_EC2_METADATA_DISABLED", false)? => {
             Err(anyhow!("AWS_ACCESS_KEY_ID not set and IMDS disabled"))
         }
-        (None, None) => Ok(s3::CredentialSource::Imds(Arc::new(
-            s3::ImdsProvider::from_env().map_err(|e| anyhow!("{e}"))?,
-        ))),
+        (None, None) => {
+            let endpoint = vars.get("AWS_EC2_METADATA_SERVICE_ENDPOINT");
+            Ok(s3::CredentialSource::Imds(Arc::new(
+                s3::ImdsProvider::new(endpoint).map_err(|e| anyhow!("{e}"))?,
+            )))
+        }
         _ => Err(anyhow!(
             "incomplete static credentials: set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
         )),
@@ -384,16 +372,16 @@ fn s3_credentials(src: Option<&s3::S3Config>) -> Result<s3::CredentialSource> {
 }
 
 impl DeltaSettings {
-    pub fn from_env() -> Result<Self> {
-        let max_steps = parse_env_int("WALG_DELTA_MAX_STEPS", 0)?.max(0) as u32;
-        let origin = std::env::var("WALG_DELTA_ORIGIN").ok();
+    pub fn resolve(vars: &Vars) -> Result<Self> {
+        let max_steps = vars.int("WALG_DELTA_MAX_STEPS", 0)?.max(0) as u32;
+        let origin = vars.get("WALG_DELTA_ORIGIN");
         let from_full = match origin.as_deref() {
             None | Some("LATEST") => false,
             Some("LATEST_FULL") => true,
             Some(s) => bail!("WALG_DELTA_ORIGIN={s} must be LATEST or LATEST_FULL"),
         };
-        let from_name = std::env::var("WALG_DELTA_FROM_NAME").ok();
-        let from_user_data = std::env::var("WALG_DELTA_FROM_USER_DATA").ok();
+        let from_name = vars.get("WALG_DELTA_FROM_NAME");
+        let from_user_data = vars.get("WALG_DELTA_FROM_USER_DATA");
         Ok(Self {
             max_steps,
             from_full,
@@ -407,23 +395,21 @@ impl DeltaSettings {
     }
 }
 
-fn detect_storage() -> Result<StorageSettings> {
-    if let Ok(prefix) = std::env::var("WALG_FILE_PREFIX") {
+fn detect_storage(vars: &Vars) -> Result<StorageSettings> {
+    if let Some(prefix) = vars.get("WALG_FILE_PREFIX") {
         return Ok(StorageSettings::Fs { path: prefix });
     }
-    if let Ok(s3_prefix) = std::env::var("WALG_S3_PREFIX") {
+    if let Some(s3_prefix) = vars.get("WALG_S3_PREFIX") {
         let (bucket, prefix) = parse_uri_prefix(&s3_prefix, "s3://")?;
-        return Ok(StorageSettings::S3(s3_config_from_env(
-            bucket, prefix, None,
-        )?));
+        return Ok(StorageSettings::S3(s3_config(vars, bucket, prefix, None)?));
     }
-    if let Ok(gs_prefix) = std::env::var("WALG_GS_PREFIX") {
+    if let Some(gs_prefix) = vars.get("WALG_GS_PREFIX") {
         let (bucket, prefix) = parse_uri_prefix(&gs_prefix, "gs://")?;
-        let credentials_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
         return Ok(StorageSettings::Gcs(gcs::GcsConfig {
             bucket,
             prefix,
-            credentials_path,
+            credentials_path: vars.get("GOOGLE_APPLICATION_CREDENTIALS"),
+            endpoint: gcs_endpoint(vars),
         }));
     }
     bail!("no storage configured: set WALG_FILE_PREFIX, WALG_S3_PREFIX, or WALG_GS_PREFIX")
@@ -445,14 +431,14 @@ fn parse_uri_prefix(uri: &str, scheme: &str) -> Result<(String, String)> {
 
 /// `WALG_UPLOAD_CONCURRENCY`; read before runtime construction to cap
 /// worker threads for backup-push
-pub fn upload_concurrency_from_env() -> Result<usize> {
-    Ok(parse_env_int("WALG_UPLOAD_CONCURRENCY", 4)?.max(1) as usize)
+pub fn upload_concurrency(vars: &Vars) -> Result<usize> {
+    Ok(vars.int("WALG_UPLOAD_CONCURRENCY", 4)?.max(1) as usize)
 }
 
 /// `WALG_DOWNLOAD_CONCURRENCY`; read before runtime construction to cap
 /// worker threads for fetch-side commands
-pub fn download_concurrency_from_env() -> Result<usize> {
-    Ok(parse_env_int("WALG_DOWNLOAD_CONCURRENCY", 4)?.max(1) as usize)
+pub fn download_concurrency(vars: &Vars) -> Result<usize> {
+    Ok(vars.int("WALG_DOWNLOAD_CONCURRENCY", 4)?.max(1) as usize)
 }
 
 /// Parse a Go-style duration (`time.ParseDuration`): one or more
@@ -503,32 +489,6 @@ pub fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
         return Err(format!("invalid duration {s:?}"));
     }
     Ok(total)
-}
-
-/// Read a Go-style duration env var, falling back to `default` when unset
-pub fn duration_env(key: &str, default: Duration) -> Result<Duration> {
-    match std::env::var(key) {
-        Err(_) => Ok(default),
-        Ok(v) => parse_duration(&v).map_err(|e| anyhow!("{key}: {e}")),
-    }
-}
-
-fn parse_env_int(key: &str, default: i64) -> Result<i64> {
-    match std::env::var(key) {
-        Err(_) => Ok(default),
-        Ok(v) => v.parse().with_context(|| format!("parse {key}={v}")),
-    }
-}
-
-fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
-    match std::env::var(key) {
-        Err(_) => Ok(default),
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => bail!("parse {key}={v} as bool"),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -628,7 +588,7 @@ mod tests {
         ];
         let _g = EnvGuard::new(&vars);
         let src = StorageSettings::Fs { path: "/x".into() };
-        match storage_from_uri("s3://bkt/pre/fix", &src).unwrap() {
+        match storage_from_uri(&Vars::default(), "s3://bkt/pre/fix", &src).unwrap() {
             StorageSettings::S3(c) => {
                 assert_eq!(c.bucket, "bkt");
                 assert_eq!(c.prefix, "pre/fix");
@@ -643,45 +603,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_int_default_valid_and_malformed() {
+    fn vars_int_default_valid_and_malformed() {
         let key = "WALRUS_TEST_PARSE_INT";
+        let v = Vars::default();
         {
             let _g = EnvGuard::new(&[(key, None)]);
-            assert_eq!(parse_env_int(key, 7).unwrap(), 7);
+            assert_eq!(v.int(key, 7).unwrap(), 7);
         }
         {
             let _g = EnvGuard::new(&[(key, Some("42"))]);
-            assert_eq!(parse_env_int(key, 7).unwrap(), 42);
+            assert_eq!(v.int(key, 7).unwrap(), 42);
         }
         {
             let _g = EnvGuard::new(&[(key, Some("-5"))]);
-            assert_eq!(parse_env_int(key, 7).unwrap(), -5);
+            assert_eq!(v.int(key, 7).unwrap(), -5);
         }
         for bad in ["abc", "", "1.5", "9999999999999999999999"] {
             let _g = EnvGuard::new(&[(key, Some(bad))]);
-            assert!(parse_env_int(key, 7).is_err(), "{bad:?} should not parse");
+            assert!(v.int(key, 7).is_err(), "{bad:?} should not parse");
         }
     }
 
     #[test]
-    fn parse_env_bool_tokens_and_rejection() {
+    fn vars_bool_tokens_and_rejection() {
         let key = "WALRUS_TEST_PARSE_BOOL";
+        let v = Vars::default();
         for t in ["1", "true", "TRUE", "yes", "On"] {
             let _g = EnvGuard::new(&[(key, Some(t))]);
-            assert!(parse_env_bool(key, false).unwrap(), "{t:?} should be true");
+            assert!(v.bool(key, false).unwrap(), "{t:?} should be true");
         }
         for f in ["0", "false", "NO", "off"] {
             let _g = EnvGuard::new(&[(key, Some(f))]);
-            assert!(!parse_env_bool(key, true).unwrap(), "{f:?} should be false");
+            assert!(!v.bool(key, true).unwrap(), "{f:?} should be false");
         }
         for bad in ["maybe", "", "2"] {
             let _g = EnvGuard::new(&[(key, Some(bad))]);
-            assert!(parse_env_bool(key, false).is_err(), "{bad:?} should error");
+            assert!(v.bool(key, false).is_err(), "{bad:?} should error");
         }
         {
             let _g = EnvGuard::new(&[(key, None)]);
-            assert!(parse_env_bool(key, true).unwrap());
-            assert!(!parse_env_bool(key, false).unwrap());
+            assert!(v.bool(key, true).unwrap());
+            assert!(!v.bool(key, false).unwrap());
         }
     }
 
@@ -721,12 +683,12 @@ mod tests {
     #[test]
     fn storage_from_uri_file_and_bare_path() {
         let src = StorageSettings::Fs { path: "/x".into() };
-        match storage_from_uri("file:///tmp/dst", &src).unwrap() {
+        match storage_from_uri(&Vars::default(), "file:///tmp/dst", &src).unwrap() {
             StorageSettings::Fs { path } => assert_eq!(path, "/tmp/dst"),
             other => panic!("expected Fs, got {other:?}"),
         }
         // bare path with no scheme falls back to fs verbatim
-        match storage_from_uri("/var/backups", &src).unwrap() {
+        match storage_from_uri(&Vars::default(), "/var/backups", &src).unwrap() {
             StorageSettings::Fs { path } => assert_eq!(path, "/var/backups"),
             other => panic!("expected Fs, got {other:?}"),
         }
@@ -741,8 +703,9 @@ mod tests {
                 bucket: "srcb".into(),
                 prefix: "srcp".into(),
                 credentials_path: Some("/src/sa.json".into()),
+                endpoint: None,
             });
-            match storage_from_uri("gs://dstb/dst/pre", &src).unwrap() {
+            match storage_from_uri(&Vars::default(), "gs://dstb/dst/pre", &src).unwrap() {
                 StorageSettings::Gcs(c) => {
                     assert_eq!(c.bucket, "dstb");
                     assert_eq!(c.prefix, "dst/pre");
@@ -755,7 +718,7 @@ mod tests {
         {
             let _g = EnvGuard::new(&[("GOOGLE_APPLICATION_CREDENTIALS", Some("/env/sa.json"))]);
             let src = StorageSettings::Fs { path: "/x".into() };
-            match storage_from_uri("gs://b", &src).unwrap() {
+            match storage_from_uri(&Vars::default(), "gs://b", &src).unwrap() {
                 StorageSettings::Gcs(c) => {
                     assert_eq!(c.bucket, "b");
                     assert_eq!(c.prefix, "");
@@ -787,7 +750,7 @@ mod tests {
             endpoint: Some("http://ceph:7480".into()),
             force_path_style: true,
         });
-        match storage_from_uri("s3://dstb/dst", &src).unwrap() {
+        match storage_from_uri(&Vars::default(), "s3://dstb/dst", &src).unwrap() {
             StorageSettings::S3(c) => {
                 assert_eq!(c.bucket, "dstb");
                 assert_eq!(c.prefix, "dst");
@@ -811,7 +774,7 @@ mod tests {
                 ("WALG_S3_PREFIX", None),
                 ("WALG_GS_PREFIX", None),
             ]);
-            match detect_storage().unwrap() {
+            match detect_storage(&Vars::default()).unwrap() {
                 StorageSettings::Fs { path } => assert_eq!(path, "/srv/wal"),
                 other => panic!("expected Fs, got {other:?}"),
             }
@@ -833,7 +796,7 @@ mod tests {
                 ("WALG_S3_ENDPOINT", None),
                 ("AWS_S3_FORCE_PATH_STYLE", None),
             ]);
-            match detect_storage().unwrap() {
+            match detect_storage(&Vars::default()).unwrap() {
                 StorageSettings::S3(c) => {
                     assert_eq!(c.bucket, "mybkt");
                     assert_eq!(c.prefix, "walg");
@@ -859,7 +822,7 @@ mod tests {
                 ("AWS_SECRET_KEY", None),
                 ("AWS_EC2_METADATA_DISABLED", None),
             ]);
-            match detect_storage().unwrap() {
+            match detect_storage(&Vars::default()).unwrap() {
                 StorageSettings::S3(c) => {
                     assert!(matches!(c.creds, s3::CredentialSource::Imds(_)));
                 }
@@ -878,7 +841,7 @@ mod tests {
                 ("AWS_SECRET_KEY", None),
                 ("AWS_EC2_METADATA_DISABLED", Some("true")),
             ]);
-            assert!(detect_storage().is_err());
+            assert!(detect_storage(&Vars::default()).is_err());
         }
         // gs prefix, credentials path from env (path not opened here)
         {
@@ -888,7 +851,7 @@ mod tests {
                 ("WALG_GS_PREFIX", Some("gs://gbkt/walg/")),
                 ("GOOGLE_APPLICATION_CREDENTIALS", Some("/creds/sa.json")),
             ]);
-            match detect_storage().unwrap() {
+            match detect_storage(&Vars::default()).unwrap() {
                 StorageSettings::Gcs(c) => {
                     assert_eq!(c.bucket, "gbkt");
                     assert_eq!(c.prefix, "walg");
@@ -904,7 +867,7 @@ mod tests {
                 ("WALG_S3_PREFIX", None),
                 ("WALG_GS_PREFIX", None),
             ]);
-            assert!(detect_storage().is_err());
+            assert!(detect_storage(&Vars::default()).is_err());
         }
     }
 
@@ -950,6 +913,7 @@ mod tests {
                 bucket: "gb".into(),
                 prefix: "gp".into(),
                 credentials_path: Some(sa.to_string_lossy().into()),
+                endpoint: None,
             }),
             RetryPolicy::default(),
         )
@@ -967,7 +931,10 @@ mod tests {
             ..Settings::default()
         };
         let dst = settings
-            .build_dst_storage(&format!("file://{}", dir.path().display()))
+            .build_dst_storage(
+                &Vars::default(),
+                &format!("file://{}", dir.path().display()),
+            )
             .unwrap();
         assert!(dst.describe().starts_with("file://"));
 
@@ -993,7 +960,7 @@ mod tests {
         // Unset → disabled, LATEST semantics
         {
             let _g = EnvGuard::new(&clear);
-            let d = DeltaSettings::from_env().unwrap();
+            let d = DeltaSettings::resolve(&Vars::default()).unwrap();
             assert!(!d.enabled());
             assert!(!d.from_full);
             assert_eq!(d.max_steps, 0);
@@ -1004,7 +971,7 @@ mod tests {
             v[0] = ("WALG_DELTA_MAX_STEPS", Some("3"));
             v[1] = ("WALG_DELTA_ORIGIN", Some("LATEST_FULL"));
             let _g = EnvGuard::new(&v);
-            let d = DeltaSettings::from_env().unwrap();
+            let d = DeltaSettings::resolve(&Vars::default()).unwrap();
             assert!(d.enabled());
             assert!(d.from_full);
             assert_eq!(d.max_steps, 3);
@@ -1014,14 +981,14 @@ mod tests {
             let mut v = clear.clone();
             v[1] = ("WALG_DELTA_ORIGIN", Some("LATEST"));
             let _g = EnvGuard::new(&v);
-            assert!(!DeltaSettings::from_env().unwrap().from_full);
+            assert!(!DeltaSettings::resolve(&Vars::default()).unwrap().from_full);
         }
         // Garbage origin → error
         {
             let mut v = clear.clone();
             v[1] = ("WALG_DELTA_ORIGIN", Some("SIDEWAYS"));
             let _g = EnvGuard::new(&v);
-            assert!(DeltaSettings::from_env().is_err());
+            assert!(DeltaSettings::resolve(&Vars::default()).is_err());
         }
     }
 
@@ -1055,13 +1022,11 @@ mod tests {
             ("AWS_SECRET_ACCESS_KEY", None),
             ("AWS_SECRET_KEY", None),
         ]);
-        assert!(s3_credentials(None).is_err());
+        assert!(s3_credentials(&Vars::default(), None).is_err());
     }
 
     #[test]
     fn s3_reads_walg_endpoint_and_force_path_style_names() {
-        // ubicloud's wal-g.env uses the wal-g var names AWS_ENDPOINT +
-        // AWS_S3_FORCE_PATH_STYLE (minio / custom S3), not AWS_ENDPOINT_URL
         let _g = EnvGuard::new(&[
             ("WALG_FILE_PREFIX", None),
             ("WALG_GS_PREFIX", None),
@@ -1074,7 +1039,7 @@ mod tests {
             ("AWS_ACCESS_KEY_ID", Some("k")),
             ("AWS_SECRET_ACCESS_KEY", Some("s")),
         ]);
-        match detect_storage().unwrap() {
+        match detect_storage(&Vars::default()).unwrap() {
             StorageSettings::S3(c) => {
                 assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
                 assert!(c.force_path_style);
@@ -1084,9 +1049,10 @@ mod tests {
     }
 
     #[test]
-    fn load_env_file_fills_gaps_without_clobbering() {
+    fn config_file_env_wins_file_fills_gaps() {
+        // viper AutomaticEnv: env overrides the file; unset keys come from file
         let _g = EnvGuard::new(&[
-            ("WALG_S3_PREFIX", Some("s3://envbkt")), // already set: must survive
+            ("WALG_S3_PREFIX", Some("s3://envbkt")), // set in env: env wins
             ("AWS_REGION", None),                    // unset: file supplies
             ("AWS_ACCESS_KEY_ID", None),
         ]);
@@ -1094,26 +1060,16 @@ mod tests {
         let path = dir.path().join("wal-g.env");
         std::fs::write(
             &path,
-            "# region + key, prefix already in env\n\
+            "# region + key, prefix also in env\n\
              WALG_S3_PREFIX=s3://filebkt\n\
              \n\
              export AWS_REGION=eu-west-3\n\
              AWS_ACCESS_KEY_ID=\"quoted\"\n",
         )
         .unwrap();
-        load_env_file(&path).unwrap();
-        assert_eq!(std::env::var("WALG_S3_PREFIX").unwrap(), "s3://envbkt");
-        assert_eq!(std::env::var("AWS_REGION").unwrap(), "eu-west-3");
-        assert_eq!(std::env::var("AWS_ACCESS_KEY_ID").unwrap(), "quoted");
-    }
-
-    #[test]
-    fn load_env_file_rejects_malformed_line() {
-        // guard VALID so the partial application before the error is reverted
-        let _g = EnvGuard::new(&[("VALID", None)]);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bad.env");
-        std::fs::write(&path, "VALID=1\nnot_a_pair\n").unwrap();
-        assert!(load_env_file(&path).is_err());
+        let vars = Vars::load(&path).unwrap();
+        assert_eq!(vars.get("WALG_S3_PREFIX").as_deref(), Some("s3://envbkt"));
+        assert_eq!(vars.get("AWS_REGION").as_deref(), Some("eu-west-3"));
+        assert_eq!(vars.get("AWS_ACCESS_KEY_ID").as_deref(), Some("quoted"));
     }
 }

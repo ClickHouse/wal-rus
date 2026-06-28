@@ -14,10 +14,13 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: walrus::cli::Cli) -> anyhow::Result<()> {
-    if let Some(path) = cli.config.as_deref() {
-        walrus::config::load_env_file(path)?;
-    }
-    let threads = cli.worker_threads()?;
+    // Parse --config into an in-memory source (no setenv); process env overrides
+    // it. Built before the runtime so worker-count resolution can read it
+    let vars = match cli.config.as_deref() {
+        Some(path) => walrus::config::Vars::load(path)?,
+        None => walrus::config::Vars::default(),
+    };
+    let threads = cli.worker_threads(&vars)?;
     cap_malloc_arenas(threads);
     // current_thread when 1: no worker threads, single glibc malloc arena
     // (see docs/DESIGN.md Runtime)
@@ -37,7 +40,7 @@ fn run(cli: walrus::cli::Cli) -> anyhow::Result<()> {
         .thread_stack_size(stack_size)
         .enable_all()
         .build()?
-        .block_on(cli.run())
+        .block_on(cli.run(vars))
 }
 
 /// Cap glibc malloc arenas to the CPU count. glibc otherwise grows to 8*ncpu

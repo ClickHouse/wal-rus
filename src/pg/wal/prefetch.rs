@@ -28,26 +28,24 @@ use super::segment::{SegmentName, wal_segment_size};
 pub const PREFETCH_SUBDIR: &str = ".wal-g/prefetch";
 pub const RUNNING_SUBDIR: &str = "running";
 
-/// Base dir holding `.wal-g/prefetch/`. `WALG_PREFETCH_DIR` overrides the
-/// pg_wal-relative default; honored by both the writer here & the consumer in
-/// `fetch::try_promote_prefetched` so the two stay in sync (wal-g parity)
-fn prefetch_base(pg_wal: &Path) -> PathBuf {
-    match std::env::var_os("WALG_PREFETCH_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => pg_wal.to_path_buf(),
-    }
+/// Base dir holding `.wal-g/prefetch/`. `over` (resolved `WALG_PREFETCH_DIR`,
+/// from `Settings::prefetch_dir`) overrides the pg_wal-relative default; honored
+/// by both the writer here & the consumer in `fetch::try_promote_prefetched` so
+/// the two stay in sync (wal-g parity)
+fn prefetch_base<'a>(pg_wal: &'a Path, over: Option<&'a Path>) -> &'a Path {
+    over.unwrap_or(pg_wal)
 }
 
-pub fn prefetch_dir(pg_wal: &Path) -> PathBuf {
-    prefetch_base(pg_wal).join(PREFETCH_SUBDIR)
+pub fn prefetch_dir(pg_wal: &Path, over: Option<&Path>) -> PathBuf {
+    prefetch_base(pg_wal, over).join(PREFETCH_SUBDIR)
 }
 
-pub fn running_dir(pg_wal: &Path) -> PathBuf {
-    prefetch_dir(pg_wal).join(RUNNING_SUBDIR)
+pub fn running_dir(pg_wal: &Path, over: Option<&Path>) -> PathBuf {
+    prefetch_dir(pg_wal, over).join(RUNNING_SUBDIR)
 }
 
-pub fn prefetched_path(pg_wal: &Path, seg: &str) -> PathBuf {
-    prefetch_dir(pg_wal).join(seg)
+pub fn prefetched_path(pg_wal: &Path, seg: &str, over: Option<&Path>) -> PathBuf {
+    prefetch_dir(pg_wal, over).join(seg)
 }
 
 pub async fn handle(
@@ -63,8 +61,9 @@ pub async fn handle(
     let seed_seg =
         SegmentName::parse(seed).with_context(|| format!("invalid seed segment name: {seed}"))?;
 
-    let pre = prefetch_dir(pg_wal);
-    let run = running_dir(pg_wal);
+    let over = settings.prefetch_dir.as_deref();
+    let pre = prefetch_dir(pg_wal, over);
+    let run = running_dir(pg_wal, over);
     fs::create_dir_all(&run)
         .await
         .with_context(|| format!("create {}", run.display()))?;

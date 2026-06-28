@@ -220,8 +220,8 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
         .await
         .unwrap();
 
-    let staged_2 = prefetch::prefetched_path(&pg_wal, "000000010000000000000002");
-    let staged_3 = prefetch::prefetched_path(&pg_wal, "000000010000000000000003");
+    let staged_2 = prefetch::prefetched_path(&pg_wal, "000000010000000000000002", None);
+    let staged_3 = prefetch::prefetched_path(&pg_wal, "000000010000000000000003", None);
     assert!(staged_2.exists(), "expected {staged_2:?} after prefetch");
     assert!(staged_3.exists(), "expected {staged_3:?} after prefetch");
 
@@ -265,7 +265,7 @@ async fn prefetch_cleans_stale_already_replayed_segments() {
         .unwrap();
 
     // leftover from an earlier replay point: a staged segment older than seed 5
-    let stale = prefetch::prefetched_path(&pg_wal, "000000010000000000000002");
+    let stale = prefetch::prefetched_path(&pg_wal, "000000010000000000000002", None);
     std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
     std::fs::write(&stale, b"stale").unwrap();
 
@@ -278,7 +278,7 @@ async fn prefetch_cleans_stale_already_replayed_segments() {
         "cleanup must drop already-replayed staged segment"
     );
     assert!(
-        prefetch::prefetched_path(&pg_wal, six).exists(),
+        prefetch::prefetched_path(&pg_wal, six, None).exists(),
         "segment after the seed must be staged"
     );
 }
@@ -319,7 +319,7 @@ async fn wal_fetch_triggers_in_process_prefetch() {
     assert!(dst.exists());
 
     // prefetch fires as a detached task; poll for the next segment to be staged
-    let staged_2 = prefetch::prefetched_path(&pg_wal, "000000010000000000000002");
+    let staged_2 = prefetch::prefetched_path(&pg_wal, "000000010000000000000002", None);
     let mut waited = Duration::ZERO;
     while !staged_2.exists() && waited < Duration::from_secs(5) {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -347,7 +347,7 @@ async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
     let seg = "000000010000000000000002";
     // full-size segment with valid magic so promotion accepts it once staged
     let segment = pseudo_wal_segment(2);
-    let running = prefetch::running_dir(&pg_wal).join(seg);
+    let running = prefetch::running_dir(&pg_wal, None).join(seg);
     std::fs::create_dir_all(running.parent().unwrap()).unwrap();
     // an in-flight prefetch: running/<seg> present, not yet complete
     std::fs::write(&running, b"").unwrap();
@@ -355,7 +355,7 @@ async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
     // background prefetcher completes shortly. Write into running/ then rename
     // to ready/ (the real prefetcher's atomic publish), so a watcher never stats
     // a half-written ready file and rejects it on the exact-size check
-    let ready = prefetch::prefetched_path(&pg_wal, seg);
+    let ready = prefetch::prefetched_path(&pg_wal, seg, None);
     let running_bg = running.clone();
     let ready_bg = ready.clone();
     let segment_bg = segment.clone();
@@ -395,7 +395,7 @@ async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
         .unwrap();
 
     // a stalled prefetch: running/<seg> present but never grows or completes
-    let running = prefetch::running_dir(&pg_wal).join(seg);
+    let running = prefetch::running_dir(&pg_wal, None).join(seg);
     std::fs::create_dir_all(running.parent().unwrap()).unwrap();
     std::fs::write(&running, b"partial").unwrap();
 
