@@ -33,14 +33,28 @@ pub enum SslMode {
     VerifyFull,
 }
 
-impl SslMode {
-    pub fn from_env() -> Result<Self> {
-        match std::env::var("PGSSLMODE").ok().as_deref() {
-            None => Ok(SslMode::Prefer),
-            Some(s) => Self::parse(s),
+/// Resolved client-TLS material (`PGSSLROOTCERT` / `PGSSLCERT` / `PGSSLKEY`),
+/// lifted out of the handshake path so it stays env-free. Empty values are
+/// treated as unset
+#[derive(Debug, Clone, Default)]
+pub struct TlsParams {
+    pub rootcert: Option<String>,
+    pub cert: Option<String>,
+    pub key: Option<String>,
+}
+
+impl TlsParams {
+    pub fn resolve(vars: &crate::config::Vars) -> Self {
+        let nonempty = |k: &str| vars.get(k).filter(|s: &String| !s.is_empty());
+        Self {
+            rootcert: nonempty("PGSSLROOTCERT"),
+            cert: nonempty("PGSSLCERT"),
+            key: nonempty("PGSSLKEY"),
         }
     }
+}
 
+impl SslMode {
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "disable" => Ok(SslMode::Disable),
@@ -101,6 +115,7 @@ pub async fn maybe_upgrade(
     socket: TcpStream,
     host: &str,
     sslmode: SslMode,
+    tls: &TlsParams,
 ) -> Result<(Box<dyn SocketStream>, bool)> {
     if !sslmode.attempts_tls() {
         return Ok((Box::new(socket), false));
@@ -121,7 +136,7 @@ pub async fn maybe_upgrade(
 
     match resp[0] {
         b'S' => {
-            let config = build_client_config(sslmode)?;
+            let config = build_client_config(sslmode, tls)?;
             let connector = TlsConnector::from(Arc::new(config));
             let server_name = ServerName::try_from(host.to_string())
                 .map_err(|e| anyhow!("invalid host for SNI: {e}"))?;
@@ -141,25 +156,23 @@ pub async fn maybe_upgrade(
     }
 }
 
-fn build_client_config(sslmode: SslMode) -> Result<ClientConfig> {
+fn build_client_config(sslmode: SslMode, tls: &TlsParams) -> Result<ClientConfig> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow!("rustls protocol versions: {e}"))?;
 
-    let rootcert = std::env::var("PGSSLROOTCERT")
-        .ok()
-        .filter(|p| !p.is_empty());
+    let rootcert = tls.rootcert.as_deref();
 
     // Server-cert verifier per sslmode; leaves builder awaiting client-auth choice
-    let builder = match verification_plan(sslmode, rootcert.as_deref()) {
+    let builder = match verification_plan(sslmode, rootcert) {
         // prefer / allow, and require without a root: encrypt only, accept any cert
         Verify::None => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier)),
         plan => {
             let mut roots = RootCertStore::empty();
-            match rootcert.as_deref() {
+            match rootcert {
                 // system has no rustls OS-store loader here; fall back to the
                 // bundled webpki roots (same public-root effect as pgx)
                 Some(path) if path != "system" => load_pem_roots(path, &mut roots)
@@ -182,7 +195,7 @@ fn build_client_config(sslmode: SslMode) -> Result<ClientConfig> {
 
     // Client cert auth: PGSSLCERT + PGSSLKEY. libpq's ~/.postgresql/postgresql.{crt,key}
     // default location is not honored, matching this module's PGSSLROOTCERT handling
-    match load_client_auth()? {
+    match load_client_auth(tls)? {
         Some((certs, key)) => builder
             .with_client_auth_cert(certs, key)
             .map_err(|e| anyhow!("configure client cert auth: {e}")),
@@ -192,9 +205,11 @@ fn build_client_config(sslmode: SslMode) -> Result<ClientConfig> {
 
 /// Resolve PGSSLCERT + PGSSLKEY into a cert chain & private key for mutual TLS.
 /// Both must be set together. Returns None when neither is set (no client auth)
-fn load_client_auth() -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
-    let cert = std::env::var("PGSSLCERT").ok().filter(|s| !s.is_empty());
-    let key = std::env::var("PGSSLKEY").ok().filter(|s| !s.is_empty());
+fn load_client_auth(
+    tls: &TlsParams,
+) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
+    let cert = tls.cert.clone();
+    let key = tls.key.clone();
     match (cert, key) {
         (None, None) => Ok(None),
         (Some(cert_path), Some(key_path)) => {
@@ -351,25 +366,6 @@ impl ServerCertVerifier for SkipHostnameVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // build_client_config / load_client_auth / SslMode::from_env read process
-    // env (PGSSLMODE / PGSSLROOTCERT / PGSSLCERT / PGSSLKEY); serialize every
-    // test that reads or mutates them so they can't observe each other's writes
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn set_env(k: &str, v: Option<&str>) {
-        unsafe {
-            match v {
-                Some(x) => std::env::set_var(k, x),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
 
     #[test]
     fn parses_sslmodes() {
@@ -401,17 +397,13 @@ mod tests {
 
     #[test]
     fn client_config_builds_for_all_modes() {
-        let _e = lock_env();
-        for k in ["PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"] {
-            set_env(k, None);
-        }
         for m in [
             SslMode::Prefer,
             SslMode::Require,
             SslMode::VerifyCa,
             SslMode::VerifyFull,
         ] {
-            build_client_config(m).unwrap();
+            build_client_config(m, &TlsParams::default()).unwrap();
         }
     }
 
@@ -419,10 +411,8 @@ mod tests {
     /// and only suppress the hostname mismatch.
     #[test]
     fn verify_ca_rejects_bogus_cert() {
-        let _e = lock_env();
-        set_env("PGSSLROOTCERT", None);
         // Run only after the aws-lc-rs provider is installed by build_client_config above
-        let _ = build_client_config(SslMode::VerifyCa).unwrap();
+        let _ = build_client_config(SslMode::VerifyCa, &TlsParams::default()).unwrap();
 
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -521,9 +511,10 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
         });
 
         let raw = TcpStream::connect(addr).await.unwrap();
-        let (sock, used_tls) = maybe_upgrade(raw, "127.0.0.1", SslMode::Prefer)
-            .await
-            .unwrap();
+        let (sock, used_tls) =
+            maybe_upgrade(raw, "127.0.0.1", SslMode::Prefer, &TlsParams::default())
+                .await
+                .unwrap();
         assert!(!used_tls);
         drop(sock);
         server.await.unwrap();
@@ -542,7 +533,7 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
         });
 
         let raw = TcpStream::connect(addr).await.unwrap();
-        let err = maybe_upgrade(raw, "127.0.0.1", SslMode::Require)
+        let err = maybe_upgrade(raw, "127.0.0.1", SslMode::Require, &TlsParams::default())
             .await
             .err()
             .unwrap();
@@ -561,9 +552,10 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
         });
 
         let raw = TcpStream::connect(addr).await.unwrap();
-        let (_sock, used_tls) = maybe_upgrade(raw, "127.0.0.1", SslMode::Disable)
-            .await
-            .unwrap();
+        let (_sock, used_tls) =
+            maybe_upgrade(raw, "127.0.0.1", SslMode::Disable, &TlsParams::default())
+                .await
+                .unwrap();
         assert!(!used_tls);
         let server_sock = server.await.unwrap();
         // No bytes pending: peek with try_read on a non-blocking socket
@@ -582,7 +574,7 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
             sock
         });
         let raw = TcpStream::connect(addr).await.unwrap();
-        let err = maybe_upgrade(raw, "127.0.0.1", SslMode::Prefer)
+        let err = maybe_upgrade(raw, "127.0.0.1", SslMode::Prefer, &TlsParams::default())
             .await
             .err()
             .unwrap();
@@ -635,48 +627,38 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
     }
 
     #[test]
-    fn build_client_config_env_branches() {
-        let _e = lock_env();
-        // snapshot the four vars so the process env is left as found
-        let keys = ["PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in keys {
-            set_env(k, None);
-        }
-
-        // SslMode::from_env: unset -> Prefer, set -> parsed, garbage -> err
-        assert_eq!(SslMode::from_env().unwrap(), SslMode::Prefer);
-        set_env("PGSSLMODE", Some("verify-full"));
-        assert_eq!(SslMode::from_env().unwrap(), SslMode::VerifyFull);
-        set_env("PGSSLMODE", Some("nonsense"));
-        assert!(SslMode::from_env().is_err());
-        set_env("PGSSLMODE", None);
-
+    fn build_client_config_tls_param_branches() {
         // PGSSLROOTCERT=<file> drives the load_pem_roots branch (not "system")
         let ca = write_tmp("env-ca", TEST_CRT);
-        set_env("PGSSLROOTCERT", Some(ca.to_str().unwrap()));
-        build_client_config(SslMode::VerifyFull).unwrap();
-        build_client_config(SslMode::VerifyCa).unwrap();
-        set_env("PGSSLROOTCERT", None);
+        let with_root = TlsParams {
+            rootcert: Some(ca.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        build_client_config(SslMode::VerifyFull, &with_root).unwrap();
+        build_client_config(SslMode::VerifyCa, &with_root).unwrap();
 
         // PGSSLCERT + PGSSLKEY drive the with_client_auth_cert branch
         let crt = write_tmp("env-crt", TEST_CRT);
         let key = write_tmp("env-key", TEST_KEY);
-        set_env("PGSSLCERT", Some(crt.to_str().unwrap()));
-        set_env("PGSSLKEY", Some(key.to_str().unwrap()));
-        build_client_config(SslMode::Prefer).unwrap();
+        let both = TlsParams {
+            cert: Some(crt.to_str().unwrap().to_string()),
+            key: Some(key.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        build_client_config(SslMode::Prefer, &both).unwrap();
 
         // half-configured client auth is a hard error (both required)
-        set_env("PGSSLKEY", None);
-        assert!(build_client_config(SslMode::Prefer).is_err());
-        set_env("PGSSLCERT", None);
-        set_env("PGSSLKEY", Some(key.to_str().unwrap()));
-        assert!(build_client_config(SslMode::Prefer).is_err());
+        let cert_only = TlsParams {
+            cert: Some(crt.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        assert!(build_client_config(SslMode::Prefer, &cert_only).is_err());
+        let key_only = TlsParams {
+            key: Some(key.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        assert!(build_client_config(SslMode::Prefer, &key_only).is_err());
 
-        for (k, v) in &saved {
-            set_env(k, v.as_deref());
-        }
         std::fs::remove_file(ca).ok();
         std::fs::remove_file(crt).ok();
         std::fs::remove_file(key).ok();

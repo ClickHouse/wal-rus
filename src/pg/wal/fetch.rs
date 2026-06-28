@@ -56,7 +56,7 @@ pub async fn handle(
     prefetch: Prefetch,
 ) -> Result<()> {
     let history = is_history_filename(name);
-    if !history && try_promote_prefetched(name, dst).await? {
+    if !history && try_promote_prefetched(name, dst, settings.prefetch_dir.as_deref()).await? {
         trigger_prefetch(settings, &storage, name, dst, prefetch);
         return Ok(());
     }
@@ -126,14 +126,16 @@ fn trigger_prefetch(
                 }
             });
         }
-        Prefetch::Fork => fork_prefetch(name, pg_wal),
+        Prefetch::Fork => fork_prefetch(name, pg_wal, settings.config_path.as_deref()),
     }
 }
 
-/// Spawn a detached `walrus wal-prefetch <name> <pg_wal>` child. It inherits
-/// env (storage creds, WALG_*) and is never waited on; once the parent exits,
-/// init reaps it (wal-g RegularPrefetcher via exec.Command + cmd.Start)
-fn fork_prefetch(name: &str, pg_wal: &Path) {
+/// Spawn a detached `walrus wal-prefetch <name> <pg_wal>` child. It inherits the
+/// process env (storage creds, WALG_*) and, since file-only settings are no
+/// longer pushed into env, re-passes `--config` so the child re-resolves the
+/// same file. Never waited on; once the parent exits, init reaps it (wal-g
+/// RegularPrefetcher via exec.Command + cmd.Start)
+fn fork_prefetch(name: &str, pg_wal: &Path, config: Option<&Path>) {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
@@ -142,6 +144,9 @@ fn fork_prefetch(name: &str, pg_wal: &Path) {
         }
     };
     let mut cmd = std::process::Command::new(exe);
+    if let Some(config) = config {
+        cmd.arg("--config").arg(config);
+    }
     cmd.arg("wal-prefetch").arg(name).arg(pg_wal);
     if let Err(e) = cmd.spawn() {
         tracing::warn!(target = "wal_fetch", "prefetch fork: {e}");
@@ -271,12 +276,12 @@ fn tmp_path(dst: &Path) -> PathBuf {
 /// (~200 ms of no growth → presume dead, reclaim, fall back to a direct
 /// download). Returns true when `dst` was satisfied from prefetch, false to
 /// download. Any unexpected error or missing prefetch dir falls through
-async fn try_promote_prefetched(name: &str, dst: &Path) -> Result<bool> {
+async fn try_promote_prefetched(name: &str, dst: &Path, over: Option<&Path>) -> Result<bool> {
     let Some(parent) = dst.parent() else {
         return Ok(false);
     };
-    let ready = super::prefetch::prefetched_path(parent, name);
-    let running = super::prefetch::running_dir(parent).join(name);
+    let ready = super::prefetch::prefetched_path(parent, name, over);
+    let running = super::prefetch::running_dir(parent, over).join(name);
 
     let mut seen_size: i64 = -1;
     let mut stalls = 0u32;
@@ -385,7 +390,7 @@ mod tests {
     fn layout(pg_wal: &Path, name: &str) -> (PathBuf, PathBuf) {
         (
             pg_wal.join(name),
-            super::super::prefetch::prefetched_path(pg_wal, name),
+            super::super::prefetch::prefetched_path(pg_wal, name, None),
         )
     }
 
@@ -398,7 +403,7 @@ mod tests {
         // a single page, not a full segment
         fs::write(&ready, vec![0u8; 8192]).await.unwrap();
 
-        assert!(!try_promote_prefetched(name, &dst).await.unwrap());
+        assert!(!try_promote_prefetched(name, &dst, None).await.unwrap());
         assert!(!fs::try_exists(&dst).await.unwrap(), "must not promote");
     }
 
@@ -416,7 +421,11 @@ mod tests {
         let mut seg = vec![0u8; seg_size];
         seg[..4].copy_from_slice(&VALID_MAGIC);
         fs::write(&ok_ready, &seg).await.unwrap();
-        assert!(try_promote_prefetched(ok_name, &ok_dst).await.unwrap());
+        assert!(
+            try_promote_prefetched(ok_name, &ok_dst, None)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             fs::metadata(&ok_dst).await.unwrap().len() as usize,
             seg_size
@@ -427,7 +436,11 @@ mod tests {
         let bad_name = "000000010000000000000008";
         let (bad_dst, bad_ready) = layout(dir.path(), bad_name);
         fs::write(&bad_ready, vec![0u8; seg_size]).await.unwrap();
-        assert!(!try_promote_prefetched(bad_name, &bad_dst).await.unwrap());
+        assert!(
+            !try_promote_prefetched(bad_name, &bad_dst, None)
+                .await
+                .unwrap()
+        );
         assert!(
             !fs::try_exists(&bad_dst).await.unwrap(),
             "bad segment removed"

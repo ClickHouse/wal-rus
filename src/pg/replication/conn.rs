@@ -15,7 +15,9 @@ use postgres_protocol::message::frontend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 
-use super::tls::{SocketStream, SslMode, maybe_upgrade};
+use crate::config::Vars;
+
+use super::tls::{SocketStream, SslMode, TlsParams, maybe_upgrade};
 
 #[derive(Debug, Clone)]
 pub struct PgConfig {
@@ -26,21 +28,28 @@ pub struct PgConfig {
     pub database: String,
     pub application_name: String,
     pub sslmode: SslMode,
+    pub tls: TlsParams,
 }
 
 impl PgConfig {
-    pub fn from_env() -> Result<Self> {
-        let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".into());
-        let port: u16 = std::env::var("PGPORT")
-            .unwrap_or_else(|_| "5432".into())
+    pub fn resolve(vars: &Vars) -> Result<Self> {
+        let host = vars.get("PGHOST").unwrap_or_else(|| "localhost".into());
+        let port: u16 = vars
+            .get("PGPORT")
+            .unwrap_or_else(|| "5432".into())
             .parse()
             .context("PGPORT")?;
-        let user = std::env::var("PGUSER")
-            .or_else(|_| std::env::var("USER"))
-            .map_err(|_| anyhow!("PGUSER not set"))?;
-        let password = std::env::var("PGPASSWORD").ok();
-        let database = std::env::var("PGDATABASE").unwrap_or_else(|_| user.clone());
-        let sslmode = SslMode::from_env()?;
+        let user = vars
+            .get("PGUSER")
+            .or_else(|| vars.get("USER"))
+            .ok_or_else(|| anyhow!("PGUSER not set"))?;
+        let password = vars.get("PGPASSWORD");
+        let database = vars.get("PGDATABASE").unwrap_or_else(|| user.clone());
+        let sslmode = match vars.get("PGSSLMODE") {
+            None => SslMode::Prefer,
+            Some(s) => SslMode::parse(&s)?,
+        };
+        let tls = TlsParams::resolve(vars);
         Ok(Self {
             host,
             port,
@@ -49,6 +58,7 @@ impl PgConfig {
             database,
             application_name: "walrus".into(),
             sslmode,
+            tls,
         })
     }
 }
@@ -97,7 +107,7 @@ impl ReplicationConn {
             let raw = TcpStream::connect(&addr)
                 .await
                 .with_context(|| format!("connect to {addr}"))?;
-            let (sock, used_tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode)
+            let (sock, used_tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode, &cfg.tls)
                 .await
                 .with_context(|| format!("tls negotiation against {addr}"))?;
             if used_tls {
@@ -629,6 +639,7 @@ mod tests {
             database: "u".into(),
             application_name: "walrus-test".into(),
             sslmode: SslMode::Prefer,
+            tls: TlsParams::default(),
         };
         let err = ReplicationConn::connect(&cfg).await.err().unwrap();
         let s = format!("{err:#}");
@@ -687,6 +698,7 @@ mod tests {
             database: "u".into(),
             application_name: "walrus-auth-test".into(),
             sslmode: SslMode::Disable,
+            tls: TlsParams::default(),
         }
     }
 

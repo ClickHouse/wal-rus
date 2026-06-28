@@ -297,6 +297,7 @@ async fn listing_table(storage: &DynStorage, prefix: &str, recursive: bool) -> R
 /// the configured crypter; size_hint drops whenever bytes are transformed
 pub async fn copy(
     settings: &Settings,
+    vars: &crate::config::Vars,
     from: &str,
     to: &str,
     prefix: &str,
@@ -309,9 +310,9 @@ pub async fn copy(
     let src = if from.is_empty() {
         settings.build_storage()?
     } else {
-        settings.build_dst_storage(from)?
+        settings.build_dst_storage(vars, from)?
     };
-    let dst = settings.build_dst_storage(to)?;
+    let dst = settings.build_dst_storage(vars, to)?;
 
     let metas = list_metas(&src, prefix).await?;
     let transform = decrypt_source || encrypt_target;

@@ -82,9 +82,10 @@ pub struct ImdsProvider {
 }
 
 impl ImdsProvider {
-    pub fn from_env() -> Result<Self> {
-        let endpoint = std::env::var("AWS_EC2_METADATA_SERVICE_ENDPOINT")
-            .ok()
+    /// `endpoint` overrides the link-local default (`AWS_EC2_METADATA_SERVICE_ENDPOINT`),
+    /// resolved in the config layer
+    pub fn new(endpoint: Option<String>) -> Result<Self> {
+        let endpoint = endpoint
             .map(|e| e.trim_end_matches('/').to_string())
             .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
         Self::with_endpoint(endpoint)

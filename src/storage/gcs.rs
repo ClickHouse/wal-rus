@@ -46,6 +46,9 @@ pub struct GcsConfig {
     pub bucket: String,
     pub prefix: String,
     pub credentials_path: Option<String>,
+    /// Emulator endpoint (fake-gcs-server); resolved from `WALG_GS_ENDPOINT` /
+    /// `STORAGE_EMULATOR_HOST` in the config layer. `Some` disables auth
+    pub endpoint: Option<String>,
 }
 
 pub struct GcsStorage {
@@ -64,14 +67,10 @@ impl GcsStorage {
             .build()
             .map_err(|e| StorageError::Config(e.to_string()))?;
 
-        // Emulator mode: WALG_GS_ENDPOINT / STORAGE_EMULATOR_HOST point at a
-        // fake-gcs-server which serves the JSON API over plain HTTP and ignores
-        // auth. Skip credentials + the oauth2 token mint entirely.
-        if let Some(ep) = std::env::var("WALG_GS_ENDPOINT")
-            .or_else(|_| std::env::var("STORAGE_EMULATOR_HOST"))
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
+        // Emulator mode: a fake-gcs-server endpoint serves the JSON API over
+        // plain HTTP and ignores auth. Skip credentials + the oauth2 token mint
+        // entirely.
+        if let Some(ep) = cfg.endpoint.as_deref().filter(|s| !s.is_empty()) {
             let host = if ep.starts_with("http://") || ep.starts_with("https://") {
                 ep.trim_end_matches('/').to_string()
             } else {
@@ -86,16 +85,12 @@ impl GcsStorage {
             });
         }
 
-        let path = cfg
-            .credentials_path
-            .clone()
-            .or_else(|| std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok())
-            .ok_or_else(|| {
-                StorageError::Config(
-                    "GOOGLE_APPLICATION_CREDENTIALS not set; metadata-server auth not yet supported"
-                        .into(),
-                )
-            })?;
+        let path = cfg.credentials_path.clone().ok_or_else(|| {
+            StorageError::Config(
+                "GOOGLE_APPLICATION_CREDENTIALS not set; metadata-server auth not yet supported"
+                    .into(),
+            )
+        })?;
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| StorageError::Config(format!("read credentials {}: {}", path, e)))?;
         let sa: ServiceAccount = serde_json::from_str(&raw)
@@ -537,20 +532,13 @@ mod tests {
 
     #[test]
     fn emulator_endpoint_overrides_host_and_skips_auth() {
-        // set_var unsafe in edition 2024; this test mutates process env so it
-        // must not run concurrently with other gcs env readers — there are none
-        unsafe {
-            std::env::set_var("WALG_GS_ENDPOINT", "http://127.0.0.1:4443");
-        }
         let s = GcsStorage::new(GcsConfig {
             bucket: "b".into(),
             prefix: "p".into(),
             credentials_path: None,
+            endpoint: Some("http://127.0.0.1:4443".into()),
         })
         .expect("emulator mode needs no credentials");
-        unsafe {
-            std::env::remove_var("WALG_GS_ENDPOINT");
-        }
         assert!(s.sa.is_none());
         assert_eq!(s.host, "http://127.0.0.1:4443");
         assert!(
@@ -568,6 +556,7 @@ mod tests {
                 bucket: "b".into(),
                 prefix: "p".into(),
                 credentials_path: None,
+                endpoint: None,
             },
             client: Client::builder().build().unwrap(),
             host,
@@ -732,6 +721,7 @@ mod tests {
                 bucket: "b".into(),
                 prefix: "p".into(),
                 credentials_path: None,
+                endpoint: None,
             },
             client: Client::builder().build().unwrap(),
             host: "http://127.0.0.1:1".into(), // unused: access_token only hits token_uri

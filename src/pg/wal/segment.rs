@@ -14,7 +14,7 @@ pub const DEFAULT_WAL_SEG_SIZE: u64 = 16 * 1024 * 1024;
 pub const SEGMENT_NAME_LEN: usize = 24;
 
 /// Process-wide WAL segment size. Defaults to 16 MiB; overridden at startup by
-/// `WALG_PG_WAL_SIZE` (see [`configure_from_env`]) and, for wal-receive, by the
+/// `WALG_PG_WAL_SIZE` (see [`configure`]) and, for wal-receive, by the
 /// `wal_segment_size` read from the live server. Mirrors wal-g's mutable
 /// `WalSegmentSize` global so every segment-number/LSN computation honors a
 /// non-default `initdb --wal-segsize`
@@ -34,12 +34,11 @@ pub fn set_wal_segment_size(bytes: u64) {
 /// Apply `WALG_PG_WAL_SIZE` (segment size in MiB) to the process-wide segment
 /// size. No-op when unset, matching wal-g's `viper.IsSet` gate. PG requires the
 /// segment size to be a power of two in 1..=1024 MiB (`initdb --wal-segsize`)
-pub fn configure_from_env() -> anyhow::Result<()> {
-    let Some(v) = std::env::var_os("WALG_PG_WAL_SIZE") else {
+pub fn configure(vars: &crate::config::Vars) -> anyhow::Result<()> {
+    let Some(v) = vars.get("WALG_PG_WAL_SIZE") else {
         return Ok(());
     };
     let mb: u64 = v
-        .to_string_lossy()
         .parse()
         .map_err(|_| anyhow::anyhow!("WALG_PG_WAL_SIZE must be an integer count of MiB"))?;
     set_wal_segment_size(seg_size_from_mb(mb)?);

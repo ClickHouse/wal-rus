@@ -131,14 +131,14 @@ fn fixed_len(decoded: &[u8]) -> Result<[u8; KEY_BYTES]> {
     Ok(out)
 }
 
-pub fn from_env() -> Result<Option<DynCrypter>> {
-    let key_inline = std::env::var("WALG_LIBSODIUM_KEY").ok();
-    let key_path = std::env::var("WALG_LIBSODIUM_KEY_PATH").ok();
+pub fn resolve(vars: &crate::config::Vars) -> Result<Option<DynCrypter>> {
+    let key_inline = vars.get("WALG_LIBSODIUM_KEY");
+    let key_path = vars.get("WALG_LIBSODIUM_KEY_PATH");
     if key_inline.is_none() && key_path.is_none() {
         return Ok(None);
     }
     let transform = KeyTransform::from_name(
-        std::env::var("WALG_LIBSODIUM_KEY_TRANSFORM")
+        vars.get("WALG_LIBSODIUM_KEY_TRANSFORM")
             .unwrap_or_default()
             .as_str(),
     )?;

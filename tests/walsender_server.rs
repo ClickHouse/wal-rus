@@ -45,6 +45,7 @@ fn client_config(port: u16, sslmode: SslMode) -> PgConfig {
         database: "u".into(),
         application_name: "walrus-server-test".into(),
         sslmode,
+        tls: Default::default(),
     }
 }
 
@@ -97,6 +98,7 @@ async fn protocol_roundtrip_through_tcp() {
         database: "u".into(),
         application_name: "walrus-server-test".into(),
         sslmode: SslMode::Disable,
+        tls: Default::default(),
     };
     let mut client = ReplicationConn::connect(&cfg)
         .await

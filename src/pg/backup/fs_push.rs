@@ -186,7 +186,12 @@ struct WorkerResult {
     max_file_no: u32,
 }
 
-pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) -> Result<()> {
+pub async fn handle(
+    settings: &Settings,
+    storage: DynStorage,
+    args: PushArgs,
+    cfg: PgConfig,
+) -> Result<()> {
     let start_time = Utc::now();
     let pgdata = args
         .pgdata
@@ -212,7 +217,6 @@ pub async fn handle(settings: &Settings, storage: DynStorage, args: PushArgs) ->
         );
     }
 
-    let cfg = PgConfig::from_env()?;
     tracing::info!(
         target = "backup_push",
         "filesystem backup-push from {} (connecting to {}:{} as {})",

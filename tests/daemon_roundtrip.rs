@@ -49,7 +49,14 @@ async fn daemon_check_and_wal_roundtrip() {
 
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
-        let _ = walrus::daemon::serve(&socket_for_server, s, store).await;
+        let _ = walrus::daemon::serve(
+            &socket_for_server,
+            s,
+            store,
+            walrus::daemon::DEFAULT_PUSH_TIMEOUT,
+            None,
+        )
+        .await;
     });
 
     wait_for_socket(&socket).await;
@@ -103,7 +110,14 @@ async fn daemon_closes_connection_on_handler_error() {
     let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
-        let _ = walrus::daemon::serve(&socket_for_server, s, store).await;
+        let _ = walrus::daemon::serve(
+            &socket_for_server,
+            s,
+            store,
+            walrus::daemon::DEFAULT_PUSH_TIMEOUT,
+            None,
+        )
+        .await;
     });
     wait_for_socket(&socket).await;
 
