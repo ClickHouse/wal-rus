@@ -264,6 +264,111 @@ pub enum Cmd {
         #[command(subcommand)]
         op: DaemonOp,
     },
+    /// Storage tools (wal-g `st`): cat/check/copy/get/ls/put/rm over the
+    /// configured storage. wal-g's `transfer` & failover-storage `--target`
+    /// need a multistorage model walrus doesn't have, so they're omitted
+    St {
+        /// Interpret file paths as glob patterns
+        #[arg(long = "glob", short = 'g', global = true)]
+        glob: bool,
+        #[command(subcommand)]
+        op: StOp,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StOp {
+    /// Stream a storage object to stdout
+    Cat {
+        #[arg(value_name = "relative_object_path")]
+        path: String,
+        /// Decrypt the object (off by default, unlike `get`)
+        #[arg(long)]
+        decrypt: bool,
+        /// Decompress the object (off by default, unlike `get`)
+        #[arg(long)]
+        decompress: bool,
+    },
+    /// Verify storage access (wal-g `st check read|write`)
+    Check {
+        #[command(subcommand)]
+        op: StCheckOp,
+    },
+    /// Copy objects between storages. `--from`/`--to` are walrus storage URIs
+    /// (`s3://`, `gs://`, `file://`, bare path); `--from` empty = configured
+    /// storage. Diverges from wal-g's config-file form
+    Copy {
+        /// Source storage URI (empty = configured storage)
+        #[arg(long, default_value = "")]
+        from: String,
+        /// Target storage URI
+        #[arg(long, default_value = "")]
+        to: String,
+        /// Prefix-filter path in source storage
+        #[arg(long, short = 'p', default_value = "")]
+        prefix: String,
+        /// Decrypt files read from source storage
+        #[arg(long = "decrypt-source", short = 'd')]
+        decrypt_source: bool,
+        /// Encrypt files written to target storage
+        #[arg(long = "encrypt-source", short = 'e')]
+        encrypt_source: bool,
+    },
+    /// Download a storage object to a destination path
+    Get {
+        #[arg(value_name = "relative_object_path")]
+        path: String,
+        #[arg(value_name = "destination_path")]
+        dst: String,
+        /// Skip decryption (decryption is on by default)
+        #[arg(long = "no-decrypt")]
+        no_decrypt: bool,
+        /// Skip decompression (decompression is on by default)
+        #[arg(long = "no-decompress")]
+        no_decompress: bool,
+    },
+    /// List objects in a storage folder
+    Ls {
+        #[arg(value_name = "relative folder path")]
+        path: Option<String>,
+        /// List folder recursively
+        #[arg(long, short = 'r')]
+        recursive: bool,
+    },
+    /// Upload a local file (or stdin) to storage
+    Put {
+        /// Local source path (omitted when `--read-stdin`, then this slot holds
+        /// the destination per wal-g RangeArgs(1,2))
+        #[arg(value_name = "local_path")]
+        local_path: Option<String>,
+        #[arg(value_name = "destination_path")]
+        dst: Option<String>,
+        /// Overwrite an existing object
+        #[arg(long, short = 'f')]
+        force: bool,
+        /// Read object content from stdin
+        #[arg(long = "read-stdin", short = 's')]
+        read_stdin: bool,
+        /// Skip encryption (encryption is on by default)
+        #[arg(long = "no-encrypt")]
+        no_encrypt: bool,
+        /// Skip compression (compression is on by default)
+        #[arg(long = "no-compress")]
+        no_compress: bool,
+    },
+    /// Remove objects by prefix
+    Rm {
+        #[arg(value_name = "prefix")]
+        prefix: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StCheckOp {
+    /// List the storage root (read access); optional names must each exist
+    Read { names: Vec<String> },
+    /// Write then delete a probe object (write access)
+    Write,
 }
 
 #[derive(Subcommand, Debug)]
@@ -582,6 +687,98 @@ impl Cli {
                 timeout,
                 connection_timeout,
             } => crate::daemon::client::run(&socket, op, timeout, connection_timeout).await,
+            Cmd::St { glob, op } => {
+                let s = Settings::from_env()?;
+                let storage = s.build_storage()?;
+                match op {
+                    StOp::Cat {
+                        path,
+                        decrypt,
+                        decompress,
+                    } => {
+                        crate::storage::tools::cat(&s, &storage, &path, decrypt, decompress, glob)
+                            .await
+                    }
+                    StOp::Check { op } => match op {
+                        StCheckOp::Read { names } => {
+                            crate::storage::check::read(&storage, &names).await
+                        }
+                        StCheckOp::Write => crate::storage::check::write(&storage).await,
+                    },
+                    StOp::Copy {
+                        from,
+                        to,
+                        prefix,
+                        decrypt_source,
+                        encrypt_source,
+                    } => {
+                        crate::storage::tools::copy(
+                            &s,
+                            &from,
+                            &to,
+                            &prefix,
+                            decrypt_source,
+                            encrypt_source,
+                        )
+                        .await
+                    }
+                    StOp::Get {
+                        path,
+                        dst,
+                        no_decrypt,
+                        no_decompress,
+                    } => {
+                        crate::storage::tools::get(
+                            &s,
+                            &storage,
+                            &path,
+                            std::path::Path::new(&dst),
+                            !no_decrypt,
+                            !no_decompress,
+                        )
+                        .await
+                    }
+                    StOp::Ls { path, recursive } => {
+                        crate::storage::tools::ls(&storage, path.as_deref(), recursive, glob).await
+                    }
+                    StOp::Put {
+                        local_path,
+                        dst,
+                        force,
+                        read_stdin,
+                        no_encrypt,
+                        no_compress,
+                    } => {
+                        // wal-g RangeArgs(1,2): without --read-stdin both positionals
+                        // required; with --read-stdin the single positional is dst
+                        let (local_path, dst) = if read_stdin {
+                            let dst = dst
+                                .or(local_path)
+                                .ok_or_else(|| anyhow::anyhow!("specify destination"))?;
+                            (None, dst)
+                        } else {
+                            match (local_path, dst) {
+                                (Some(lp), Some(dst)) => (Some(lp), dst),
+                                _ => anyhow::bail!(
+                                    "specify localPath and destination, or use --read-stdin"
+                                ),
+                            }
+                        };
+                        crate::storage::tools::put(
+                            &s,
+                            &storage,
+                            local_path.as_deref().map(std::path::Path::new),
+                            &dst,
+                            force,
+                            !no_encrypt,
+                            !no_compress,
+                            read_stdin,
+                        )
+                        .await
+                    }
+                    StOp::Rm { prefix } => crate::storage::tools::rm(&storage, &prefix, glob).await,
+                }
+            }
         }
     }
 }
@@ -635,6 +832,218 @@ mod tests {
         let cli = Cli::parse_from(["walrus", "wal-push", "/p", "--config", "/etc/walg.env"]);
         assert_eq!(cli.config, Some(PathBuf::from("/etc/walg.env")));
         assert!(matches!(cli.cmd, Cmd::WalPush { .. }));
+    }
+
+    #[test]
+    fn st_check_read_parses_optional_names() {
+        match Cli::parse_from(["walrus", "st", "check", "read"]).cmd {
+            Cmd::St {
+                op:
+                    StOp::Check {
+                        op: StCheckOp::Read { names },
+                    },
+                ..
+            } => assert!(names.is_empty()),
+            _ => panic!("expected st check read"),
+        }
+        match Cli::parse_from(["walrus", "st", "check", "read", "a", "b"]).cmd {
+            Cmd::St {
+                op:
+                    StOp::Check {
+                        op: StCheckOp::Read { names },
+                    },
+                ..
+            } => assert_eq!(names, ["a", "b"]),
+            _ => panic!("expected st check read"),
+        }
+    }
+
+    #[test]
+    fn st_cat_parses_decrypt_decompress() {
+        match Cli::parse_from(["walrus", "st", "cat", "foo"]).cmd {
+            Cmd::St {
+                op:
+                    StOp::Cat {
+                        path,
+                        decrypt,
+                        decompress,
+                    },
+                ..
+            } => {
+                assert_eq!(path, "foo");
+                assert!(!decrypt);
+                assert!(!decompress);
+            }
+            _ => panic!("expected st cat"),
+        }
+        match Cli::parse_from(["walrus", "st", "cat", "foo", "--decrypt", "--decompress"]).cmd {
+            Cmd::St {
+                op:
+                    StOp::Cat {
+                        decrypt,
+                        decompress,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(decrypt);
+                assert!(decompress);
+            }
+            _ => panic!("expected st cat"),
+        }
+    }
+
+    #[test]
+    fn st_get_parses_paths_and_flags() {
+        match Cli::parse_from(["walrus", "st", "get", "a", "b"]).cmd {
+            Cmd::St {
+                op:
+                    StOp::Get {
+                        path,
+                        dst,
+                        no_decrypt,
+                        no_decompress,
+                    },
+                ..
+            } => {
+                assert_eq!(path, "a");
+                assert_eq!(dst, "b");
+                assert!(!no_decrypt);
+                assert!(!no_decompress);
+            }
+            _ => panic!("expected st get"),
+        }
+        match Cli::parse_from([
+            "walrus",
+            "st",
+            "get",
+            "a",
+            "b",
+            "--no-decrypt",
+            "--no-decompress",
+        ])
+        .cmd
+        {
+            Cmd::St {
+                op:
+                    StOp::Get {
+                        no_decrypt,
+                        no_decompress,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(no_decrypt);
+                assert!(no_decompress);
+            }
+            _ => panic!("expected st get"),
+        }
+    }
+
+    #[test]
+    fn st_put_parses_force_and_read_stdin() {
+        match Cli::parse_from(["walrus", "st", "put", "f", "--force"]).cmd {
+            Cmd::St {
+                op:
+                    StOp::Put {
+                        local_path,
+                        dst,
+                        force,
+                        read_stdin,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(local_path.as_deref(), Some("f"));
+                assert_eq!(dst, None);
+                assert!(force);
+                assert!(!read_stdin);
+            }
+            _ => panic!("expected st put"),
+        }
+        match Cli::parse_from(["walrus", "st", "put", "dst", "--read-stdin"]).cmd {
+            Cmd::St {
+                op:
+                    StOp::Put {
+                        local_path,
+                        dst,
+                        read_stdin,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(local_path.as_deref(), Some("dst"));
+                assert_eq!(dst, None);
+                assert!(read_stdin);
+            }
+            _ => panic!("expected st put"),
+        }
+    }
+
+    #[test]
+    fn st_ls_parses_optional_path_and_flags() {
+        match Cli::parse_from(["walrus", "st", "ls"]).cmd {
+            Cmd::St {
+                op: StOp::Ls { path, recursive },
+                ..
+            } => {
+                assert_eq!(path, None);
+                assert!(!recursive);
+            }
+            _ => panic!("expected st ls"),
+        }
+        match Cli::parse_from(["walrus", "st", "ls", "foo", "-r"]).cmd {
+            Cmd::St {
+                op: StOp::Ls {
+                    path, recursive, ..
+                },
+                ..
+            } => {
+                assert_eq!(path.as_deref(), Some("foo"));
+                assert!(recursive);
+            }
+            _ => panic!("expected st ls"),
+        }
+    }
+
+    #[test]
+    fn st_persistent_glob_reaches_subcommand() {
+        // global -g/--glob can appear after the subcommand
+        match Cli::parse_from(["walrus", "st", "rm", "foo", "--glob"]).cmd {
+            Cmd::St { glob, op } => {
+                assert!(glob);
+                assert!(matches!(op, StOp::Rm { .. }));
+            }
+            _ => panic!("expected st rm"),
+        }
+    }
+
+    #[test]
+    fn st_copy_parses_flags() {
+        match Cli::parse_from([
+            "walrus", "st", "copy", "--from", "a", "--to", "b", "-p", "pre", "-d", "-e",
+        ])
+        .cmd
+        {
+            Cmd::St {
+                op:
+                    StOp::Copy {
+                        from,
+                        to,
+                        prefix,
+                        decrypt_source,
+                        encrypt_source,
+                    },
+                ..
+            } => {
+                assert_eq!(from, "a");
+                assert_eq!(to, "b");
+                assert_eq!(prefix, "pre");
+                assert!(decrypt_source);
+                assert!(encrypt_source);
+            }
+            _ => panic!("expected st copy"),
+        }
     }
 
     #[test]

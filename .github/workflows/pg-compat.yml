@@ -410,12 +410,7 @@ jobs:
           retention-days: 14
 
   # PG17 vm-test lane + line-coverage baseline. Runs the vm-test suite
-  # (tests/vm_live.rs) against a real PG 17 cluster under cargo-llvm-cov: the
-  # instrumented run is the functional pg17 vm-test gate (pg-vm-test covers
-  # 13-16) and emits the coverage baseline, exercising PG-dependent library
-  # code, not just unit tests. Uploads lcov.info (merged HTML is rendered by
-  # coverage-merge); summary lands in the job log; fails on any 0%-coverage
-  # source file.
+  # (tests/vm_live.rs) against a real PG 17 cluster under cargo-llvm-cov
   vm-test-pg17:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -466,27 +461,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Fail on any 0%-coverage file
-        run: |
-          zero=$(awk '
-            /^SF:/ { f = substr($0, 4) }
-            /^LF:/ { lf = substr($0, 4) + 0 }
-            /^LH:/ {
-              if (substr($0, 4) + 0 == 0 && lf > 0) {
-                i = index(f, "/src/"); if (i) f = substr(f, i + 1)
-                print f
-              }
-            }
-          ' lcov.info)
-          if [ -n "$zero" ]; then
-            count=$(printf '%s\n' "$zero" | grep -c .)
-            echo "Files with 0% line coverage (every source file must be exercised by a test):"
-            printf '%s\n' "$zero" | sed 's/^/  /'
-            echo "::error::${count} file(s) have 0% line coverage"
-            exit 1
-          fi
-          echo "OK: all instrumented files have >0% line coverage."
-
       - name: Collect PG logs on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -498,13 +472,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # Restate the line number with the shell ci/*.sh lanes folded in. Each
-  # instrumented lane uploaded .profraw from the one cov-build binary; merge them
-  # against that exact object (raw llvm-cov export reproduces cargo-llvm-cov's
-  # filtering) and sum per-line hits with the vm-test lcov. Runs even if a lane
-  # failed so the number is always produced; the hard 0%-file gate stays in the
-  # vm-test-pg17 job (vm-test lcov), so a partial merge here can't false-fail it.
-  # genhtml renders the merged lcov into the HTML report in the artifact.
+  # Restate the line number with the shell ci/*.sh lanes folded in, then gate on
+  # it. Each instrumented lane uploaded .profraw from the one cov-build binary;
+  # merge them against that exact object (raw llvm-cov export reproduces
+  # cargo-llvm-cov's filtering) and sum per-line hits with the vm-test lcov. Runs
+  # even if a lane failed so the number is always produced. The hard 0%-file gate
+  # fires on the merged report, but only when the merge is complete (every
+  # coverage lane green and both inputs present); a partial merge reports 0%
+  # files as a warning instead, since a missing lane's profraw would masquerade
+  # as a coverage hole. genhtml renders the merged lcov into the HTML report.
   coverage-merge:
     needs: [vm-test-pg17, cov-build, pg, pg-storage, pg-codec, pg-tls-scram]
     if: always()
@@ -539,7 +515,8 @@ jobs:
           set -euo pipefail
           llvmbin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
           inputs=()
-          if [ -f vmtest/lcov.info ]; then inputs+=(vmtest/lcov.info); else echo "::warning::no vm-test lcov"; fi
+          have_vmtest=false; have_shell=false
+          if [ -f vmtest/lcov.info ]; then inputs+=(vmtest/lcov.info); have_vmtest=true; else echo "::warning::no vm-test lcov"; fi
           mkdir -p profraw
           find profraw -name '*.profraw' -type f >profraw.list || true
           if [ -f cov/walrus ] && [ -s profraw.list ]; then
@@ -550,21 +527,65 @@ jobs:
               --ignore-filename-regex '(/\.cargo/registry/|/rustc/|library/std/)' \
               --format lcov >shell.lcov
             inputs+=(shell.lcov)
+            have_shell=true
             echo "shell-lane profraw merged: $(wc -l <profraw.list) file(s)"
           else
             echo "::warning::no shell-lane profraw; merged number is vm-test only"
           fi
           [ ${#inputs[@]} -gt 0 ] || { echo "::error::no coverage inputs"; exit 1; }
           awk -f ci/lcov_merge.awk "${inputs[@]}" >merged.lcov
+          # Gate only when both streams folded in; a missing one means absent
+          # coverage, not a real hole (see the 0%-gate step).
+          if [ "$have_vmtest" = true ] && [ "$have_shell" = true ]; then
+            echo true >merge_complete.flag
+          else
+            echo false >merge_complete.flag
+          fi
       - name: Coverage summary
         run: |
           awk -F: '/^LH:/{h+=$2} /^LF:/{f+=$2} END{if(f>0) printf "merged line coverage: %d/%d = %.2f%%\n",h,f,100*h/f}' merged.lcov
-          # Report (do not fail on) 0%-coverage files; the hard gate is the
-          # vm-test-pg17 job. A file here can only be 0% if no stream hit it.
-          awk '
-            /^SF:/{f=substr($0,4)} /^LF:/{lf=substr($0,4)+0}
-            /^LH:/{ if(substr($0,4)+0==0 && lf>0){ i=index(f,"/src/"); if(i)f=substr(f,i+1); print "  0%:",f } }
-          ' merged.lcov
+
+      - name: Fail on any 0%-coverage file (merged)
+        # Lane results gate enforcement: a failed coverage lane already reds CI
+        # and may have dropped its profraw, so 0% then is an artifact gap, not a
+        # real hole. Enforce only on a complete, all-green merge; else warn.
+        env:
+          R_VM_TEST: ${{ needs.vm-test-pg17.result }}
+          R_COV_BUILD: ${{ needs.cov-build.result }}
+          R_PG: ${{ needs.pg.result }}
+          R_PG_STORAGE: ${{ needs.pg-storage.result }}
+          R_PG_CODEC: ${{ needs.pg-codec.result }}
+          R_PG_TLS_SCRAM: ${{ needs.pg-tls-scram.result }}
+        run: |
+          set -euo pipefail
+          zero=$(awk '
+            /^SF:/ { f = substr($0, 4) }
+            /^LF:/ { lf = substr($0, 4) + 0 }
+            /^LH:/ {
+              if (substr($0, 4) + 0 == 0 && lf > 0) {
+                i = index(f, "/src/"); if (i) f = substr(f, i + 1)
+                print f
+              }
+            }
+          ' merged.lcov)
+          if [ -z "$zero" ]; then
+            echo "OK: all merged files have >0% line coverage."
+            exit 0
+          fi
+          count=$(printf '%s\n' "$zero" | grep -c .)
+          complete=$(cat merge_complete.flag 2>/dev/null || echo false)
+          lanes_ok=true
+          for r in "$R_VM_TEST" "$R_COV_BUILD" "$R_PG" "$R_PG_STORAGE" "$R_PG_CODEC" "$R_PG_TLS_SCRAM"; do
+            [ "$r" = success ] || lanes_ok=false
+          done
+          if [ "$complete" = true ] && [ "$lanes_ok" = true ]; then
+            echo "Files with 0% line coverage in merged report (every source file must be exercised by a test):"
+            printf '%s\n' "$zero" | sed 's/^/  /'
+            echo "::error::${count} file(s) have 0% line coverage"
+            exit 1
+          fi
+          echo "::warning::${count} file(s) at 0% but merge incomplete (lanes_ok=$lanes_ok complete=$complete); not gating"
+          printf '%s\n' "$zero" | sed 's/^/  0%: /'
       - name: Install genhtml
         run: sudo apt-get update && sudo apt-get install -y lcov
       - name: Coverage HTML (merged)
