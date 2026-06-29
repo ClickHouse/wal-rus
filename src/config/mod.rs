@@ -1,15 +1,14 @@
 //! Config loading from env, mirroring wal-g WALG_/AWS_/GOOGLE_ vars
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 
 use crate::compression;
 use crate::crypto::{self, DynCrypter};
 use crate::retry::RetryPolicy;
-use crate::storage::{DynStorage, Storage, fs::FsStorage, gcs, retrying::RetryingStorage, s3};
+use crate::storage::{self, GcsConfig, Operator, S3Config};
 
 mod vars;
 pub use vars::Vars;
@@ -65,8 +64,8 @@ pub struct DeltaSettings {
 #[derive(Debug, Clone)]
 pub enum StorageSettings {
     Fs { path: String },
-    S3(s3::S3Config),
-    Gcs(gcs::GcsConfig),
+    S3(S3Config),
+    Gcs(GcsConfig),
 }
 
 impl Default for Settings {
@@ -194,7 +193,7 @@ impl Settings {
         }
     }
 
-    pub fn build_storage(&self) -> Result<DynStorage> {
+    pub fn build_storage(&self) -> Result<Operator> {
         Self::build_storage_for(&self.storage, self.retry)
     }
 
@@ -202,29 +201,13 @@ impl Settings {
     /// `s3://bucket/prefix`, `gs://bucket/prefix`. Inherits credentials &
     /// retry policy from the current Settings; lets `copy` target a different
     /// prefix or bucket without reconfiguring the global env
-    pub fn build_dst_storage(&self, vars: &Vars, uri: &str) -> Result<DynStorage> {
+    pub fn build_dst_storage(&self, vars: &Vars, uri: &str) -> Result<Operator> {
         let dst = storage_from_uri(vars, uri, &self.storage)?;
         Self::build_storage_for(&dst, self.retry)
     }
 
-    fn build_storage_for(s: &StorageSettings, policy: RetryPolicy) -> Result<DynStorage> {
-        match s {
-            StorageSettings::Fs { path } => {
-                // local fs: skip retry wrapper; no transient failures worth retrying
-                let s = FsStorage::new(path).context("init fs storage")?;
-                Ok(Arc::new(s) as Arc<dyn Storage>)
-            }
-            StorageSettings::S3(c) => {
-                let s = s3::S3Storage::with_retry_policy(c.clone(), policy)
-                    .context("init s3 storage")?;
-                Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
-            }
-            StorageSettings::Gcs(c) => {
-                let cfg = c.clone();
-                let s = gcs::GcsStorage::new(cfg).context("init gcs storage")?;
-                Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
-            }
-        }
+    fn build_storage_for(s: &StorageSettings, policy: RetryPolicy) -> Result<Operator> {
+        storage::build_operator(s, policy)
     }
 }
 
@@ -259,7 +242,7 @@ fn storage_from_uri(vars: &Vars, uri: &str, src: &StorageSettings) -> Result<Sto
             _ => None,
         }
         .or_else(|| gcs_endpoint(vars));
-        return Ok(StorageSettings::Gcs(gcs::GcsConfig {
+        return Ok(StorageSettings::Gcs(GcsConfig {
             bucket,
             prefix,
             credentials_path,
@@ -297,14 +280,13 @@ fn s3_config(
     vars: &Vars,
     bucket: String,
     prefix: String,
-    src: Option<&s3::S3Config>,
-) -> Result<s3::S3Config> {
+    src: Option<&S3Config>,
+) -> Result<S3Config> {
     let region = src
         .map(|c| c.region.clone())
         .or_else(|| vars.get("AWS_REGION"))
         .or_else(|| vars.get("WALG_S3_REGION"))
         .unwrap_or_else(|| "us-east-1".into());
-    let creds = s3_credentials(vars, src)?;
     let endpoint = src
         .and_then(|c| c.endpoint.clone())
         .or_else(|| vars.get("AWS_ENDPOINT_URL"))
@@ -314,13 +296,22 @@ fn s3_config(
         Some(c) => c.force_path_style,
         None => force_path_style(vars, endpoint.is_some())?,
     };
-    Ok(s3::S3Config {
+    let S3Creds {
+        access_key_id,
+        secret_access_key,
+        session_token,
+        disable_ec2_metadata,
+    } = s3_credentials(vars, src)?;
+    Ok(S3Config {
         bucket,
         prefix,
         region,
-        creds,
         endpoint,
         force_path_style,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        disable_ec2_metadata,
     })
 }
 
@@ -335,13 +326,27 @@ fn force_path_style(vars: &Vars, endpoint_set: bool) -> Result<bool> {
     Ok(endpoint_set)
 }
 
-/// Pick a credential source: inherit `src`, else explicit static env keys,
-/// else the EC2 metadata service. IMDS is skipped (surfacing the missing-keys
-/// error) when AWS_EC2_METADATA_DISABLED is set. One static key without the
-/// other is a hard error rather than a silent IMDS fallback
-fn s3_credentials(vars: &Vars, src: Option<&s3::S3Config>) -> Result<s3::CredentialSource> {
+/// Resolved static credential fields handed to the S3 Operator builder
+#[derive(Default)]
+struct S3Creds {
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+    disable_ec2_metadata: bool,
+}
+
+/// Resolve static credential fields, honoring wal-g aliases. Inherits `src`
+/// when present. Both key halves or neither: one without the other is a hard
+/// error. When neither is set, OpenDAL's reqsign chain (env, IMDS, assume-role,
+/// web-identity, ECS) resolves at request time
+fn s3_credentials(vars: &Vars, src: Option<&S3Config>) -> Result<S3Creds> {
     if let Some(c) = src {
-        return Ok(c.creds.clone());
+        return Ok(S3Creds {
+            access_key_id: c.access_key_id.clone(),
+            secret_access_key: c.secret_access_key.clone(),
+            session_token: c.session_token.clone(),
+            disable_ec2_metadata: c.disable_ec2_metadata,
+        });
     }
     let access_key = vars
         .get("AWS_ACCESS_KEY_ID")
@@ -349,22 +354,18 @@ fn s3_credentials(vars: &Vars, src: Option<&s3::S3Config>) -> Result<s3::Credent
     let secret_key = vars
         .get("AWS_SECRET_ACCESS_KEY")
         .or_else(|| vars.get("AWS_SECRET_KEY"));
+    let disable_ec2_metadata = vars.bool("AWS_EC2_METADATA_DISABLED", false)?;
     match (access_key, secret_key) {
-        (Some(access_key), Some(secret_key)) => Ok(s3::CredentialSource::Static(s3::Credentials {
-            access_key,
-            secret_key,
+        (Some(ak), Some(sk)) => Ok(S3Creds {
+            access_key_id: Some(ak),
+            secret_access_key: Some(sk),
             session_token: vars.get("AWS_SESSION_TOKEN"),
-            expires_at: None,
-        })),
-        (None, None) if vars.bool("AWS_EC2_METADATA_DISABLED", false)? => {
-            Err(anyhow!("AWS_ACCESS_KEY_ID not set and IMDS disabled"))
-        }
-        (None, None) => {
-            let endpoint = vars.get("AWS_EC2_METADATA_SERVICE_ENDPOINT");
-            Ok(s3::CredentialSource::Imds(Arc::new(
-                s3::ImdsProvider::new(endpoint).map_err(|e| anyhow!("{e}"))?,
-            )))
-        }
+            disable_ec2_metadata,
+        }),
+        (None, None) => Ok(S3Creds {
+            disable_ec2_metadata,
+            ..Default::default()
+        }),
         _ => Err(anyhow!(
             "incomplete static credentials: set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
         )),
@@ -405,7 +406,7 @@ fn detect_storage(vars: &Vars) -> Result<StorageSettings> {
     }
     if let Some(gs_prefix) = vars.get("WALG_GS_PREFIX") {
         let (bucket, prefix) = parse_uri_prefix(&gs_prefix, "gs://")?;
-        return Ok(StorageSettings::Gcs(gcs::GcsConfig {
+        return Ok(StorageSettings::Gcs(GcsConfig {
             bucket,
             prefix,
             credentials_path: vars.get("GOOGLE_APPLICATION_CREDENTIALS"),
@@ -494,18 +495,12 @@ pub fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ObjExt;
     use std::sync::Mutex;
 
     // set_var/remove_var are unsafe in edition 2024 and process-global;
     // serialize env-touching tests so they can't observe each other's writes
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn static_creds(c: &s3::S3Config) -> &s3::Credentials {
-        match &c.creds {
-            s3::CredentialSource::Static(cr) => cr,
-            other => panic!("expected static creds, got {other:?}"),
-        }
-    }
 
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -593,8 +588,8 @@ mod tests {
                 assert_eq!(c.bucket, "bkt");
                 assert_eq!(c.prefix, "pre/fix");
                 assert_eq!(c.region, "eu-west-2");
-                assert_eq!(static_creds(&c).access_key, "AKIA_ALIAS");
-                assert_eq!(static_creds(&c).secret_key, "secret_alias");
+                assert_eq!(c.access_key_id.as_deref(), Some("AKIA_ALIAS"));
+                assert_eq!(c.secret_access_key.as_deref(), Some("secret_alias"));
                 assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
                 assert!(c.force_path_style);
             }
@@ -699,7 +694,7 @@ mod tests {
         // gs src carries credentials_path -> inherited, env ignored
         {
             let _g = EnvGuard::new(&[("GOOGLE_APPLICATION_CREDENTIALS", Some("/env/sa.json"))]);
-            let src = StorageSettings::Gcs(gcs::GcsConfig {
+            let src = StorageSettings::Gcs(GcsConfig {
                 bucket: "srcb".into(),
                 prefix: "srcp".into(),
                 credentials_path: Some("/src/sa.json".into()),
@@ -737,27 +732,25 @@ mod tests {
             ("AWS_ACCESS_KEY_ID", None),
             ("AWS_SECRET_ACCESS_KEY", None),
         ]);
-        let src = StorageSettings::S3(s3::S3Config {
+        let src = StorageSettings::S3(S3Config {
             bucket: "srcb".into(),
             prefix: "srcp".into(),
             region: "ap-south-1".into(),
-            creds: s3::CredentialSource::Static(s3::Credentials {
-                access_key: "AKIASRC".into(),
-                secret_key: "secretsrc".into(),
-                session_token: Some("toksrc".into()),
-                expires_at: None,
-            }),
             endpoint: Some("http://ceph:7480".into()),
             force_path_style: true,
+            access_key_id: Some("AKIASRC".into()),
+            secret_access_key: Some("secretsrc".into()),
+            session_token: Some("toksrc".into()),
+            disable_ec2_metadata: false,
         });
         match storage_from_uri(&Vars::default(), "s3://dstb/dst", &src).unwrap() {
             StorageSettings::S3(c) => {
                 assert_eq!(c.bucket, "dstb");
                 assert_eq!(c.prefix, "dst");
                 assert_eq!(c.region, "ap-south-1");
-                assert_eq!(static_creds(&c).access_key, "AKIASRC");
-                assert_eq!(static_creds(&c).secret_key, "secretsrc");
-                assert_eq!(static_creds(&c).session_token.as_deref(), Some("toksrc"));
+                assert_eq!(c.access_key_id.as_deref(), Some("AKIASRC"));
+                assert_eq!(c.secret_access_key.as_deref(), Some("secretsrc"));
+                assert_eq!(c.session_token.as_deref(), Some("toksrc"));
                 assert_eq!(c.endpoint.as_deref(), Some("http://ceph:7480"));
                 assert!(c.force_path_style);
             }
@@ -801,16 +794,16 @@ mod tests {
                     assert_eq!(c.bucket, "mybkt");
                     assert_eq!(c.prefix, "walg");
                     assert_eq!(c.region, "us-west-1");
-                    assert_eq!(static_creds(&c).access_key, "AKID");
-                    assert_eq!(static_creds(&c).secret_key, "SEKRIT");
+                    assert_eq!(c.access_key_id.as_deref(), Some("AKID"));
+                    assert_eq!(c.secret_access_key.as_deref(), Some("SEKRIT"));
                     // no endpoint -> path style defaults off
                     assert!(!c.force_path_style);
                 }
                 other => panic!("expected S3, got {other:?}"),
             }
         }
-        // s3 prefix, no static keys -> IMDS credential source (no network here,
-        // the provider only builds its client)
+        // s3 prefix, no static keys -> defer to OpenDAL's credential chain
+        // (no static fields set; reqsign resolves env/IMDS/web-identity/ECS)
         {
             let _g = EnvGuard::new(&[
                 ("WALG_FILE_PREFIX", None),
@@ -824,12 +817,14 @@ mod tests {
             ]);
             match detect_storage(&Vars::default()).unwrap() {
                 StorageSettings::S3(c) => {
-                    assert!(matches!(c.creds, s3::CredentialSource::Imds(_)));
+                    assert!(c.access_key_id.is_none() && c.secret_access_key.is_none());
+                    assert!(!c.disable_ec2_metadata);
                 }
                 other => panic!("expected S3, got {other:?}"),
             }
         }
-        // s3 prefix, no static keys, IMDS disabled -> error
+        // s3 prefix, no static keys, IMDS disabled -> disable_ec2_metadata set,
+        // credential resolution deferred to the rest of OpenDAL's chain
         {
             let _g = EnvGuard::new(&[
                 ("WALG_FILE_PREFIX", None),
@@ -841,7 +836,10 @@ mod tests {
                 ("AWS_SECRET_KEY", None),
                 ("AWS_EC2_METADATA_DISABLED", Some("true")),
             ]);
-            assert!(detect_storage(&Vars::default()).is_err());
+            match detect_storage(&Vars::default()).unwrap() {
+                StorageSettings::S3(c) => assert!(c.disable_ec2_metadata),
+                other => panic!("expected S3, got {other:?}"),
+            }
         }
         // gs prefix, credentials path from env (path not opened here)
         {
@@ -882,43 +880,38 @@ mod tests {
             RetryPolicy::default(),
         )
         .unwrap();
-        assert!(fs.describe().starts_with("file://"));
+        assert!(fs.describe().starts_with("fs://"));
 
-        // s3: client construction only, no IO
+        // s3: operator construction only, no IO
         let s3 = Settings::build_storage_for(
-            &StorageSettings::S3(s3::S3Config {
+            &StorageSettings::S3(S3Config {
                 bucket: "b".into(),
                 prefix: "p".into(),
                 region: "us-east-1".into(),
-                creds: s3::CredentialSource::Static(s3::Credentials {
-                    access_key: "AKID".into(),
-                    secret_key: "sek".into(),
-                    session_token: None,
-                    expires_at: None,
-                }),
                 endpoint: None,
                 force_path_style: false,
+                access_key_id: Some("AKID".into()),
+                secret_access_key: Some("sek".into()),
+                session_token: None,
+                disable_ec2_metadata: false,
             }),
             RetryPolicy::default(),
         )
         .unwrap();
-        assert_eq!(s3.describe(), "s3://b/p");
+        assert!(s3.describe().starts_with("s3://"), "{}", s3.describe());
 
-        // gcs: a credentials file lets new() succeed without env or network
-        // (avoids racing the gcs WALG_GS_ENDPOINT unit test)
-        let sa = dir.path().join("sa.json");
-        std::fs::write(&sa, r#"{"client_email":"x@y","private_key":"dummy"}"#).unwrap();
+        // gcs: emulator endpoint + skip_signature builds without creds or network
         let gcs = Settings::build_storage_for(
-            &StorageSettings::Gcs(gcs::GcsConfig {
+            &StorageSettings::Gcs(GcsConfig {
                 bucket: "gb".into(),
                 prefix: "gp".into(),
-                credentials_path: Some(sa.to_string_lossy().into()),
-                endpoint: None,
+                credentials_path: None,
+                endpoint: Some("http://127.0.0.1:1".into()),
             }),
             RetryPolicy::default(),
         )
         .unwrap();
-        assert_eq!(gcs.describe(), "gs://gb/gp");
+        assert!(gcs.describe().starts_with("gcs://"), "{}", gcs.describe());
     }
 
     #[test]
@@ -936,7 +929,7 @@ mod tests {
                 &format!("file://{}", dir.path().display()),
             )
             .unwrap();
-        assert!(dst.describe().starts_with("file://"));
+        assert!(dst.describe().starts_with("fs://"));
 
         // build_storage (instance) rides the same path
         assert!(
@@ -944,7 +937,7 @@ mod tests {
                 .build_storage()
                 .unwrap()
                 .describe()
-                .starts_with("file://")
+                .starts_with("fs://")
         );
     }
 

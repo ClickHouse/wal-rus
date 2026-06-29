@@ -180,10 +180,11 @@ pub fn strip_leftmost_backup_name(key: &str) -> Option<&str> {
 /// the initial allocation for the in-memory buffer (callers know the rough
 /// blob size). Error chain: `get {key}` → underlying read error → `parse {key}`
 pub(crate) async fn load_json<T: serde::de::DeserializeOwned>(
-    storage: &crate::storage::DynStorage,
+    storage: &crate::storage::Operator,
     key: &str,
     buf_hint: usize,
 ) -> Result<T> {
+    use crate::storage::ObjExt;
     use tokio::io::AsyncReadExt;
     let mut r = storage
         .get(key)
@@ -463,23 +464,22 @@ impl Default for BackupSentinelDtoV2 {
 #[cfg(test)]
 pub(crate) mod test_fixtures {
     use super::*;
-    use crate::storage::{AsyncReader, DynStorage, fs::FsStorage};
-    use std::sync::Arc;
+    use crate::storage::{AsyncReader, ObjExt, Operator};
 
-    pub(crate) fn fs_store(dir: &std::path::Path) -> DynStorage {
-        Arc::new(FsStorage::new(dir).unwrap())
+    pub(crate) fn fs_store(dir: &std::path::Path) -> Operator {
+        crate::storage::fs_operator(dir)
     }
 
     fn reader(bytes: Vec<u8>) -> AsyncReader {
         Box::pin(std::io::Cursor::new(bytes))
     }
 
-    pub(crate) async fn put_bytes(s: &DynStorage, key: &str, bytes: Vec<u8>) {
+    pub(crate) async fn put_bytes(s: &Operator, key: &str, bytes: Vec<u8>) {
         let len = bytes.len() as u64;
         s.put(key, reader(bytes), Some(len)).await.unwrap();
     }
 
-    pub(crate) async fn put_sentinel(s: &DynStorage, name: &str, sentinel: &BackupSentinelDtoV2) {
+    pub(crate) async fn put_sentinel(s: &Operator, name: &str, sentinel: &BackupSentinelDtoV2) {
         put_bytes(
             s,
             &sentinel_key(name),
@@ -488,7 +488,7 @@ pub(crate) mod test_fixtures {
         .await;
     }
 
-    pub(crate) async fn put_files_metadata(s: &DynStorage, name: &str, fm: &FilesMetadataDto) {
+    pub(crate) async fn put_files_metadata(s: &Operator, name: &str, fm: &FilesMetadataDto) {
         put_bytes(
             s,
             &files_metadata_key(name),
@@ -497,7 +497,7 @@ pub(crate) mod test_fixtures {
         .await;
     }
 
-    pub(crate) async fn put_wal_segment(s: &DynStorage, seg: &str) {
+    pub(crate) async fn put_wal_segment(s: &Operator, seg: &str) {
         put_bytes(s, &format!("{}/{seg}", crate::pg::WAL_FOLDER), Vec::new()).await;
     }
 

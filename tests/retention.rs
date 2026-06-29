@@ -5,7 +5,6 @@
 //! the `copy` command end-to-end. Mirrors wal-g's `delete_test.go` shape
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
 
 use chrono::Utc;
 use walrus::config::{Settings, StorageSettings};
@@ -14,8 +13,7 @@ use walrus::pg::backup::delete::{
     self, DeleteModifier, DeleteOp, GarbageScope, try_extract_timeline_seg_no,
 };
 use walrus::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, sentinel_key, tar_part_key};
-use walrus::storage::Storage;
-use walrus::storage::fs::FsStorage;
+use walrus::storage::ObjExt;
 
 fn test_settings() -> Settings {
     Settings {
@@ -51,7 +49,7 @@ fn make_sentinel(start_lsn: u64, is_permanent: bool) -> BackupSentinelDtoV2 {
     }
 }
 
-async fn put_bytes(store: &Arc<FsStorage>, key: &str, body: Vec<u8>) {
+async fn put_bytes(store: &walrus::storage::Operator, key: &str, body: Vec<u8>) {
     let len = body.len() as u64;
     let r: walrus::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
     store.put(key, r, Some(len)).await.unwrap();
@@ -63,9 +61,9 @@ fn backup_name(timeline: u32, start_lsn: u64) -> String {
 
 /// Seed N backups with start LSNs `[1, 2, ..., N] * seg_size` and a few WAL
 /// segments per backup. Returns `(store_dir, store, backup_names_in_order)`
-async fn seed_bucket(n: u32) -> (tempfile::TempDir, Arc<FsStorage>, Vec<String>) {
+async fn seed_bucket(n: u32) -> (tempfile::TempDir, walrus::storage::Operator, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
     let mut names = Vec::new();
     for i in 0..n {
         let lsn = (i as u64 + 1) * seg_size();
@@ -96,7 +94,7 @@ async fn seed_bucket(n: u32) -> (tempfile::TempDir, Arc<FsStorage>, Vec<String>)
 #[tokio::test]
 async fn delete_retain_keeps_n_newest() {
     let (_dir, store, names) = seed_bucket(4).await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
     let plan = delete::handle(
         dyn_store.clone(),
         DeleteOp::Retain {
@@ -129,7 +127,7 @@ async fn delete_retain_keeps_n_newest() {
 #[tokio::test]
 async fn delete_before_name_drops_older_only() {
     let (_dir, store, names) = seed_bucket(4).await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
     let plan = delete::handle(
         dyn_store.clone(),
         DeleteOp::Before {
@@ -150,7 +148,7 @@ async fn delete_before_name_drops_older_only() {
 #[tokio::test]
 async fn delete_everything_refuses_with_permanent_unless_force() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
     let name = backup_name(1, seg_size());
     let sentinel = make_sentinel(seg_size(), /*is_permanent*/ true);
     put_bytes(
@@ -159,7 +157,7 @@ async fn delete_everything_refuses_with_permanent_unless_force() {
         serde_json::to_vec(&sentinel).unwrap(),
     )
     .await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
 
     // without FORCE: refuses
     let err = delete::handle(
@@ -185,7 +183,7 @@ async fn delete_everything_refuses_with_permanent_unless_force() {
 #[tokio::test]
 async fn delete_permanent_wal_is_preserved() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     // Two backups: older permanent (LSN seg 3), newer impermanent (LSN seg 6).
     // Then a few WAL segments scattered across [1..8]
@@ -218,7 +216,7 @@ async fn delete_permanent_wal_is_preserved() {
         )
         .await;
     }
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
 
     delete::handle(
         dyn_store.clone(),
@@ -263,7 +261,7 @@ async fn delete_permanent_wal_is_preserved() {
 #[tokio::test]
 async fn delete_dry_run_does_not_delete() {
     let (_dir, store, names) = seed_bucket(3).await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
     let plan = delete::handle(
         dyn_store.clone(),
         DeleteOp::Retain {
@@ -285,7 +283,7 @@ async fn delete_dry_run_does_not_delete() {
 #[tokio::test]
 async fn delete_garbage_scopes_to_wal_archives_only() {
     let (_dir, store, names) = seed_bucket(3).await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
     // The oldest non-permanent backup is the first one; "garbage ARCHIVES"
     // deletes only WAL older than it (nothing here, since seg 1 == oldest)
     delete::handle(
@@ -308,7 +306,7 @@ async fn delete_garbage_scopes_to_wal_archives_only() {
 #[tokio::test]
 async fn delete_target_drops_delta_dependants() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
     let full = backup_name(1, seg_size());
     let mut full_s = make_sentinel(seg_size(), false);
     full_s.sentinel.backup_start_lsn = NonZeroU64::new(seg_size());
@@ -341,7 +339,7 @@ async fn delete_target_drops_delta_dependants() {
         serde_json::to_vec(&d2_s).unwrap(),
     )
     .await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
 
     // Default modifier deletes target + dependants. Targeting d1 should remove d1 and d2 but keep full
     delete::handle(
@@ -362,7 +360,7 @@ async fn delete_target_drops_delta_dependants() {
 #[tokio::test]
 async fn delete_target_find_full_drops_chain_root() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
     let full = backup_name(1, seg_size());
     let full_s = make_sentinel(seg_size(), false);
     put_bytes(
@@ -381,7 +379,7 @@ async fn delete_target_find_full_drops_chain_root() {
         serde_json::to_vec(&d1_s).unwrap(),
     )
     .await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
 
     // FIND_FULL on the delta should drop the whole chain (full + delta)
     delete::handle(
@@ -404,8 +402,8 @@ async fn copy_single_backup_to_other_fs_prefix() {
     let src_root = dir.path().join("src");
     let dst_root = dir.path().join("dst");
     std::fs::create_dir_all(&src_root).unwrap();
-    let src = Arc::new(FsStorage::new(&src_root).unwrap());
-    let dst = Arc::new(FsStorage::new(&dst_root).unwrap());
+    let src = walrus::storage::fs_operator(&src_root);
+    let dst = walrus::storage::fs_operator(&dst_root);
 
     let name = backup_name(1, seg_size());
     let sentinel = make_sentinel(seg_size(), false);
@@ -425,8 +423,8 @@ async fn copy_single_backup_to_other_fs_prefix() {
     .await;
 
     let s = test_settings();
-    let src_dyn: walrus::storage::DynStorage = src as Arc<dyn Storage>;
-    let dst_dyn: walrus::storage::DynStorage = dst as Arc<dyn Storage>;
+    let src_dyn: walrus::storage::Operator = src.clone();
+    let dst_dyn: walrus::storage::Operator = dst.clone();
     copy_mod::handle(
         &s,
         src_dyn,
@@ -462,7 +460,7 @@ async fn delete_retain_after_keeps_newer_than_boundary() {
     // the timestamp lands between #2 and #3 should keep base_3 + base_4 (count=1
     // newest + everything after the boundary), deleting base_1 + base_2
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
     let mut names = Vec::new();
     let mut boundary = None;
     let t0 = Utc::now() - chrono::Duration::hours(4);
@@ -482,7 +480,7 @@ async fn delete_retain_after_keeps_newer_than_boundary() {
         .await;
         names.push(name);
     }
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
     let after = boundary.unwrap().to_rfc3339();
     let plan = delete::handle(
         dyn_store.clone(),
@@ -506,7 +504,7 @@ async fn delete_retain_after_keeps_newer_than_boundary() {
 #[tokio::test]
 async fn backup_mark_target_user_data_flips_sentinel() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
     // Two backups, one carrying UserData={"id":"tagged"}
     let n1 = backup_name(1, seg_size());
     let s1 = make_sentinel(seg_size(), false);
@@ -515,7 +513,7 @@ async fn backup_mark_target_user_data_flips_sentinel() {
     let mut s2 = make_sentinel(2 * seg_size(), false);
     s2.sentinel.user_data = Some(serde_json::json!({"id": "tagged"}));
     put_bytes(&store, &sentinel_key(&n2), serde_json::to_vec(&s2).unwrap()).await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
 
     let resolved = walrus::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"tagged"}"#)
         .await
@@ -544,7 +542,7 @@ async fn backup_mark_target_user_data_flips_sentinel() {
 #[tokio::test]
 async fn backup_mark_target_user_data_rejects_no_match() {
     let (_dir, store, _names) = seed_bucket(2).await;
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
     let err = walrus::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"x"}"#)
         .await
         .unwrap_err();
@@ -554,7 +552,7 @@ async fn backup_mark_target_user_data_rejects_no_match() {
 #[tokio::test]
 async fn backup_mark_target_user_data_rejects_ambiguous() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
     // Two backups sharing the same UserData value
     for i in 0..2u32 {
         let lsn = (i as u64 + 1) * seg_size();
@@ -568,7 +566,7 @@ async fn backup_mark_target_user_data_rejects_ambiguous() {
         )
         .await;
     }
-    let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
+    let dyn_store: walrus::storage::Operator = store.clone();
     let err = walrus::pg::backup::show::resolve_by_user_data(&dyn_store, r#"{"id":"dup"}"#)
         .await
         .unwrap_err();

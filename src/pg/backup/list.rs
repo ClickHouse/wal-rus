@@ -8,7 +8,7 @@ use futures::StreamExt;
 
 use crate::pg::backup::fetch::fetch_sentinel;
 use crate::pg::backup::name_from_sentinel_key;
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupSummary {
@@ -30,7 +30,7 @@ pub enum Format {
     Json,
 }
 
-pub async fn handle(storage: DynStorage, format: Format) -> Result<()> {
+pub async fn handle(storage: Operator, format: Format) -> Result<()> {
     let backups = collect(storage).await?;
     match format {
         Format::Plain => print_plain(&backups),
@@ -42,10 +42,10 @@ pub async fn handle(storage: DynStorage, format: Format) -> Result<()> {
     Ok(())
 }
 
-pub async fn collect(storage: DynStorage) -> Result<Vec<BackupSummary>> {
+pub async fn collect(storage: Operator) -> Result<Vec<BackupSummary>> {
     let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
     let mut stream = storage
-        .list(&prefix)
+        .list_objs(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
     let mut sentinel_keys: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
@@ -83,7 +83,7 @@ pub async fn collect(storage: DynStorage) -> Result<Vec<BackupSummary>> {
     Ok(out)
 }
 
-async fn fetch_summary(storage: &DynStorage, name: &str) -> Result<BackupSummary> {
+async fn fetch_summary(storage: &Operator, name: &str) -> Result<BackupSummary> {
     let v2 = fetch_sentinel(storage, name).await?;
     Ok(BackupSummary {
         name: name.to_string(),

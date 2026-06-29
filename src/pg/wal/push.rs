@@ -9,12 +9,12 @@ use tokio::io::AsyncReadExt;
 use crate::compression;
 use crate::config::Settings;
 use crate::pg;
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 use super::segment::{is_history_filename, is_wal_filename};
 use crate::pg::backup::wal_delta;
 
-pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -> Result<()> {
+pub async fn handle(settings: &Settings, storage: Operator, src_path: &Path) -> Result<()> {
     let name = src_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -100,7 +100,7 @@ pub async fn handle(settings: &Settings, storage: DynStorage, src_path: &Path) -
 /// rather than propagated — a delta-recording error must not fail the archive
 async fn maybe_record_delta(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     src_path: &Path,
     name: &str,
 ) {
@@ -120,7 +120,7 @@ async fn maybe_record_delta(
 /// so a 16 MB segment doesn't materialize in memory
 async fn compare_existing(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     key: &str,
     method: compression::Method,
     src_path: &Path,

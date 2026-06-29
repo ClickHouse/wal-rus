@@ -38,7 +38,7 @@ use tokio::sync::Semaphore;
 use crate::config::Settings;
 use crate::pg::wal::push;
 use crate::pg::wal::segment::SegmentName;
-use crate::storage::DynStorage;
+use crate::storage::Operator;
 
 /// Upper bound on `.ready` names parsed per look-ahead scan, so a pathological
 /// backlog can't build an unbounded candidate list
@@ -74,7 +74,7 @@ impl State {
 
 pub struct Uploader {
     settings: Arc<Settings>,
-    storage: DynStorage,
+    storage: Operator,
     /// Bounds total in-flight uploads (foreground + look-ahead)
     sem: Arc<Semaphore>,
     /// Segments past the foreground one to pre-upload; `concurrency - 1`
@@ -84,7 +84,7 @@ pub struct Uploader {
 }
 
 impl Uploader {
-    pub fn new(settings: Arc<Settings>, storage: DynStorage) -> Self {
+    pub fn new(settings: Arc<Settings>, storage: Operator) -> Self {
         let concurrency = settings.upload_concurrency.max(1);
         Uploader {
             settings,
@@ -104,7 +104,7 @@ impl Uploader {
         &self.settings
     }
 
-    pub fn storage(&self) -> DynStorage {
+    pub fn storage(&self) -> Operator {
         self.storage.clone()
     }
 
@@ -308,7 +308,7 @@ mod tests {
 
     fn uploader(dir: &Path, concurrency: usize) -> Arc<Uploader> {
         let store = dir.join("store");
-        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&store);
         Arc::new(Uploader::new(
             Arc::new(test_settings(&store, concurrency)),
             storage,

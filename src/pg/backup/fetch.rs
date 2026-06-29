@@ -22,7 +22,7 @@ use crate::pg::backup::{
     BackupSentinelDtoV2, FilesMetadataDto, LATEST, TablespaceSpec, files_metadata_key,
     name_from_sentinel_key, sentinel_key, tar_partitions_prefix,
 };
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 #[derive(Debug, Clone, Default)]
 pub struct FetchArgs {
@@ -34,7 +34,7 @@ pub struct FetchArgs {
 
 pub async fn handle(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     name: &str,
     dst: &Path,
 ) -> Result<()> {
@@ -43,7 +43,7 @@ pub async fn handle(
 
 pub async fn handle_with_args(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     name: &str,
     dst: &Path,
     args: &FetchArgs,
@@ -157,7 +157,7 @@ pub async fn handle_with_args(
 /// Returns `[(name, sentinel)]` from chain root to the requested leaf.
 /// A full backup yields a single-entry vec
 async fn build_chain(
-    storage: &DynStorage,
+    storage: &Operator,
     leaf: &str,
 ) -> Result<Vec<(String, BackupSentinelDtoV2)>> {
     let mut out: Vec<(String, BackupSentinelDtoV2)> = Vec::new();
@@ -182,7 +182,7 @@ async fn build_chain(
     Ok(out)
 }
 
-async fn fetch_incremented_set(storage: &DynStorage, name: &str) -> Result<HashSet<String>> {
+async fn fetch_incremented_set(storage: &Operator, name: &str) -> Result<HashSet<String>> {
     let key = files_metadata_key(name);
     // Older backups may omit files_metadata.json; treat any load failure as
     // empty rather than propagating (matches wal-g's tolerant behaviour)
@@ -227,12 +227,12 @@ fn strip_to_relative(p: &Path) -> PathBuf {
     rel
 }
 
-pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
+pub async fn resolve_name(storage: &Operator, name: &str) -> Result<String> {
     if name != LATEST {
         return Ok(name.to_string());
     }
     let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
-    let mut stream = storage.list(&prefix).await?;
+    let mut stream = storage.list_objs(&prefix).await?;
     let mut latest: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
     while let Some(item) = stream.next().await {
         let obj = item?;
@@ -250,7 +250,7 @@ pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no backups found"))
 }
 
-pub async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
+pub async fn fetch_sentinel(storage: &Operator, name: &str) -> Result<BackupSentinelDtoV2> {
     crate::pg::backup::load_json(storage, &sentinel_key(name), 4096).await
 }
 
@@ -312,9 +312,9 @@ fn apply_mapping(location: &str, mappings: &[(String, String)]) -> String {
     location.to_string()
 }
 
-pub async fn list_tar_parts(storage: &DynStorage, name: &str) -> Result<Vec<String>> {
+pub async fn list_tar_parts(storage: &Operator, name: &str) -> Result<Vec<String>> {
     let prefix = format!("{}/", tar_partitions_prefix(name));
-    let mut stream = storage.list(&prefix).await?;
+    let mut stream = storage.list_objs(&prefix).await?;
     let mut keys = Vec::new();
     while let Some(item) = stream.next().await {
         let obj = item?;
@@ -331,7 +331,7 @@ pub async fn list_tar_parts(storage: &DynStorage, name: &str) -> Result<Vec<Stri
 
 async fn unpack_part(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     key: &str,
     dst: &Path,
     incremented: Arc<HashSet<String>>,
@@ -491,7 +491,6 @@ fn method_from_key(key: &str) -> compression::Method {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::fs::FsStorage;
 
     /// A tar part whose only file is flagged incremented, restored into an
     /// empty dir: `apply_increment_in_place` needs the base file the parent
@@ -500,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn increment_apply_wraps_missing_target_error() {
         let dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(dir.path());
 
         let mut builder = tar::Builder::new(Vec::new());
         let data = crate::pg::backup::increment::INCREMENT_MAGIC.to_vec();
@@ -537,7 +536,7 @@ mod tests {
     async fn restores_directory_mode() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(dir.path());
 
         let mut builder = tar::Builder::new(Vec::new());
         let mut dh = tar::Header::new_gnu();

@@ -11,7 +11,7 @@ use crate::pg::backup::{
     fetch::{fetch_sentinel, resolve_name},
     files_metadata_key, format_pg_lsn, load_json, name_from_sentinel_key, sentinel_key,
 };
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -21,7 +21,7 @@ pub enum Format {
 
 /// `backup-show <name|LATEST>` -- pretty/JSON dump of one sentinel and a
 /// summary line from `files_metadata.json` (file count, tar-part count)
-pub async fn show(storage: DynStorage, name: &str, format: Format) -> Result<()> {
+pub async fn show(storage: Operator, name: &str, format: Format) -> Result<()> {
     let resolved = resolve_name(&storage, name).await?;
     let sentinel = fetch_sentinel(&storage, &resolved).await?;
     // files_metadata is optional — older backups may not have it
@@ -59,7 +59,7 @@ pub async fn show(storage: DynStorage, name: &str, format: Format) -> Result<()>
 
 /// `backup-mark <name> --permanent | --impermanent`
 /// Fetches the sentinel, flips `IsPermanent`, re-uploads. wal-g's behavior
-pub async fn mark(storage: DynStorage, name: &str, permanent: bool) -> Result<()> {
+pub async fn mark(storage: Operator, name: &str, permanent: bool) -> Result<()> {
     let resolved = resolve_name(&storage, name).await?;
     let mut sentinel = fetch_sentinel(&storage, &resolved).await?;
     if sentinel.is_permanent == permanent {
@@ -85,12 +85,12 @@ pub async fn mark(storage: DynStorage, name: &str, permanent: bool) -> Result<()
 /// Resolve a backup name from a `--target-user-data` JSON value. Walks every
 /// sentinel, deeply compares its `UserData` to the parsed target. Errors when
 /// nothing matches, or when two distinct backups share the value
-pub async fn resolve_by_user_data(storage: &DynStorage, user_data_str: &str) -> Result<String> {
+pub async fn resolve_by_user_data(storage: &Operator, user_data_str: &str) -> Result<String> {
     let target: serde_json::Value = serde_json::from_str(user_data_str)
         .with_context(|| format!("--target-user-data is not valid JSON: {user_data_str}"))?;
     let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
     let mut stream = storage
-        .list(&prefix)
+        .list_objs(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
     let mut matches: Vec<String> = Vec::new();
@@ -129,7 +129,7 @@ pub async fn resolve_by_user_data(storage: &DynStorage, user_data_str: &str) -> 
     }
 }
 
-async fn fetch_files_metadata(storage: &DynStorage, name: &str) -> Result<FilesMetadataDto> {
+async fn fetch_files_metadata(storage: &Operator, name: &str) -> Result<FilesMetadataDto> {
     load_json(storage, &files_metadata_key(name), 16 * 1024).await
 }
 

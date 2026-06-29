@@ -40,7 +40,7 @@ use crate::pg::replication::base_backup::{
     run_base_backup,
 };
 use crate::pg::replication::conn::ReplicationConn;
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 /// Entry name (post-remap) that should be teed into a standalone tar so
 /// restore can apply it last
@@ -69,7 +69,7 @@ pub struct PushArgs {
 
 pub async fn handle(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     args: PushArgs,
     cfg: PgConfig,
 ) -> Result<()> {
@@ -482,7 +482,7 @@ pub async fn handle(
 /// Inputs to [`finalize_backup`], shared by the BASE_BACKUP & filesystem paths
 pub(crate) struct Finalize<'a> {
     pub settings: &'a Settings,
-    pub storage: &'a DynStorage,
+    pub storage: &'a Operator,
     pub backup_name: String,
     pub start_lsn: u64,
     pub end_lsn: u64,
@@ -648,7 +648,7 @@ async fn fetch_setting(conn: &mut ReplicationConn, name: &str) -> Result<String>
 }
 
 async fn upload_json<T: serde::Serialize>(
-    storage: &DynStorage,
+    storage: &Operator,
     key: &str,
     value: &T,
 ) -> Result<()> {
@@ -796,7 +796,7 @@ fn increment_sentinel_fields(
 /// gap *between* present summaries stays fatal (see `select_for_range`)
 pub(crate) async fn build_delta_map_from_summaries(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     pgdata: Option<&std::path::Path>,
     timeline: u32,
     first_used_lsn: u64,
@@ -937,7 +937,7 @@ mod tests {
         // can't be read, so the wrapper must bail before touching disk
         let tmp = tempfile::tempdir().unwrap();
         let settings = Settings::default();
-        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(tmp.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(tmp.path());
         let err = build_delta_map_from_summaries(&settings, &storage, None, 1, 0x100, 0x200)
             .await
             .unwrap_err();
@@ -968,7 +968,7 @@ mod tests {
 
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
-        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
         let settings = Settings::default();
 
         let err = build_delta_map_from_summaries(

@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::compression;
 use crate::config::Settings;
 use crate::pg;
-use crate::storage::{DynStorage, StorageError};
+use crate::storage::{ObjExt, Operator};
 
 use super::segment::is_history_filename;
 
@@ -50,7 +50,7 @@ pub struct ArchiveNotFound(pub String);
 
 pub async fn handle(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     name: &str,
     dst: &Path,
     prefetch: Prefetch,
@@ -66,7 +66,7 @@ pub async fn handle(
         settings.compression
     };
 
-    let (key, method) = match find_object(storage.as_ref(), name, preferred).await? {
+    let (key, method) = match find_object(&storage, name, preferred).await? {
         Some(p) => p,
         None => return Err(ArchiveNotFound(name.to_string()).into()),
     };
@@ -95,7 +95,7 @@ pub async fn handle(
 /// concurrency of 1 (nothing to prefetch ahead)
 fn trigger_prefetch(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     name: &str,
     dst: &Path,
     mode: Prefetch,
@@ -158,7 +158,7 @@ fn fork_prefetch(name: &str, pg_wal: &Path, config: Option<&Path>) {
 /// worker (writes `running/<seg>` in place so wal-fetch can observe its growth)
 async fn stream_object_into(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     key: &str,
     method: compression::Method,
     out: &mut fs::File,
@@ -184,11 +184,11 @@ async fn stream_object_into(
 /// the configured compression is always the preferred extension
 pub(super) async fn download_to_running(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     name: &str,
     out_path: &Path,
 ) -> Result<bool> {
-    let (key, method) = match find_object(storage.as_ref(), name, settings.compression).await? {
+    let (key, method) = match find_object(storage, name, settings.compression).await? {
         Some(p) => p,
         None => return Err(ArchiveNotFound(name.to_string()).into()),
     };
@@ -210,7 +210,7 @@ pub(super) async fn download_to_running(
 }
 
 async fn find_object(
-    storage: &dyn crate::storage::Storage,
+    storage: &Operator,
     name: &str,
     preferred: compression::Method,
 ) -> Result<Option<(String, compression::Method)>> {
@@ -235,7 +235,7 @@ async fn find_object(
                 return Ok(Some((key, m)));
             }
             Ok(false) => continue,
-            Err(StorageError::NotFound(_)) => continue,
+            Err(ref e) if crate::storage::is_not_found(e) => continue,
             Err(e) => return Err(e.into()),
         }
     }

@@ -25,7 +25,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::config::Settings;
 use crate::pg::wal;
-use crate::storage::DynStorage;
+use crate::storage::Operator;
 
 use protocol::{MessageType, parse_args, read_message, write_message};
 use uploader::Uploader;
@@ -49,7 +49,7 @@ struct Daemon {
 pub async fn serve(
     socket: &Path,
     settings: Settings,
-    storage: DynStorage,
+    storage: Operator,
     push_timeout: Duration,
     pgdata: Option<PathBuf>,
 ) -> Result<()> {
@@ -254,7 +254,7 @@ mod tests {
             compression: crate::compression::Method::None,
             ..Default::default()
         };
-        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(store).unwrap());
+        let storage: Operator = crate::storage::fs_operator(store);
         Arc::new(Daemon {
             uploader: Arc::new(Uploader::new(Arc::new(settings), storage)),
             pgdata: None,

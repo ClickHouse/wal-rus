@@ -48,7 +48,7 @@ use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, mes
 use crate::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use crate::pg::wal::push;
 use crate::pg::wal::segment::{self, SegmentName};
-use crate::storage::DynStorage;
+use crate::storage::Operator;
 
 /// Status update cadence — wal-g defaults to 10s; we match
 const STATUS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -67,7 +67,7 @@ struct SegmentAccumulator {
     archive_dir: PathBuf,
     current: Option<CurrentSegment>,
     settings: Settings,
-    storage: DynStorage,
+    storage: Operator,
     /// In-flight segment uploads, bounded by `upload_sem`. Each task yields the
     /// start LSN of the segment it shipped so reaping can drop it from
     /// `in_flight`. Receive loop reaps completions each iteration; rotation
@@ -101,7 +101,7 @@ impl SegmentAccumulator {
         archive_dir: PathBuf,
         seg_size: u64,
         settings: Settings,
-        storage: DynStorage,
+        storage: Operator,
         start_lsn: u64,
     ) -> Result<Self> {
         fs::create_dir_all(&archive_dir)
@@ -371,7 +371,7 @@ impl SegmentAccumulator {
 
 pub async fn handle(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     archive_dir: &Path,
     cfg: PgConfig,
     slot_name: Option<String>,
@@ -629,7 +629,7 @@ async fn query_slot_info(q: &mut ReplicationConn, slot_name: &str) -> Result<Slo
 async fn get_start_timeline(
     conn: &mut ReplicationConn,
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     archive_dir: &Path,
     sys_timeline: u32,
     xlogpos: u64,
@@ -675,7 +675,7 @@ fn lsn_to_timeline(content: &[u8], lsn: u64, file_timeline: u32) -> u32 {
 /// pipeline (which stores history uncompressed under `wal_005/<name>`)
 async fn upload_history(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     archive_dir: &Path,
     fname: &str,
     content: &[u8],
@@ -722,7 +722,7 @@ async fn start_replication(
 /// prevent-wal-overwrite, plain-overwrites otherwise
 async fn repush_leftover_segments(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     archive_dir: &Path,
     seg_size: u64,
 ) -> Result<()> {
@@ -838,7 +838,7 @@ mod tests {
     async fn test_acc(dir: &Path, seg_size: u64) -> SegmentAccumulator {
         let store = dir.join("store");
         let settings = test_settings(&store);
-        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&store);
         SegmentAccumulator::new(1, dir.to_path_buf(), seg_size, settings, storage, 0)
             .await
             .unwrap()
@@ -947,7 +947,7 @@ mod tests {
         let store = dir.path().join("store");
         std::fs::create_dir_all(&archive_dir).unwrap();
         let settings = test_settings(&store);
-        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&store);
 
         // complete segment left by a crash between rotation and upload
         let complete = SegmentName {
@@ -1086,7 +1086,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store");
         let settings = test_settings(&store);
-        let storage: DynStorage = Arc::new(crate::storage::fs::FsStorage::new(&store).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&store);
         upload_history(
             &settings,
             &storage,

@@ -19,7 +19,7 @@ use serde::Serialize;
 use crate::pg::backup::fetch::fetch_sentinel;
 use crate::pg::backup::{LATEST, name_from_sentinel_key, strip_leftmost_backup_name};
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 /// `TryFetchTimelineAndLogSegNo`: find the first 24-hex chunk in `name`,
 /// parse as TTTTTTTTLLLLLLLLSSSSSSSS, return (timeline, global_seg_no)
@@ -72,10 +72,10 @@ impl BackupRecord {
 
 /// Enumerate every sentinel under `basebackups_005/`, build a BackupRecord
 /// for each. Backups with unreadable sentinels are skipped with a warning
-pub async fn collect_records(storage: &DynStorage) -> Result<Vec<BackupRecord>> {
+pub async fn collect_records(storage: &Operator) -> Result<Vec<BackupRecord>> {
     let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
     let mut stream = storage
-        .list(&prefix)
+        .list_objs(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
     let mut names: Vec<String> = Vec::new();
@@ -100,7 +100,7 @@ pub async fn collect_records(storage: &DynStorage) -> Result<Vec<BackupRecord>> 
     Ok(out)
 }
 
-async fn fetch_record(storage: &DynStorage, name: &str) -> Result<BackupRecord> {
+async fn fetch_record(storage: &Operator, name: &str) -> Result<BackupRecord> {
     let v2 = fetch_sentinel(storage, name).await?;
     let (timeline, start_seg_no) = try_extract_timeline_seg_no(name)
         .ok_or_else(|| anyhow!("cannot derive timeline / segment from backup name {name}"))?;
@@ -165,7 +165,7 @@ pub struct DeletePlan {
     pub target: Option<String>,
 }
 
-pub async fn handle(storage: DynStorage, op: DeleteOp, confirm: bool) -> Result<DeletePlan> {
+pub async fn handle(storage: Operator, op: DeleteOp, confirm: bool) -> Result<DeletePlan> {
     let backups = collect_records(&storage).await?;
     let plan = plan_delete(&storage, &backups, &op).await?;
     print_plan(&plan, confirm);
@@ -176,7 +176,7 @@ pub async fn handle(storage: DynStorage, op: DeleteOp, confirm: bool) -> Result<
 }
 
 async fn plan_delete(
-    storage: &DynStorage,
+    storage: &Operator,
     backups: &[BackupRecord],
     op: &DeleteOp,
 ) -> Result<DeletePlan> {
@@ -198,7 +198,7 @@ async fn plan_delete(
 // ── before & retain (share `delete-before-target` core) ────────────────────
 
 async fn plan_before(
-    storage: &DynStorage,
+    storage: &Operator,
     backups: &[BackupRecord],
     target: &str,
     modifier: DeleteModifier,
@@ -215,7 +215,7 @@ async fn plan_before(
 }
 
 async fn plan_retain(
-    storage: &DynStorage,
+    storage: &Operator,
     backups: &[BackupRecord],
     count: usize,
     modifier: DeleteModifier,
@@ -399,7 +399,7 @@ fn resolve_after_target(
 /// strictly before target. Permanent backups (and their reserved WAL range)
 /// are preserved. `prefix_filter` optionally restricts the walk
 async fn delete_before_target_plan(
-    storage: &DynStorage,
+    storage: &Operator,
     backups: &[BackupRecord],
     target: &BackupRecord,
     prefix_filter: Option<&str>,
@@ -437,7 +437,7 @@ fn less_than_target(key: &str, target: &BackupRecord) -> bool {
 // ── everything ─────────────────────────────────────────────────────────────
 
 async fn plan_everything(
-    storage: &DynStorage,
+    storage: &Operator,
     backups: &[BackupRecord],
     force: bool,
 ) -> Result<DeletePlan> {
@@ -460,7 +460,7 @@ async fn plan_everything(
 // ── target ─────────────────────────────────────────────────────────────────
 
 async fn plan_target(
-    storage: &DynStorage,
+    storage: &Operator,
     backups: &[BackupRecord],
     name: &str,
     modifier: DeleteModifier,
@@ -544,7 +544,7 @@ fn find_dependant_backups(backups: &[BackupRecord], target: &BackupRecord) -> Ve
 // ── garbage ────────────────────────────────────────────────────────────────
 
 async fn plan_garbage(
-    storage: &DynStorage,
+    storage: &Operator,
     backups: &[BackupRecord],
     scope: GarbageScope,
 ) -> Result<DeletePlan> {
@@ -638,7 +638,7 @@ fn is_permanent_object(
 // ── object enumeration / execution ────────────────────────────────────────
 
 async fn enumerate_and_filter<F>(
-    storage: &DynStorage,
+    storage: &Operator,
     prefix: Option<&str>,
     out: &mut Vec<String>,
     mut keep: F,
@@ -655,7 +655,7 @@ where
     };
     for p in prefixes {
         let mut s = storage
-            .list(&p)
+            .list_objs(&p)
             .await
             .with_context(|| format!("list {p}"))?;
         while let Some(item) = s.next().await {
@@ -668,7 +668,7 @@ where
     Ok(())
 }
 
-async fn execute_delete(storage: &DynStorage, keys: &[String]) -> Result<()> {
+async fn execute_delete(storage: &Operator, keys: &[String]) -> Result<()> {
     for k in keys {
         if let Err(e) = storage.delete(k).await {
             tracing::warn!(target = "delete", "delete {k}: {e:#}");
@@ -1098,10 +1098,10 @@ mod tests {
         assert!(parse_garbage_scope(&args(&["ARCHIVES", "x"])).is_err());
     }
 
-    fn empty_store() -> (tempfile::TempDir, DynStorage) {
+    fn empty_store() -> (tempfile::TempDir, Operator) {
         let dir = tempfile::tempdir().unwrap();
-        let s: DynStorage =
-            std::sync::Arc::new(crate::storage::fs::FsStorage::new(dir.path()).unwrap());
+        let s: Operator =
+            crate::storage::fs_operator(dir.path());
         (dir, s)
     }
 

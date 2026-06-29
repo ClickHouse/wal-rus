@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "signal", "sync", "time", "process"] }
-tokio-util = { version = "0.7", features = ["io", "io-util"] }
+tokio-util = { version = "0.7", features = ["io", "io-util", "compat"] }
 futures = "0.3"
 async-trait = "0.1"
 bytes = "1"
@@ -36,10 +36,10 @@ url = "2"
 percent-encoding = "2"
 base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "form", "query", "http2"] }
+opendal = { version = "0.57", features = ["services-s3", "services-gcs", "services-fs"] }
 crc32c = "0.6"
 roaring = "0.11"
 aws-lc-rs = "1"
-quick-xml = "0.40"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 astral-tokio-tar = "0.6"
 postgres-protocol = "0.6"

@@ -3,7 +3,7 @@
 //! Copies one or all backups to a different prefix under the same storage
 //! backend (same credentials, same bucket). Cross-backend / cross-bucket
 //! copies fall back to stream-through with the same flow when a future
-//! caller supplies a second `DynStorage`
+//! caller supplies a second `Operator`
 //!
 //! The implementation walks source-side object listings (basebackup-relative
 //! +, optionally, WAL-relative) and copies each key server-side
@@ -17,7 +17,7 @@ use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::backup::delete::{BackupRecord, collect_records};
 use crate::pg::backup::fetch::resolve_name;
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 #[derive(Debug, Clone)]
 pub struct CopyArgs {
@@ -35,8 +35,8 @@ pub struct CopyArgs {
 /// the same stream-through path applies
 pub async fn handle(
     settings: &Settings,
-    src: DynStorage,
-    dst: DynStorage,
+    src: Operator,
+    dst: Operator,
     args: CopyArgs,
 ) -> Result<()> {
     if args.all && args.backup_name.is_some() {
@@ -112,18 +112,9 @@ pub async fn handle(
     Ok(())
 }
 
-async fn copy_one(src: &DynStorage, dst: &DynStorage, key: &str) -> Result<()> {
-    // server-side first; any failure falls back to stream-through, which can
-    // still succeed where one-sided auth can't (src & dst use separate creds)
-    if let Some(loc) = src.copy_source(key) {
-        match dst.copy_within(&loc, key).await {
-            Ok(()) => return Ok(()),
-            Err(crate::storage::StorageError::Unimplemented(_)) => {}
-            Err(e) => {
-                tracing::debug!(target = "copy", "server-side copy {key}: {e}; streaming")
-            }
-        }
-    }
+async fn copy_one(src: &Operator, dst: &Operator, key: &str) -> Result<()> {
+    // stream-through: server-side copy needs one Operator spanning src & dst,
+    // but they're independently-built handles (possibly different bucket/creds)
     let body = src.get(key).await.with_context(|| format!("get {key}"))?;
     dst.put(key, body, None)
         .await
@@ -131,12 +122,12 @@ async fn copy_one(src: &DynStorage, dst: &DynStorage, key: &str) -> Result<()> {
     Ok(())
 }
 
-async fn collect_backup_keys(src: &DynStorage, name: &str, out: &mut Vec<String>) -> Result<()> {
+async fn collect_backup_keys(src: &Operator, name: &str, out: &mut Vec<String>) -> Result<()> {
     // Per-backup prefix holds files_metadata.json, metadata.json,
     // tar_partitions/part_NNN.tar.*. The sentinel lives at `<basebackups>/`
     let backup_prefix = format!("{}/{}/", crate::pg::BASEBACKUP_FOLDER, name);
     let mut s = src
-        .list(&backup_prefix)
+        .list_objs(&backup_prefix)
         .await
         .with_context(|| format!("list {backup_prefix}"))?;
     while let Some(item) = s.next().await {
@@ -148,7 +139,7 @@ async fn collect_backup_keys(src: &DynStorage, name: &str, out: &mut Vec<String>
 }
 
 async fn collect_wal_keys(
-    src: &DynStorage,
+    src: &Operator,
     backup: &BackupRecord,
     with_history: bool,
     out: &mut Vec<String>,
@@ -158,7 +149,7 @@ async fn collect_wal_keys(
     let seg_size = wal_segment_size();
     let wal_prefix = format!("{}/", crate::pg::WAL_FOLDER);
     let mut s = src
-        .list(&wal_prefix)
+        .list_objs(&wal_prefix)
         .await
         .with_context(|| format!("list {wal_prefix}"))?;
     let segs_per_log = 0x1_0000_0000u64 / seg_size;
@@ -198,23 +189,19 @@ mod tests {
         BackupSentinelDto, BackupSentinelDtoV2, format_backup_name, sentinel_key,
     };
     use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
-    use crate::storage::fs::FsStorage;
-    use crate::storage::{
-        AsyncReader, ObjectStream, Result as StorageResult, Storage, StorageError,
-    };
-    use std::sync::Arc;
+    use crate::storage::AsyncReader;
 
-    fn fs(dir: &std::path::Path) -> DynStorage {
-        Arc::new(FsStorage::new(dir).unwrap())
+    fn fs(dir: &std::path::Path) -> Operator {
+        crate::storage::fs_operator(dir)
     }
 
-    async fn put_bytes(store: &DynStorage, key: &str, bytes: Vec<u8>) {
+    async fn put_bytes(store: &Operator, key: &str, bytes: Vec<u8>) {
         let len = bytes.len() as u64;
         let r: AsyncReader = Box::pin(std::io::Cursor::new(bytes));
         store.put(key, r, Some(len)).await.unwrap();
     }
 
-    async fn seed_backup(store: &DynStorage, name: &str, start_lsn: u64, finish_lsn: u64) {
+    async fn seed_backup(store: &Operator, name: &str, start_lsn: u64, finish_lsn: u64) {
         let v2 = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
                 backup_start_lsn: NonZeroU64::new(start_lsn),
@@ -229,8 +216,8 @@ mod tests {
         put_bytes(store, &sentinel_key(name), serde_json::to_vec(&v2).unwrap()).await;
     }
 
-    async fn list_keys(store: &DynStorage, prefix: &str) -> Vec<String> {
-        let mut s = store.list(prefix).await.unwrap();
+    async fn list_keys(store: &Operator, prefix: &str) -> Vec<String> {
+        let mut s = store.list_objs(prefix).await.unwrap();
         let mut out = Vec::new();
         while let Some(item) = s.next().await {
             out.push(item.unwrap().key);
@@ -344,31 +331,6 @@ mod tests {
         );
     }
 
-    /// Destination whose `put` always fails — drives the best-effort sweep's
-    /// failure accumulation + `last_err` return
-    struct FailPut;
-    #[async_trait::async_trait]
-    impl Storage for FailPut {
-        fn describe(&self) -> String {
-            "failput".into()
-        }
-        async fn put(&self, key: &str, _b: AsyncReader, _h: Option<u64>) -> StorageResult<()> {
-            Err(StorageError::Transport(format!("put {key} denied")))
-        }
-        async fn get(&self, _k: &str) -> StorageResult<AsyncReader> {
-            Err(StorageError::Unimplemented("get"))
-        }
-        async fn exists(&self, _k: &str) -> StorageResult<bool> {
-            Ok(false)
-        }
-        async fn list(&self, _p: &str) -> StorageResult<ObjectStream> {
-            Err(StorageError::Unimplemented("list"))
-        }
-        async fn delete(&self, _k: &str) -> StorageResult<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn copy_failures_surface_last_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -376,14 +338,22 @@ mod tests {
         let seg = DEFAULT_WAL_SEG_SIZE;
         let name = format_backup_name(1, seg, seg);
         seed_backup(&src, &name, seg, seg + 0x100).await;
+        // dst whose object folders are pre-occupied by regular files: every
+        // write hits ENOTDIR (enforced even as root), exercising the best-effort
+        // sweep's failure accumulation + last_err return
+        let dst_dir = dir.path().join("dst");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        std::fs::write(dst_dir.join(crate::pg::BASEBACKUP_FOLDER), b"x").unwrap();
+        std::fs::write(dst_dir.join(crate::pg::WAL_FOLDER), b"x").unwrap();
+        let dst = fs(&dst_dir);
         let err = handle(
             &Settings::default(),
             src,
-            Arc::new(FailPut),
+            dst,
             args(Some(&name), false, false),
         )
         .await
         .unwrap_err();
-        assert!(format!("{err:#}").contains("denied"), "{err:#}");
+        assert!(format!("{err:#}").contains("put"), "{err:#}");
     }
 }

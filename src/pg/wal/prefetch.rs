@@ -20,7 +20,7 @@ use tokio::fs;
 
 use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
-use crate::storage::DynStorage;
+use crate::storage::Operator;
 
 use super::segment::{SegmentName, wal_segment_size};
 
@@ -50,7 +50,7 @@ pub fn prefetched_path(pg_wal: &Path, seg: &str, over: Option<&Path>) -> PathBuf
 
 pub async fn handle(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     seed: &str,
     pg_wal: &Path,
     count: u32,
@@ -116,7 +116,7 @@ pub async fn handle(
 
 async fn fetch_one(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     name: &str,
     running: &Path,
     ready: &Path,

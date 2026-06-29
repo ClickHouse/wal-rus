@@ -47,7 +47,7 @@ use crate::pg::walparser::{
     walk_segment_locations,
 };
 use crate::retry::{RetryPolicy, with_retry};
-use crate::storage::{DynStorage, StorageError};
+use crate::storage::{ObjExt, Operator};
 
 pub const PG_PAGE_SIZE: u64 = 8192;
 /// PG's per-file size cap before splitting into `<rel>.<n>` segments
@@ -280,7 +280,7 @@ pub struct PrevBackupInfo {
 /// "do a full backup" (delta disabled, no prior backup, parent chain too
 /// long, etc.)
 pub async fn configure_delta_parent(
-    storage: &DynStorage,
+    storage: &Operator,
     delta: &crate::config::DeltaSettings,
     new_is_permanent: bool,
 ) -> Result<Option<PrevBackupInfo>> {
@@ -389,7 +389,7 @@ pub async fn configure_delta_parent(
 /// Tolerant: a missing or unreadable sidecar yields an empty set, which
 /// degrades the delta to shipping all paged files in full (safe, matches
 /// wal-g's behaviour when the base file list is unavailable)
-async fn load_parent_file_set(storage: &DynStorage, name: &str) -> HashSet<String> {
+async fn load_parent_file_set(storage: &Operator, name: &str) -> HashSet<String> {
     use crate::pg::backup::{FilesMetadataDto, files_metadata_key, load_json};
     let key = files_metadata_key(name);
     match load_json::<FilesMetadataDto>(storage, &key, 1 << 16).await {
@@ -413,7 +413,7 @@ fn name_only(_v2: &BackupSentinelDtoV2) -> String {
 }
 
 async fn select_candidate(
-    storage: &DynStorage,
+    storage: &Operator,
     delta: &crate::config::DeltaSettings,
 ) -> Result<Option<(String, BackupSentinelDtoV2)>> {
     if let Some(name) = &delta.from_name {
@@ -426,11 +426,11 @@ async fn select_candidate(
     find_latest(storage).await
 }
 
-async fn find_latest(storage: &DynStorage) -> Result<Option<(String, BackupSentinelDtoV2)>> {
+async fn find_latest(storage: &Operator) -> Result<Option<(String, BackupSentinelDtoV2)>> {
     use futures::StreamExt;
     let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
     let mut stream = storage
-        .list(&prefix)
+        .list_objs(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
     let mut entries: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
@@ -448,13 +448,13 @@ async fn find_latest(storage: &DynStorage) -> Result<Option<(String, BackupSenti
 }
 
 async fn find_by_user_data(
-    storage: &DynStorage,
+    storage: &Operator,
     needle: &str,
 ) -> Result<Option<(String, BackupSentinelDtoV2)>> {
     use futures::StreamExt;
     let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
     let mut stream = storage
-        .list(&prefix)
+        .list_objs(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
     let needle_json: serde_json::Value = serde_json::from_str(needle)
@@ -495,7 +495,7 @@ async fn find_by_user_data(
 /// remote replication source, which has no local WAL
 pub async fn build_delta_map_from_wal(
     settings: &crate::config::Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     timeline: u32,
     start_lsn: u64,
     end_lsn: u64,
@@ -560,7 +560,7 @@ pub async fn build_delta_map_from_wal(
 /// delta file only for a segment beginning a complete in-range group
 async fn build_delta_map_from_sidecars(
     settings: &crate::config::Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     timeline: u32,
     start_lsn: u64,
     end_lsn: u64,
@@ -658,7 +658,7 @@ async fn build_delta_map_from_sidecars(
 /// into a `Vec` — they land in the roaring map a tuple at a time
 async fn fold_sidecar_into_map(
     settings: &crate::config::Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     group_name: &str,
     compression: compression::Method,
     map: PagedFileDeltaMap,
@@ -722,7 +722,7 @@ fn fold_sidecar_stream(
 /// model can't represent
 async fn build_delta_map_from_wal_full(
     settings: &crate::config::Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     timeline: u32,
     start_lsn: u64,
     end_lsn: u64,
@@ -759,7 +759,7 @@ async fn build_delta_map_from_wal_full(
 /// Shared, `'static` slice of [`WalWalkCtx`] for the spawned fetch+parse tasks
 struct SegFetch {
     settings: crate::config::Settings,
-    storage: DynStorage,
+    storage: Operator,
     timeline: u32,
     seg_size: u64,
     compression: compression::Method,
@@ -902,7 +902,7 @@ fn lsn_to_seg(lsn: u64, seg_size: u64) -> u64 {
 /// Per-walk invariants shared across every segment of a raw-WAL walk
 struct WalWalkCtx<'a> {
     settings: &'a crate::config::Settings,
-    storage: &'a DynStorage,
+    storage: &'a Operator,
     timeline: u32,
     seg_size: u64,
     compression: compression::Method,
@@ -995,7 +995,7 @@ const WAL_ARCHIVE_WAIT: RetryPolicy = RetryPolicy {
 
 async fn fetch_segment(
     settings: &crate::config::Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     compression: compression::Method,
     wal_dir: Option<&Path>,
     name: &str,
@@ -1020,7 +1020,7 @@ async fn fetch_segment(
     // gives up to a full backup. Transient errors are already retried in storage
     let r = with_retry(
         &WAL_ARCHIVE_WAIT,
-        |e: &StorageError| matches!(e, StorageError::NotFound(_)),
+        |e: &opendal::Error| crate::storage::is_not_found(e),
         || async { storage.get(&key).await },
     )
     .await
@@ -1045,8 +1045,6 @@ mod tests {
     async fn delta_parent_carries_increment_format() {
         use crate::config::DeltaSettings;
         use crate::pg::backup::{BackupSentinelDto, format_backup_name, sentinel_key};
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
 
         let seg = DEFAULT_WAL_SEG_SIZE;
 
@@ -1074,7 +1072,7 @@ mod tests {
                 ..Default::default()
             };
             let dir = tempfile::tempdir().unwrap();
-            let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+            let storage: Operator = crate::storage::fs_operator(dir.path());
             let name = format_backup_name(1, seg, seg);
             let body = serde_json::to_vec(&v2).unwrap();
             let len = body.len() as u64;
@@ -1210,7 +1208,7 @@ mod tests {
         assert!(!m.is_empty());
     }
 
-    async fn seed_sentinel(storage: &DynStorage, name: &str, user_data: serde_json::Value) {
+    async fn seed_sentinel(storage: &Operator, name: &str, user_data: serde_json::Value) {
         use crate::pg::backup::{BackupSentinelDto, sentinel_key};
         let v2 = BackupSentinelDtoV2 {
             sentinel: BackupSentinelDto {
@@ -1236,10 +1234,9 @@ mod tests {
     #[tokio::test]
     async fn find_by_user_data_matches_sentinel() {
         use crate::pg::backup::format_backup_name;
-        use crate::storage::fs::FsStorage;
         let seg = DEFAULT_WAL_SEG_SIZE;
         let dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(dir.path());
         let a = format_backup_name(1, seg, seg);
         let b = format_backup_name(1, seg * 3, seg);
         seed_sentinel(&storage, &a, serde_json::json!({"label": "alpha"})).await;
@@ -1269,9 +1266,8 @@ mod tests {
     #[tokio::test]
     async fn fold_sidecar_into_map_reads_blocks() {
         use crate::pg::walparser::write_locations_to;
-        use crate::storage::fs::FsStorage;
         let dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(dir.path());
         let settings = crate::config::Settings::default();
         let method = compression::Method::None;
 
@@ -1307,9 +1303,8 @@ mod tests {
     #[tokio::test]
     async fn fold_sidecar_truncated_before_terminator_errors() {
         use crate::pg::walparser::write_location_tuples;
-        use crate::storage::fs::FsStorage;
         let dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(dir.path());
         let settings = crate::config::Settings::default();
         let method = compression::Method::None;
 

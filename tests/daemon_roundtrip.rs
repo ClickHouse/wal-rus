@@ -1,7 +1,6 @@
 //! Daemon socket protocol smoke test: spin up server, drive via client
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UnixStream;
@@ -9,7 +8,6 @@ use tokio::net::UnixStream;
 use walrus::cli::DaemonOp;
 use walrus::config::{Settings, StorageSettings};
 use walrus::daemon::protocol::{MessageType, read_message, write_message};
-use walrus::storage::fs::FsStorage;
 
 fn fs_settings(storage_dir: &std::path::Path) -> Settings {
     Settings {
@@ -45,7 +43,7 @@ async fn daemon_check_and_wal_roundtrip() {
     std::fs::write(&src, b"abcdefg test segment").unwrap();
 
     let s = fs_settings(&storage_dir);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
@@ -107,7 +105,7 @@ async fn daemon_closes_connection_on_handler_error() {
     let socket = dir.path().join("walrus.sock");
 
     let s = fs_settings(&storage_dir);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let socket_for_server = socket.clone();
     let server = tokio::spawn(async move {
         let _ = walrus::daemon::serve(

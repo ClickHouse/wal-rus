@@ -2,12 +2,11 @@
 
 use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use walrus::compression::Method;
 use walrus::config::{Settings, StorageSettings};
 use walrus::pg::wal;
-use walrus::storage::fs::FsStorage;
+use walrus::storage::ObjExt;
 
 fn pseudo_wal_segment(seed: u8) -> Vec<u8> {
     // 16MB to match default wal_segsize
@@ -40,7 +39,7 @@ async fn push_fetch_zstd_roundtrip() {
     std::fs::write(&src, pseudo_wal_segment(7)).unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap(), Method::Zstd);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
 
@@ -75,7 +74,7 @@ async fn push_fetch_uncompressed() {
     std::fs::write(&src, b"raw payload, not 16MB").unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
 
     assert!(
@@ -113,7 +112,7 @@ async fn ready_marker_is_renamed_to_done_after_push() {
     std::fs::write(&ready, b"").unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&s, store, &src).await.unwrap();
 
     assert!(!ready.exists(), "{ready:?} should be gone");
@@ -131,7 +130,7 @@ async fn missing_ready_marker_is_not_an_error() {
     std::fs::write(&src, b"x").unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&s, store, &src).await.unwrap();
 }
 
@@ -145,7 +144,7 @@ async fn prevent_overwrite_passes_when_existing_bytes_match() {
     std::fs::write(&src, b"identical payload").unwrap();
 
     let mut s = settings_for(storage_dir.to_str().unwrap(), Method::Zstd);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
     s.prevent_wal_overwrite = true;
@@ -163,7 +162,7 @@ async fn prevent_overwrite_rejects_when_existing_bytes_differ() {
     std::fs::write(&src, b"first payload").unwrap();
 
     let mut s = settings_for(storage_dir.to_str().unwrap(), Method::Zstd);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
 
     std::fs::write(&src, b"different bytes").unwrap();
@@ -183,7 +182,7 @@ async fn history_file_idempotent_overwrite_allowed() {
     std::fs::write(&src, b"timeline history line\n").unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap(), Method::Zstd);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
     // .history must not bail even without prevent_wal_overwrite when bytes match
     wal::push::handle(&s, store, &src).await.unwrap();
@@ -197,7 +196,7 @@ async fn prefetch_stages_segments_and_fetch_promotes_by_rename() {
     let storage_dir = dir.path().join("storage");
     let pg_wal = dir.path().join("pg_wal");
     std::fs::create_dir_all(&pg_wal).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // Seed storage with segments 2 + 3 (we'll prefetch starting from 1, count=2).
@@ -251,7 +250,7 @@ async fn prefetch_cleans_stale_already_replayed_segments() {
     let storage_dir = dir.path().join("storage");
     let pg_wal = dir.path().join("pg_wal");
     std::fs::create_dir_all(&pg_wal).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // segment 6 is what we prefetch forward from seed 5
@@ -292,7 +291,7 @@ async fn wal_fetch_triggers_in_process_prefetch() {
     let storage_dir = dir.path().join("storage");
     let pg_wal = dir.path().join("pg_wal");
     std::fs::create_dir_all(&pg_wal).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let mut s = settings_for(storage_dir.to_str().unwrap(), Method::None);
     s.download_concurrency = 2; // >1 so wal-g's checkPrefetchPossible enables it
 
@@ -341,7 +340,7 @@ async fn wal_fetch_waits_for_inflight_prefetch_instead_of_redownloading() {
     let pg_wal = dir.path().join("pg_wal");
     std::fs::create_dir_all(&pg_wal).unwrap();
     // storage intentionally left empty: a fallback download would 404
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     let seg = "000000010000000000000002";
@@ -381,7 +380,7 @@ async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
     let storage_dir = dir.path().join("storage");
     let pg_wal = dir.path().join("pg_wal");
     std::fs::create_dir_all(&pg_wal).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // seed storage so the fallback download succeeds
@@ -413,13 +412,12 @@ async fn wal_fetch_reclaims_stalled_prefetch_and_downloads() {
 #[tokio::test]
 async fn wal_show_groups_segments_and_detects_gaps() {
     use walrus::pg::wal::show;
-    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let stage = dir.path().join("stage");
     std::fs::create_dir_all(&stage).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // Seed three segments on timeline 1 with a hole at seg 3
@@ -435,7 +433,7 @@ async fn wal_show_groups_segments_and_detects_gaps() {
             .await
             .unwrap();
     }
-    let timelines = show::collect(store as Arc<dyn Storage>).await.unwrap();
+    let timelines = show::collect(store.clone()).await.unwrap();
     assert_eq!(timelines.len(), 1);
     let t = &timelines[0];
     assert_eq!(t.timeline, 1);
@@ -450,7 +448,6 @@ async fn wal_show_groups_segments_and_detects_gaps() {
 #[tokio::test]
 async fn wal_restore_fills_gap_into_local_dir() {
     use walrus::pg::wal::restore;
-    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -458,7 +455,7 @@ async fn wal_restore_fills_gap_into_local_dir() {
     let restore_dst = dir.path().join("restore");
     std::fs::create_dir_all(&stage).unwrap();
 
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // Push 4 segments forming a gap-of-2 (seg 2 + 3 missing locally)
@@ -480,7 +477,7 @@ async fn wal_restore_fills_gap_into_local_dir() {
     std::fs::remove_file(storage_dir.join("wal_005/000000010000000000000002")).unwrap();
     std::fs::remove_file(storage_dir.join("wal_005/000000010000000000000003")).unwrap();
 
-    restore::handle(&s, store.clone() as Arc<dyn Storage>, &restore_dst, None)
+    restore::handle(&s, store.clone().clone(), &restore_dst, None)
         .await
         .unwrap();
     // Storage doesn't have segments 2/3 -> restore must surface skip warnings
@@ -503,7 +500,7 @@ async fn wal_restore_fills_gap_into_local_dir() {
     let _ = std::fs::create_dir_all(&restore_dst);
     // Need a fresh gap; recreate by deleting segment 3 only
     std::fs::remove_file(storage_dir.join("wal_005/000000010000000000000003")).unwrap();
-    restore::handle(&s, store as Arc<dyn Storage>, &restore_dst, None)
+    restore::handle(&s, store.clone(), &restore_dst, None)
         .await
         .unwrap();
     // No assertion on the missing seg (storage doesn't have it). The test
@@ -513,14 +510,13 @@ async fn wal_restore_fills_gap_into_local_dir() {
 #[tokio::test]
 async fn wal_restore_timeline_filter_skips_other_timelines() {
     use walrus::pg::wal::restore;
-    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let stage = dir.path().join("stage");
     let restore_dst = dir.path().join("restore");
     std::fs::create_dir_all(&stage).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // tli 1 hole at seg 3 (push 1,2,4); tli 2 hole at seg 6 (push 5,7)
@@ -540,7 +536,7 @@ async fn wal_restore_timeline_filter_skips_other_timelines() {
 
     // Filter to tli 2: the tli-1 gap is skipped before its segments expand, so
     // only tli-2's missing seg is attempted (and tolerated as unfetchable)
-    restore::handle(&s, store as Arc<dyn Storage>, &restore_dst, Some(2))
+    restore::handle(&s, store.clone(), &restore_dst, Some(2))
         .await
         .unwrap();
     assert!(
@@ -552,7 +548,6 @@ async fn wal_restore_timeline_filter_skips_other_timelines() {
 #[tokio::test]
 async fn wal_restore_skips_segment_already_present() {
     use walrus::pg::wal::restore;
-    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
@@ -560,7 +555,7 @@ async fn wal_restore_skips_segment_already_present() {
     let restore_dst = dir.path().join("restore");
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::create_dir_all(&restore_dst).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // Hole at seg 3 (push 1,2,4)
@@ -580,7 +575,7 @@ async fn wal_restore_skips_segment_already_present() {
     // leaving the sentinel bytes untouched
     let present = restore_dst.join("000000010000000000000003");
     std::fs::write(&present, b"already-here").unwrap();
-    restore::handle(&s, store as Arc<dyn Storage>, &restore_dst, None)
+    restore::handle(&s, store.clone(), &restore_dst, None)
         .await
         .unwrap();
     assert_eq!(
@@ -594,13 +589,12 @@ async fn wal_restore_skips_segment_already_present() {
 async fn wal_verify_integrity_detects_gap_after_backup() {
     use walrus::pg::backup::{format_backup_name, sentinel_key};
     use walrus::pg::wal::verify;
-    use walrus::storage::Storage;
 
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let stage = dir.path().join("stage");
     std::fs::create_dir_all(&stage).unwrap();
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     let s = settings_for(storage_dir.to_str().unwrap(), Method::None);
 
     // Seed segments 1 (backup start), 2, then gap at 3, then 4
@@ -659,7 +653,7 @@ async fn fetch_falls_back_to_uncompressed_when_zstd_missing() {
     std::fs::write(&src, b"hello world").unwrap();
 
     let upload_settings = settings_for(storage_dir.to_str().unwrap(), Method::None);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&upload_settings, store.clone(), &src)
         .await
         .unwrap();
@@ -704,7 +698,7 @@ async fn push_fetch_libsodium_encrypted_roundtrip() {
     std::fs::write(&src, pseudo_wal_segment(11)).unwrap();
 
     let s = encrypted_settings(storage_dir.to_str().unwrap(), Method::Zstd);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
 
     // On-disk bytes must differ from the raw segment (encryption confirmed)
@@ -738,7 +732,7 @@ async fn fetch_with_wrong_key_fails() {
     std::fs::write(&src, b"secret payload, do not leak").unwrap();
 
     let push_settings = encrypted_settings(storage_dir.to_str().unwrap(), Method::None);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&push_settings, store.clone(), &src)
         .await
         .unwrap();
@@ -781,7 +775,7 @@ async fn ciphertext_overhead_matches_libsodium_layout() {
     std::fs::write(&src, &plain).unwrap();
 
     let s = encrypted_settings(storage_dir.to_str().unwrap(), Method::None);
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
     wal::push::handle(&s, store, &src).await.unwrap();
 
     let obj_path = storage_dir.join(format!("wal_005/{segment}"));

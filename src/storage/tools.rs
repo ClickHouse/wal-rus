@@ -12,7 +12,7 @@ use futures::StreamExt;
 use glob::Pattern;
 use tokio::io::{self, AsyncWriteExt};
 
-use super::DynStorage;
+use super::{ObjExt, Operator};
 use crate::compression::{self, Method};
 use crate::config::Settings;
 
@@ -33,7 +33,7 @@ fn basename(path: &str) -> &str {
 /// passing through on an unknown extension. `glob` treats `path` as a pattern
 pub async fn cat(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     path: &str,
     decrypt: bool,
     decompress: bool,
@@ -64,7 +64,7 @@ pub async fn cat(
 /// a partial file is removed on error
 pub async fn get(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     path: &str,
     dst: &Path,
     decrypt: bool,
@@ -99,7 +99,7 @@ pub async fn get(
 /// decompressing-by-extension. Shared by cat & get
 async fn download(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     key: &str,
     decrypt: bool,
     decompress: bool,
@@ -136,7 +136,7 @@ async fn download(
 #[allow(clippy::too_many_arguments)]
 pub async fn put(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     local_path: Option<&Path>,
     dst: &str,
     overwrite: bool,
@@ -202,7 +202,7 @@ pub async fn put(
 
 /// `st rm`: delete every object under a prefix, or matching a glob pattern.
 /// Erroring on an empty match set mirrors wal-g `HandleRemove`
-pub async fn rm(storage: &DynStorage, prefix: &str, glob: bool) -> Result<()> {
+pub async fn rm(storage: &Operator, prefix: &str, glob: bool) -> Result<()> {
     let all;
     let keys: Vec<&str> = if glob {
         // wal-g globs objects and folders, then prefix-deletes each match
@@ -240,7 +240,7 @@ pub async fn rm(storage: &DynStorage, prefix: &str, glob: bool) -> Result<()> {
 /// lists every object; non-recursive lists immediate objects plus synthesized
 /// directory rows. `glob` lists keys matching a pattern
 pub async fn ls(
-    storage: &DynStorage,
+    storage: &Operator,
     path: Option<&str>,
     recursive: bool,
     glob: bool,
@@ -267,7 +267,7 @@ pub async fn ls(
 
 /// Render a `ls` table (header + rows) for one folder. Recursive lists every
 /// object; non-recursive lists immediate objects plus synthesized directory rows
-async fn listing_table(storage: &DynStorage, prefix: &str, recursive: bool) -> Result<String> {
+async fn listing_table(storage: &Operator, prefix: &str, recursive: bool) -> Result<String> {
     let mut metas = list_metas(storage, prefix).await?;
     let mut out = String::from("type\tsize\tlast modified\tname\n");
     if recursive {
@@ -341,7 +341,7 @@ pub async fn copy(
 }
 
 /// Collect object keys under a prefix (recursive, keys include the prefix)
-async fn list_keys(storage: &DynStorage, prefix: &str) -> Result<Vec<String>> {
+async fn list_keys(storage: &Operator, prefix: &str) -> Result<Vec<String>> {
     Ok(list_metas(storage, prefix)
         .await?
         .into_iter()
@@ -350,9 +350,9 @@ async fn list_keys(storage: &DynStorage, prefix: &str) -> Result<Vec<String>> {
 }
 
 /// Collect object metadata under a prefix (recursive)
-async fn list_metas(storage: &DynStorage, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
+async fn list_metas(storage: &Operator, prefix: &str) -> Result<Vec<super::ObjMeta>> {
     let mut stream = storage
-        .list(prefix)
+        .list_objs(prefix)
         .await
         .with_context(|| format!("list {prefix:?}"))?;
     let mut out = Vec::new();
@@ -447,7 +447,7 @@ struct LevelObject {
 /// this level; one with a `/` contributes its first segment as a `<segment>/`
 /// directory. Directories are de-duplicated & sorted; mirrors wal-g
 /// `folder.ListFolder` returning objects + subfolders
-fn split_one_level(prefix: &str, metas: &[super::ObjectMeta]) -> (Vec<String>, Vec<LevelObject>) {
+fn split_one_level(prefix: &str, metas: &[super::ObjMeta]) -> (Vec<String>, Vec<LevelObject>) {
     let mut dirs: Vec<&str> = Vec::new();
     let mut objs = Vec::new();
     for m in metas {
@@ -502,8 +502,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn meta(key: &str, size: u64) -> super::super::ObjectMeta {
-        super::super::ObjectMeta {
+    fn meta(key: &str, size: u64) -> super::super::ObjMeta {
+        super::super::ObjMeta {
             key: key.to_string(),
             size,
             last_modified: None,

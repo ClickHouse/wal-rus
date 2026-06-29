@@ -2,7 +2,6 @@
 //! sentinel + tar produced in wal-g format
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
 
 use chrono::Utc;
 use walrus::compression::Method;
@@ -16,8 +15,7 @@ use walrus::pg::backup::{
     TablespaceSpec, files_metadata_key, format_backup_name, sentinel_key, tar_part_key,
     tar_partitions_prefix,
 };
-use walrus::storage::Storage;
-use walrus::storage::fs::FsStorage;
+use walrus::storage::ObjExt;
 
 fn test_settings() -> Settings {
     Settings {
@@ -63,14 +61,14 @@ fn build_tar(files: &[(&str, &[u8])]) -> Vec<u8> {
     buf
 }
 
-async fn put_bytes(store: Arc<FsStorage>, key: &str, body: Vec<u8>) {
+async fn put_bytes(store: walrus::storage::Operator, key: &str, body: Vec<u8>) {
     let len = body.len() as u64;
     let r: walrus::compression::AsyncReader = Box::pin(std::io::Cursor::new(body));
     store.put(key, r, Some(len)).await.unwrap();
 }
 
 /// Seed a sentinel-only backup at `lsn` carrying `user_data`; returns its name
-async fn seed_user_data(store: &Arc<FsStorage>, lsn: u64, user_data: serde_json::Value) -> String {
+async fn seed_user_data(store: &walrus::storage::Operator, lsn: u64, user_data: serde_json::Value) -> String {
     let name = format_backup_name(1, lsn, 16 * 1024 * 1024);
     let mut sentinel = make_sentinel_v2("/var/lib/postgres/data");
     sentinel.sentinel.user_data = Some(user_data);
@@ -82,14 +80,14 @@ async fn seed_user_data(store: &Arc<FsStorage>, lsn: u64, user_data: serde_json:
 #[tokio::test]
 async fn list_finds_seeded_backup() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
     let sentinel = make_sentinel_v2("/var/lib/postgres/data");
     let sentinel_bytes = serde_json::to_vec(&sentinel).unwrap();
     put_bytes(store.clone(), &sentinel_key(&backup_name), sentinel_bytes).await;
 
-    let summaries = list_mod::collect(store as Arc<dyn Storage>).await.unwrap();
+    let summaries = list_mod::collect(store.clone()).await.unwrap();
     assert_eq!(summaries.len(), 1);
     let s = &summaries[0];
     assert_eq!(s.name, backup_name);
@@ -103,7 +101,7 @@ async fn fetch_extracts_tar_part() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
 
@@ -119,7 +117,7 @@ async fn fetch_extracts_tar_part() {
 
     fetch_mod::handle(
         &test_settings(),
-        store as Arc<dyn Storage>,
+        store.clone(),
         &backup_name,
         &restore,
     )
@@ -145,7 +143,7 @@ async fn fetch_multipart_concurrent_is_byte_clean() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
     put_bytes(
@@ -179,7 +177,7 @@ async fn fetch_multipart_concurrent_is_byte_clean() {
     let mut s = test_settings();
     s.download_concurrency = 4;
 
-    fetch_mod::handle(&s, store as Arc<dyn Storage>, &backup_name, &restore)
+    fetch_mod::handle(&s, store.clone(), &backup_name, &restore)
         .await
         .unwrap();
 
@@ -199,7 +197,7 @@ async fn fetch_multipart_concurrent_is_byte_clean() {
 #[tokio::test]
 async fn fetch_resolves_latest() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     let older = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
     let newer = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
@@ -210,7 +208,7 @@ async fn fetch_resolves_latest() {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     put_bytes(store.clone(), &sentinel_key(&newer), bytes).await;
 
-    let resolved = fetch_mod::resolve_name(&(store as Arc<dyn Storage>), "LATEST")
+    let resolved = fetch_mod::resolve_name(&(store.clone()), "LATEST")
         .await
         .unwrap();
     assert_eq!(resolved, newer);
@@ -220,12 +218,12 @@ async fn fetch_resolves_latest() {
 async fn resolve_by_user_data_selects_unique_match() {
     use walrus::pg::backup::show;
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     let a = seed_user_data(&store, 0x0300_0000, serde_json::json!({"label": "a"})).await;
     seed_user_data(&store, 0x0400_0000, serde_json::json!({"label": "b"})).await;
 
-    let dyn_store = store as Arc<dyn Storage>;
+    let dyn_store = store.clone();
     assert_eq!(
         show::resolve_by_user_data(&dyn_store, r#"{"label":"a"}"#)
             .await
@@ -244,13 +242,13 @@ async fn resolve_by_user_data_selects_unique_match() {
 async fn resolve_by_user_data_errors_on_ambiguous_match() {
     use walrus::pg::backup::show;
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     let shared = serde_json::json!({"team": "infra"});
     let a = seed_user_data(&store, 0x0300_0000, shared.clone()).await;
     let b = seed_user_data(&store, 0x0400_0000, shared).await;
 
-    let dyn_store = store as Arc<dyn Storage>;
+    let dyn_store = store.clone();
     let err = show::resolve_by_user_data(&dyn_store, r#"{"team":"infra"}"#)
         .await
         .unwrap_err()
@@ -268,7 +266,7 @@ async fn fetch_decompresses_zstd_tar() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
     let sentinel = make_sentinel_v2("/d");
@@ -296,7 +294,7 @@ async fn fetch_decompresses_zstd_tar() {
 
     fetch_mod::handle(
         &test_settings(),
-        store as Arc<dyn Storage>,
+        store.clone(),
         &backup_name,
         &restore,
     )
@@ -317,7 +315,7 @@ async fn fetch_recreates_tablespace_symlinks() {
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
     let target = dir.path().join("ts_target");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
 
@@ -334,7 +332,7 @@ async fn fetch_recreates_tablespace_symlinks() {
 
     fetch_mod::handle(
         &test_settings(),
-        store as Arc<dyn Storage>,
+        store.clone(),
         &backup_name,
         &restore,
     )
@@ -363,7 +361,7 @@ async fn fetch_ignores_archived_tablespace_symlink_entry() {
     let restore = dir.path().join("restore");
     let sentinel_target = dir.path().join("ts_target");
     let archived_target = dir.path().join("archived_ts");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
 
@@ -407,7 +405,7 @@ async fn fetch_ignores_archived_tablespace_symlink_entry() {
 
     fetch_mod::handle(
         &test_settings(),
-        store as Arc<dyn Storage>,
+        store.clone(),
         &backup_name,
         &restore,
     )
@@ -435,7 +433,7 @@ async fn show_round_trip_and_mark_flips_permanent() {
     use walrus::pg::backup::show as show_mod;
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     let backup_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
     let sentinel = make_sentinel_v2("/var/lib/postgres/data");
@@ -444,7 +442,7 @@ async fn show_round_trip_and_mark_flips_permanent() {
 
     // pure read; just ensure it doesn't error
     show_mod::show(
-        store.clone() as Arc<dyn Storage>,
+        store.clone().clone(),
         &backup_name,
         show_mod::Format::Json,
     )
@@ -452,7 +450,7 @@ async fn show_round_trip_and_mark_flips_permanent() {
     .unwrap();
 
     // flip to permanent
-    show_mod::mark(store.clone() as Arc<dyn Storage>, &backup_name, true)
+    show_mod::mark(store.clone().clone(), &backup_name, true)
         .await
         .unwrap();
 
@@ -461,7 +459,7 @@ async fn show_round_trip_and_mark_flips_permanent() {
     assert!(after.is_permanent);
 
     // flip off
-    show_mod::mark(store as Arc<dyn Storage>, &backup_name, false)
+    show_mod::mark(store.clone(), &backup_name, false)
         .await
         .unwrap();
     let raw = std::fs::read(dir.path().join(sentinel_key(&backup_name))).unwrap();
@@ -472,7 +470,7 @@ async fn show_round_trip_and_mark_flips_permanent() {
 #[tokio::test]
 async fn delta_parent_picks_latest_when_enabled() {
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn Storage> = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     // Seed two sentinels; the later one (higher LSN, later StartTime) wins
     let older_name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
@@ -481,7 +479,7 @@ async fn delta_parent_picks_latest_when_enabled() {
     older.start_time = chrono::Utc::now() - chrono::Duration::hours(2);
     older.finish_time = older.start_time + chrono::Duration::minutes(1);
     put_bytes(
-        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        walrus::storage::fs_operator(dir.path()),
         &sentinel_key(&older_name),
         serde_json::to_vec(&older).unwrap(),
     )
@@ -493,7 +491,7 @@ async fn delta_parent_picks_latest_when_enabled() {
     newer.start_time = chrono::Utc::now();
     newer.finish_time = newer.start_time + chrono::Duration::minutes(1);
     put_bytes(
-        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        walrus::storage::fs_operator(dir.path()),
         &sentinel_key(&newer_name),
         serde_json::to_vec(&newer).unwrap(),
     )
@@ -525,12 +523,12 @@ async fn delta_parent_picks_latest_when_enabled() {
 #[tokio::test]
 async fn delta_parent_falls_back_to_full_when_disabled() {
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn Storage> = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     let name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
     let sentinel = make_sentinel_v2("/var/lib/postgres/data");
     put_bytes(
-        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        walrus::storage::fs_operator(dir.path()),
         &sentinel_key(&name),
         serde_json::to_vec(&sentinel).unwrap(),
     )
@@ -546,13 +544,13 @@ async fn delta_parent_falls_back_to_full_when_disabled() {
 #[tokio::test]
 async fn delta_parent_falls_back_when_max_steps_reached() {
     let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn Storage> = Arc::new(FsStorage::new(dir.path()).unwrap());
+    let store = walrus::storage::fs_operator(dir.path());
 
     let name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
     let mut sentinel = make_sentinel_v2("/var/lib/postgres/data");
     sentinel.sentinel.increment_count = Some(3); // chain already 3 deep
     put_bytes(
-        Arc::new(FsStorage::new(dir.path()).unwrap()),
+        walrus::storage::fs_operator(dir.path()),
         &sentinel_key(&name),
         serde_json::to_vec(&sentinel).unwrap(),
     )
@@ -580,7 +578,7 @@ async fn fetch_decrypts_libsodium_tar_part() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     // Build encrypted settings (libsodium + zstd) shared between seeding and fetch
     let mut k = [0u8; 32];
@@ -625,7 +623,7 @@ async fn fetch_decrypts_libsodium_tar_part() {
     )
     .await;
 
-    fetch_mod::handle(&s, store as Arc<dyn Storage>, &backup_name, &restore)
+    fetch_mod::handle(&s, store.clone(), &backup_name, &restore)
         .await
         .unwrap();
 
@@ -645,7 +643,7 @@ async fn fetch_applies_delta_chain_wi1() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let mut s = test_settings();
     s.compression = Method::None;
@@ -725,7 +723,7 @@ async fn fetch_applies_delta_chain_wi1() {
     )
     .await;
 
-    fetch_mod::handle(&s, store as Arc<dyn Storage>, &delta_name, &restore)
+    fetch_mod::handle(&s, store.clone(), &delta_name, &restore)
         .await
         .unwrap();
 
@@ -768,7 +766,7 @@ async fn fetch_applies_delta_chain_walg_leading_slash() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let mut s = test_settings();
     s.compression = Method::None;
@@ -841,7 +839,7 @@ async fn fetch_applies_delta_chain_walg_leading_slash() {
     )
     .await;
 
-    fetch_mod::handle(&s, store as Arc<dyn Storage>, &delta_name, &restore)
+    fetch_mod::handle(&s, store.clone(), &delta_name, &restore)
         .await
         .unwrap();
 
@@ -869,7 +867,7 @@ async fn fetch_walks_three_step_chain() {
     let dir = tempfile::tempdir().unwrap();
     let storage_dir = dir.path().join("storage");
     let restore = dir.path().join("restore");
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let store = walrus::storage::fs_operator(&storage_dir);
 
     let mut s = test_settings();
     s.compression = Method::None;
@@ -993,7 +991,7 @@ async fn fetch_walks_three_step_chain() {
     )
     .await;
 
-    fetch_mod::handle(&s, store as Arc<dyn Storage>, &delta2_name, &restore)
+    fetch_mod::handle(&s, store.clone(), &delta2_name, &restore)
         .await
         .unwrap();
 

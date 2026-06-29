@@ -18,7 +18,7 @@ use crate::cli::WalVerifyOp;
 use crate::pg::backup::list as backup_list;
 use crate::pg::backup::{format_pg_lsn, parse_timeline_from_backup_name};
 use crate::pg::wal::show::{self, GapInfo};
-use crate::storage::DynStorage;
+use crate::storage::Operator;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IntegrityReport {
@@ -44,7 +44,7 @@ pub enum ReportStatus {
     Empty,
 }
 
-pub async fn run(storage: DynStorage, op: WalVerifyOp) -> Result<()> {
+pub async fn run(storage: Operator, op: WalVerifyOp) -> Result<()> {
     let (json, integrity, timeline) = match op {
         WalVerifyOp::Integrity { json } => (json, true, false),
         WalVerifyOp::Timeline { json } => (json, false, true),
@@ -100,7 +100,7 @@ pub async fn run(storage: DynStorage, op: WalVerifyOp) -> Result<()> {
     Ok(())
 }
 
-pub async fn check_integrity(storage: DynStorage) -> Result<IntegrityReport> {
+pub async fn check_integrity(storage: Operator) -> Result<IntegrityReport> {
     let backups = backup_list::collect(storage.clone())
         .await
         .context("list backups")?;
@@ -138,7 +138,7 @@ pub async fn check_integrity(storage: DynStorage) -> Result<IntegrityReport> {
     })
 }
 
-pub async fn check_timeline(storage: DynStorage) -> Result<TimelineReport> {
+pub async fn check_timeline(storage: Operator) -> Result<TimelineReport> {
     let timelines = show::collect(storage.clone()).await?;
     let current = timelines.iter().map(|t| t.timeline).max();
     let backups = backup_list::collect(storage)

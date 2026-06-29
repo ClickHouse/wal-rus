@@ -16,11 +16,11 @@ use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::wal::show;
-use crate::storage::DynStorage;
+use crate::storage::Operator;
 
 pub async fn handle(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     dst: &Path,
     timeline_filter: Option<u32>,
 ) -> Result<()> {

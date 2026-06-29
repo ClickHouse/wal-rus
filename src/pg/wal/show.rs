@@ -18,7 +18,7 @@ use crate::pg::backup::list as backup_list;
 use crate::pg::backup::{format_pg_lsn, parse_timeline_from_backup_name};
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::pg::wal::segment_file::classify_segment_name;
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -58,7 +58,7 @@ pub struct BackupRef {
     pub finish_lsn: Option<NonZeroU64>,
 }
 
-pub async fn handle(storage: DynStorage, format: Format) -> Result<()> {
+pub async fn handle(storage: Operator, format: Format) -> Result<()> {
     let timelines = collect(storage).await?;
     match format {
         Format::Plain => print_plain(&timelines),
@@ -67,7 +67,7 @@ pub async fn handle(storage: DynStorage, format: Format) -> Result<()> {
     Ok(())
 }
 
-pub async fn collect(storage: DynStorage) -> Result<Vec<TimelineInfo>> {
+pub async fn collect(storage: Operator) -> Result<Vec<TimelineInfo>> {
     let segs_by_tli = list_segments(&storage).await?;
     let backups = backup_list::collect(storage.clone()).await?;
 
@@ -96,11 +96,11 @@ pub async fn collect(storage: DynStorage) -> Result<Vec<TimelineInfo>> {
 }
 
 async fn list_segments(
-    storage: &DynStorage,
+    storage: &Operator,
 ) -> Result<BTreeMap<u32, std::collections::BTreeSet<SegmentName>>> {
     let prefix = format!("{}/", WAL_FOLDER);
     let mut stream = storage
-        .list(&prefix)
+        .list_objs(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
     let mut by_tli: BTreeMap<u32, std::collections::BTreeSet<SegmentName>> = BTreeMap::new();
@@ -205,7 +205,7 @@ fn print_plain(timelines: &[TimelineInfo]) {
 }
 
 /// Helper exposed for `wal-restore`: enumerate gaps across all timelines
-pub async fn gaps_by_timeline(storage: DynStorage) -> Result<BTreeMap<u32, Vec<GapInfo>>> {
+pub async fn gaps_by_timeline(storage: Operator) -> Result<BTreeMap<u32, Vec<GapInfo>>> {
     let timelines = collect(storage).await?;
     Ok(timelines
         .into_iter()
@@ -217,7 +217,7 @@ pub async fn gaps_by_timeline(storage: DynStorage) -> Result<BTreeMap<u32, Vec<G
 /// Helper for `wal-verify integrity`: every segment from each backup's
 /// start LSN forward through the latest archived segment must be present
 pub async fn integrity_for_backup(
-    storage: DynStorage,
+    storage: Operator,
     backup_start_lsn: u64,
     timeline: u32,
 ) -> Result<Vec<GapInfo>> {
@@ -277,9 +277,8 @@ async fn _unused_reader(_r: &mut (dyn tokio::io::AsyncRead + Unpin)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{AsyncReader, fs::FsStorage};
+    use crate::storage::{AsyncReader, ObjExt};
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
     fn seg(tli: u32, seg_no: u32) -> SegmentName {
         SegmentName {
@@ -355,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn collect_splits_timelines_ignores_history_counts_partial() {
         let dir = tempfile::tempdir().unwrap();
-        let store: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let store: Operator = crate::storage::fs_operator(dir.path());
         for k in [
             "wal_005/000000010000000000000001",
             "wal_005/000000010000000000000002",
@@ -416,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn gaps_by_timeline_returns_only_lossy_timelines() {
         let dir = tempfile::tempdir().unwrap();
-        let store: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let store: Operator = crate::storage::fs_operator(dir.path());
         // tli 1 contiguous (no gap), tli 2 has a hole at seg 6
         for k in [
             "wal_005/000000010000000000000001",
@@ -436,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn integrity_for_backup_absent_timeline_reports_na() {
         let dir = tempfile::tempdir().unwrap();
-        let store: DynStorage = Arc::new(FsStorage::new(dir.path()).unwrap());
+        let store: Operator = crate::storage::fs_operator(dir.path());
         store
             .put("wal_005/000000010000000000000001", empty_body(), None)
             .await

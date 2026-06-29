@@ -34,7 +34,7 @@ use crate::pg::walparser::{
     BlockLocation, WAL_PAGE_SIZE, WalParser, XLP_PAGE_MAGIC_PG14, extract_block_locations,
     parse_record_from_bytes, write_location_tuples, write_locations_to,
 };
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 /// WAL segments per delta group (wal-g `WalFileInDelta`)
 pub const WAL_FILES_IN_DELTA: u64 = 16;
@@ -371,7 +371,7 @@ async fn remove_group_files(folder: &Path, group_name: &str) {
 /// are never held in memory
 async fn finalize_and_upload(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     folder: &Path,
     group_name: &str,
     combined: &[BlockLocation],
@@ -434,7 +434,7 @@ fn record_lock() -> &'static tokio::sync::Mutex<()> {
 /// fails the WAL push (matching wal-g, where delta errors are warnings)
 pub async fn record_segment(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     src_path: &Path,
     name: &str,
 ) -> Result<()> {
@@ -660,9 +660,7 @@ mod tests {
     #[tokio::test]
     async fn record_then_consume_uses_sidecar() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let n = WAL_FILES_IN_DELTA;
@@ -672,7 +670,7 @@ mod tests {
         std::fs::create_dir_all(&pg_wal).unwrap();
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         let tail = 2 * n; // 32: first segment of group 32
         for g in (n - 1)..=tail {
@@ -735,9 +733,7 @@ mod tests {
     #[tokio::test]
     async fn unaligned_start_walks_leading_partial() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let n = WAL_FILES_IN_DELTA;
@@ -747,7 +743,7 @@ mod tests {
         std::fs::create_dir_all(&pg_wal).unwrap();
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         let start = n + 4; // 20: group 16, position 4
         let last_complete = 2 * n; // group 32
@@ -821,9 +817,7 @@ mod tests {
     #[tokio::test]
     async fn aligned_start_walks_missing_first_group() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let n = WAL_FILES_IN_DELTA;
@@ -833,7 +827,7 @@ mod tests {
         std::fs::create_dir_all(&pg_wal).unwrap();
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         let start = 2 * n; // 32: group boundary, recording starts here
         let second_group = 3 * n; // 48
@@ -908,16 +902,14 @@ mod tests {
     #[tokio::test]
     async fn full_walk_pipelines_multiple_segments() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let tmp = tempfile::tempdir().unwrap();
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         // Segments 1..=3 (group 0), each touching a distinct block, all fetchable
         for g in 1u64..=3 {
@@ -958,16 +950,14 @@ mod tests {
     #[tokio::test]
     async fn full_walk_errors_on_missing_segment() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let tmp = tempfile::tempdir().unwrap();
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         for g in [1u64, 3] {
             let name = seg_name_from_global(1, g, seg_size).format();
@@ -999,9 +989,7 @@ mod tests {
     #[tokio::test]
     async fn full_walk_prefers_local_pg_wal() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let tmp = tempfile::tempdir().unwrap();
@@ -1010,7 +998,7 @@ mod tests {
         std::fs::create_dir_all(&pg_wal).unwrap();
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         // segment 1: local pg_wal only (uncompressed, raw segment name)
         let name1 = seg_name_from_global(1, 1, seg_size).format();
@@ -1108,7 +1096,7 @@ mod tests {
         page
     }
 
-    async fn put_segment(storage: &DynStorage, seg: u64, bytes: Vec<u8>) {
+    async fn put_segment(storage: &Operator, seg: u64, bytes: Vec<u8>) {
         let name = seg_name_from_global(1, seg, wal_segment_size()).format();
         let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
         storage
@@ -1123,16 +1111,14 @@ mod tests {
     #[tokio::test]
     async fn full_walk_stitches_boundary_record() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let tmp = tempfile::tempdir().unwrap();
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         let total = 9049;
         let split = 8152; // bytes on seg 1 after long header + align
@@ -1167,16 +1153,14 @@ mod tests {
     #[tokio::test]
     async fn full_walk_falls_back_on_multi_segment_record() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let tmp = tempfile::tempdir().unwrap();
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         let head = 8152; // bytes on seg 1 (long header + align)
         let mid = 8168; // bytes on seg 2 (short header + align), fully inside record
@@ -1219,16 +1203,14 @@ mod tests {
     #[tokio::test]
     async fn parallel_parse_missing_boundary_neighbor_errors() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let tmp = tempfile::tempdir().unwrap();
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         // seg 1 holds only the head of a boundary-spanning record (trailing head
         // non-empty); seg 2, carrying the tail, is never uploaded
@@ -1257,9 +1239,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_sidecar_falls_back_to_raw_walk() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let n = WAL_FILES_IN_DELTA;
@@ -1267,7 +1247,7 @@ mod tests {
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
         let none = compression::Method::None;
 
         // group 16's 16 raw segments fetchable for the fallback walk
@@ -1310,9 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn aligned_first_group_missing_sidecar_and_raw_errors() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let n = WAL_FILES_IN_DELTA;
@@ -1322,7 +1300,7 @@ mod tests {
         std::fs::create_dir_all(&pg_wal).unwrap();
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
 
         let start = 2 * n; // 32: group boundary, recording starts here
         let second_group = 3 * n; // 48
@@ -1378,9 +1356,7 @@ mod tests {
     #[tokio::test]
     async fn corrupt_sidecar_without_raw_wal_errors() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
-        use crate::storage::DynStorage;
-        use crate::storage::fs::FsStorage;
-        use std::sync::Arc;
+        use crate::storage::Operator;
 
         let seg_size = DEFAULT_WAL_SEG_SIZE;
         let n = WAL_FILES_IN_DELTA;
@@ -1388,7 +1364,7 @@ mod tests {
         let bucket = tmp.path().join("bucket");
         std::fs::create_dir_all(&bucket).unwrap();
         let settings = test_settings(&bucket);
-        let storage: DynStorage = Arc::new(FsStorage::new(&bucket).unwrap());
+        let storage: Operator = crate::storage::fs_operator(&bucket);
         let none = compression::Method::None;
 
         // Truncated group-16 sidecar: lone tuple, no terminator. No raw segments

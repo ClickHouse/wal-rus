@@ -41,7 +41,7 @@ use crate::pg::backup::{
 use crate::pg::replication::PgConfig;
 use crate::pg::replication::base_backup::ChannelReader;
 use crate::pg::replication::conn::ReplicationConn;
-use crate::storage::DynStorage;
+use crate::storage::{ObjExt, Operator};
 
 // walk-relative path used to detect pg_control during the tree walk
 const PG_CONTROL_ENTRY: &str = "global/pg_control";
@@ -188,7 +188,7 @@ struct WorkerResult {
 
 pub async fn handle(
     settings: &Settings,
-    storage: DynStorage,
+    storage: Operator,
     args: PushArgs,
     cfg: PgConfig,
 ) -> Result<()> {
@@ -462,7 +462,7 @@ async fn pack_worker(
     batch_rx: Arc<Mutex<mpsc::Receiver<Vec<WalkEntry>>>>,
     counter: Arc<AtomicU32>,
     settings: Settings,
-    storage: DynStorage,
+    storage: Operator,
     backup_name: String,
     delta_context: Option<DeltaContext>,
 ) -> Result<WorkerResult> {
@@ -787,7 +787,7 @@ async fn upload_part(
     reader: ChannelReader,
     key: String,
     settings: Settings,
-    storage: DynStorage,
+    storage: Operator,
 ) -> Result<u64> {
     let reader: AsyncBufReader = Box::pin(reader);
     let compressed =
@@ -806,7 +806,7 @@ async fn upload_part(
 /// Compress+encrypt a small in-memory tar and PUT it; returns compressed bytes
 async fn upload_bytes(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     key: &str,
     bytes: Bytes,
 ) -> Result<u64> {
@@ -1046,7 +1046,7 @@ fn sql_lit(s: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn build_delta_context(
     settings: &Settings,
-    storage: &DynStorage,
+    storage: &Operator,
     parent: Option<&delta::PrevBackupInfo>,
     args: &PushArgs,
     increment_format: IncrementFormat,
@@ -1186,7 +1186,6 @@ mod tests {
 
     use super::*;
     use crate::compression::Method;
-    use crate::storage::fs::FsStorage;
     use tokio::io::AsyncReadExt;
 
     fn write_file(root: &Path, rel: &str, content: &[u8]) {
@@ -1386,7 +1385,7 @@ mod tests {
         .collect();
 
         let store_dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(store_dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(store_dir.path());
         let settings = Settings {
             compression: Method::None,
             ..Default::default()
@@ -1473,7 +1472,7 @@ mod tests {
         std::fs::remove_file(root.join("base/1/5678")).unwrap();
 
         let store_dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(store_dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(store_dir.path());
         let settings = Settings {
             compression: Method::None,
             ..Default::default()
@@ -1589,7 +1588,7 @@ mod tests {
 
         let batch_rx = walk_batches(&root, 1 << 30).await;
         let store_dir = tempfile::tempdir().unwrap();
-        let storage: DynStorage = Arc::new(FsStorage::new(store_dir.path()).unwrap());
+        let storage: Operator = crate::storage::fs_operator(store_dir.path());
         let settings = Settings {
             compression: Method::None,
             ..Default::default()

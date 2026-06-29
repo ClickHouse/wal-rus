@@ -20,8 +20,7 @@ use walrus::config::{Settings, StorageSettings, Vars};
 use walrus::pg::backup;
 use walrus::pg::replication::PgConfig;
 use walrus::pg::wal;
-use walrus::storage::Storage;
-use walrus::storage::fs::FsStorage;
+use walrus::storage::ObjExt;
 
 fn settings_for(path: &str) -> Settings {
     Settings {
@@ -54,7 +53,7 @@ async fn wal_push_fetch_byte_identity() {
     std::fs::write(&src, &payload).unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
     wal::push::handle(&s, store.clone(), &src).await.unwrap();
 
     let dst = dir.path().join("restored");
@@ -75,7 +74,7 @@ async fn backup_push_fetch_against_live_pg() {
     std::fs::create_dir_all(&storage_dir).unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
 
     let args = backup::push::PushArgs {
         pgdata: None,
@@ -194,7 +193,7 @@ async fn backup_with_user_tablespace_against_live_pg() {
     std::fs::create_dir_all(&storage_dir).unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
 
     let args = backup::push::PushArgs {
         pgdata: None,
@@ -312,7 +311,7 @@ async fn encrypted_backup_push_fetch_against_live_pg() {
     std::fs::create_dir_all(&storage_dir).unwrap();
 
     let s = encrypted_settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
 
     backup::push::handle(&s, store.clone(), default_push_args(), pg_cfg())
         .await
@@ -379,7 +378,7 @@ async fn retain_full_one_against_live_pg() {
     std::fs::create_dir_all(&storage_dir).unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
 
     // Two full backups, serialized. Each backup-push's pg_stop_backup advances
     // the LSN, so the second backup's name sorts strictly after the first
@@ -425,7 +424,7 @@ fn read_sentinel(
 /// bucket so the WAL-walk delta map can find the changed blocks — this cluster
 /// has no archive_command. The segment holding the delta's start LSN may still
 /// be partial/absent; the raw-WAL walk skips it and it carries no table writes.
-async fn archive_pg_wal(s: &Settings, store: &Arc<dyn Storage>, pg_wal: &std::path::Path) {
+async fn archive_pg_wal(s: &Settings, store: &walrus::storage::Operator, pg_wal: &std::path::Path) {
     let seg_size = 16 * 1024 * 1024u64;
     let mut segs: Vec<std::path::PathBuf> = std::fs::read_dir(pg_wal)
         .unwrap()
@@ -465,7 +464,7 @@ async fn archive_pg_wal(s: &Settings, store: &Arc<dyn Storage>, pg_wal: &std::pa
 /// tablespaces into the sandbox so we never write to postgres-owned paths
 async fn restore_backup(
     s: &Settings,
-    store: &Arc<dyn Storage>,
+    store: &walrus::storage::Operator,
     storage_dir: &std::path::Path,
     name: &str,
     restore_dir: std::path::PathBuf,
@@ -487,7 +486,7 @@ async fn delta_chain_against_live_pg() {
     let storage_dir = dir.path().join("storage");
     std::fs::create_dir_all(&storage_dir).unwrap();
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
 
     let pghost = std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".into());
     let pgport = std::env::var("PGPORT").unwrap_or_else(|_| "5432".into());
@@ -666,7 +665,7 @@ async fn wal_receive_archives_segment_against_live_pg() {
     std::fs::create_dir_all(&archive_dir).unwrap();
 
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
 
     let s_recv = s.clone();
     let store_recv = store.clone();
@@ -906,7 +905,7 @@ async fn delta_from_summaries_against_live_pg() {
     let storage_dir = dir.path().join("storage");
     std::fs::create_dir_all(&storage_dir).unwrap();
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
     let psql = psql_runner();
 
     let ver: i64 = psql("SHOW server_version_num").parse().unwrap_or(0);
@@ -1137,7 +1136,7 @@ async fn tablespace_backup_restore_against_live_pg() {
     let storage_dir = dir.path().join("storage");
     std::fs::create_dir_all(&storage_dir).unwrap();
     let s = settings_for(storage_dir.to_str().unwrap());
-    let store = Arc::new(FsStorage::new(&storage_dir).unwrap()) as Arc<dyn Storage>;
+    let store = walrus::storage::fs_operator(&storage_dir).clone();
     let psql = psql_runner();
 
     // Tablespace location: empty dir outside PGDATA, owned by the PG user (us)
