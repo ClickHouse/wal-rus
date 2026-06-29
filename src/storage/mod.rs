@@ -19,9 +19,10 @@ use opendal::raw::HttpClient;
 use opendal::services::{Fs, Gcs, S3};
 use opendal::ErrorKind;
 pub use opendal::Operator;
-use tokio::io::AsyncWriteExt;
+use bytes::BytesMut;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
-use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::config::StorageSettings;
 use crate::retry::RetryPolicy;
@@ -70,9 +71,9 @@ pub struct GcsConfig {
     pub endpoint: Option<String>,
 }
 
-/// Process-wide part budget. One permit per active upload writer (each pinned to
-/// `concurrent(1)`), so resident part buffers stay near MAX_INFLIGHT_PARTS × PART_SIZE
-/// regardless of how many uploads run at once
+/// Process-wide part budget. One permit per resident PART_SIZE buffer, so
+/// aggregate in-flight bytes stay near MAX_INFLIGHT_PARTS × PART_SIZE across
+/// every concurrent upload, independent of writer count
 fn part_permits() -> &'static Semaphore {
     static P: OnceLock<Semaphore> = OnceLock::new();
     P.get_or_init(|| Semaphore::new(MAX_INFLIGHT_PARTS))
@@ -179,31 +180,55 @@ pub fn build_operator(s: &StorageSettings, policy: RetryPolicy) -> Result<Operat
     }
 }
 
-/// Upload `body` to `key`. `size_hint` is accepted for call-site stability but
-/// unused: OpenDAL emits a single PUT for bodies up to one chunk, multipart
-/// beyond. One part permit is held for the writer's lifetime to bound aggregate
-/// in-flight memory
+/// Upload `body` to `key`. Reads the stream into contiguous PART_SIZE buffers
+/// and hands each to OpenDAL's writer as one `Buffer`, so every part is a single
+/// mmap-backed allocation freed whole on upload — not a fan of small slices the
+/// allocator retains (`into_futures_async_write` coalesces through a 256 KiB
+/// buffer, fragmenting each part). `concurrent(1)` keeps one part in flight per
+/// writer; one permit per resident buffer bounds aggregate in-flight memory.
+/// `size_hint` is unused (call-site stability): a lone part closes as a single
+/// PUT, multiple parts as a multipart upload
 pub async fn put_reader(
     op: &Operator,
     key: &str,
     mut body: AsyncReader,
     _size_hint: Option<u64>,
 ) -> Result<()> {
-    let _permit = part_permits()
-        .acquire()
-        .await
-        .map_err(|e| anyhow!("part permit pool closed: {e}"))?;
-    let w = op
+    let mut w = op
         .writer_with(key)
-        .chunk(PART_SIZE)
         .concurrent(1)
         .await
         .with_context(|| format!("open writer {key}"))?;
-    let mut aw = w.into_futures_async_write().compat_write();
-    tokio::io::copy(&mut body, &mut aw)
-        .await
-        .with_context(|| format!("stream body {key}"))?;
-    aw.shutdown()
+    loop {
+        // Permit gates allocation of each part buffer; held over fill + handoff
+        let permit = part_permits()
+            .acquire()
+            .await
+            .map_err(|e| anyhow!("part permit pool closed: {e}"))?;
+        let mut buf = BytesMut::with_capacity(PART_SIZE);
+        while buf.len() < PART_SIZE {
+            let n = body
+                .read_buf(&mut buf)
+                .await
+                .with_context(|| format!("read body {key}"))?;
+            if n == 0 {
+                break;
+            }
+        }
+        if buf.is_empty() {
+            break;
+        }
+        // Short read => source EOF; full read => possibly more parts
+        let full = buf.len() == PART_SIZE;
+        w.write(buf.freeze())
+            .await
+            .with_context(|| format!("stream part {key}"))?;
+        drop(permit);
+        if !full {
+            break;
+        }
+    }
+    w.close()
         .await
         .with_context(|| format!("finalize {key}"))?;
     Ok(())
@@ -289,5 +314,46 @@ impl ObjExt for Operator {
     }
     fn describe(&self) -> String {
         describe(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn roundtrip(len: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let op = fs_operator(dir.path());
+        let data = pattern(len);
+        let body: AsyncReader = Box::pin(std::io::Cursor::new(data.clone()));
+        put_reader(&op, "obj", body, Some(len as u64))
+            .await
+            .unwrap();
+        let mut r = get_reader(&op, "obj").await.unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got.len(), len, "length mismatch for len={len}");
+        assert_eq!(got, data, "content mismatch for len={len}");
+    }
+
+    #[tokio::test]
+    async fn put_reader_roundtrips_across_part_boundaries() {
+        // empty (close-only), small (single part), exact one part, and bodies
+        // spanning the multi-part loop including an exact-multiple boundary
+        for len in [
+            0,
+            1024,
+            PART_SIZE,
+            PART_SIZE + 4096,
+            PART_SIZE * 2,
+            PART_SIZE * 2 + 7,
+        ] {
+            roundtrip(len).await;
+        }
     }
 }
