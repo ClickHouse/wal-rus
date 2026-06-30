@@ -39,7 +39,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 crc32c = "0.6"
 roaring = "0.11"
 aws-lc-rs = "1"
-quick-xml = "0.40"
+quick-xml = "0.41"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 astral-tokio-tar = "0.6"
 postgres-protocol = "0.6"
