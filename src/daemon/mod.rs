@@ -70,8 +70,11 @@ pub async fn serve(
     });
 
     spawn_sigusr1_listener();
-    systemd::notify("READY=1");
-    systemd::spawn_watchdog();
+    #[cfg(target_os = "linux")]
+    {
+        systemd::notify("READY=1");
+        systemd::spawn_watchdog();
+    }
 
     loop {
         let (stream, _) = listener.accept().await?;

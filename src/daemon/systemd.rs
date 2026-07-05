@@ -5,6 +5,8 @@
 //! no-ops when walrus is not run under systemd. Mirrors wal-g's
 //! SendSdNotify, sized down to readiness + watchdog keep-alive
 
+#![cfg(target_os = "linux")]
+
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::time::Duration;
