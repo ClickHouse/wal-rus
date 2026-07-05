@@ -36,7 +36,10 @@ jobs:
         working-directory: bench/tools
 
   test:
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
