@@ -78,7 +78,6 @@ which accepts more connection variables:
 - `PGSERVICEFILE`
 - `PGSSLPASSWORD`
 - `PGOPTIONS`
-- `PGAPPNAME`
 - `PGCONNECT_TIMEOUT`
 - `PGTARGETSESSIONATTRS`
 - `PGTZ`

@@ -1,0 +1,5 @@
+# Keep the build context small/clean for docker/wal-receive/Dockerfile.
+target/
+.git/
+# the operator's gitignored kubebuilder envtest binaries
+docker/wal-receive/operator/bin/

@@ -135,6 +135,14 @@ pub enum Cmd {
         /// segment is shipped via the regular wal-push pipeline
         archive_dir: PathBuf,
     },
+    /// Long-running durable synchronous-standby receiver: streams WAL, fsyncs +
+    /// retains segments locally, and acks as an ANY-1 sync quorum member (the
+    /// Ubicloud sync_pair receiver). Runs the control plane (poller / janitor /
+    /// mTLS API) alongside the synchronous receive hot path.
+    SyncStandby {
+        /// Directory used to assemble + retain segments (the partials dir)
+        archive_dir: PathBuf,
+    },
     /// List backups under basebackups_005/
     BackupList {
         /// Print summaries as JSON instead of a table
@@ -505,6 +513,13 @@ impl Cli {
                 let cfg = PgConfig::resolve(&vars)?;
                 let slot_name = wal::receive::slot_name(&vars)?;
                 wal::receive::handle(&s, storage, &archive_dir, cfg, slot_name).await
+            }
+            Cmd::SyncStandby { archive_dir } => {
+                let s = Settings::resolve(&vars, config_path.clone())?;
+                let storage = s.build_storage()?;
+                let cfg = PgConfig::resolve(&vars)?;
+                let slot_name = wal::receive::slot_name(&vars)?;
+                crate::pg::sync_replica::run(&s, storage, &archive_dir, cfg, slot_name).await
             }
             Cmd::BackupList { json } => {
                 let s = Settings::resolve(&vars, config_path.clone())?;

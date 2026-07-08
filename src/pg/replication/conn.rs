@@ -45,6 +45,8 @@ impl PgConfig {
             .ok_or_else(|| anyhow!("PGUSER not set"))?;
         let password = vars.get("PGPASSWORD");
         let database = vars.get("PGDATABASE").unwrap_or_else(|| user.clone());
+        let application_name =
+            resolve_application_name(vars.get("WALG_APPLICATION_NAME"), vars.get("PGAPPNAME"));
         let sslmode = match vars.get("PGSSLMODE") {
             None => SslMode::Prefer,
             Some(s) => SslMode::parse(&s)?,
@@ -56,11 +58,23 @@ impl PgConfig {
             user,
             password,
             database,
-            application_name: "walrus".into(),
+            application_name,
             sslmode,
             tls,
         })
     }
+}
+
+/// Resolve the replication `application_name`: `WALG_APPLICATION_NAME`, else the
+/// libpq-standard `PGAPPNAME`, else `walrus`. It is load-bearing for synchronous
+/// replication — PG matches it against `synchronous_standby_names`, so a sync
+/// standby must announce the exact name the primary expects (e.g. `<ubid>_receiver`)
+fn resolve_application_name(walg: Option<String>, pgappname: Option<String>) -> String {
+    [walg, pgappname]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| "walrus".into())
 }
 
 pub struct ReplicationConn {
@@ -107,6 +121,13 @@ impl ReplicationConn {
             let raw = TcpStream::connect(&addr)
                 .await
                 .with_context(|| format!("connect to {addr}"))?;
+            // Disable Nagle: as a synchronous standby every commit blocks on our
+            // small (~34 byte) status ack, and Nagle would buffer it (up to its
+            // delay) — collapsing sole-acker latency/throughput. PG's own
+            // walreceiver sets TCP_NODELAY for the same reason.
+            if let Err(e) = raw.set_nodelay(true) {
+                tracing::warn!(%addr, "set TCP_NODELAY failed: {e}");
+            }
             let (sock, used_tls) = maybe_upgrade(raw, &cfg.host, cfg.sslmode, &cfg.tls)
                 .await
                 .with_context(|| format!("tls negotiation against {addr}"))?;
@@ -435,6 +456,30 @@ impl ReplicationConn {
     }
 }
 
+/// `wal_segment_size` from `pg_settings`. PG 10 and below report it in 8 KiB
+/// blocks; PG 11+ in bytes (wal-g GetWalSegmentBytes). Runs on a non-replication
+/// side connection (replication mode forbids the query). Shared by both receivers.
+pub(crate) async fn query_wal_segment_size(q: &mut ReplicationConn) -> Result<u64> {
+    let rows = q
+        .query_rows("SELECT setting FROM pg_settings WHERE name = 'wal_segment_size'")
+        .await?;
+    let raw = rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|c| c.as_deref())
+        .ok_or_else(|| anyhow!("server did not report wal_segment_size"))?;
+    let mut bytes: u64 = raw
+        .parse()
+        .with_context(|| format!("wal_segment_size={raw}"))?;
+    if q.server_pg_version() < 110000 {
+        bytes = bytes.saturating_mul(8192);
+    }
+    if bytes == 0 || !bytes.is_power_of_two() {
+        bail!("server wal_segment_size={bytes} is not a power of two");
+    }
+    Ok(bytes)
+}
+
 pub fn error_message(body: &postgres_protocol::message::backend::ErrorResponseBody) -> String {
     use fallible_iterator::FallibleIterator as _;
     let mut fields = body.fields();
@@ -571,6 +616,18 @@ mod tests {
         assert_eq!(parse_server_version("18"), Some(180000));
         assert_eq!(parse_server_version("17beta1"), Some(170000));
         assert_eq!(parse_server_version("9.6.24"), Some(90624));
+    }
+
+    #[test]
+    fn application_name_precedence() {
+        let s = |x: &str| Some(x.to_string());
+        // WALG_APPLICATION_NAME wins, then PGAPPNAME, then the default
+        assert_eq!(resolve_application_name(s("recv"), s("pg")), "recv");
+        assert_eq!(resolve_application_name(None, s("pg")), "pg");
+        assert_eq!(resolve_application_name(None, None), "walrus");
+        // empty values are skipped, not treated as a set name
+        assert_eq!(resolve_application_name(s(""), s("pg")), "pg");
+        assert_eq!(resolve_application_name(s(""), None), "walrus");
     }
 
     #[test]

@@ -1,0 +1,346 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: walreceivers.walg.io
+spec:
+  group: walg.io
+  names:
+    kind: WalReceiver
+    listKind: WalReceiverList
+    plural: walreceivers
+    singular: walreceiver
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.primary.host
+      name: Primary
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: WalReceiver is the Schema for the walreceivers API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: WalReceiverSpec is the desired state of one per-tenant receiver.
+            properties:
+              control:
+                description: |-
+                  Control configures the receiver's control HTTP/mTLS API for
+                  control-plane-orchestrated failover (Option B).
+                properties:
+                  disabled:
+                    description: |-
+                      Disabled turns the control API + its LoadBalancer off (the receiver then
+                      falls back to the autonomous push-on-primary-loss). Default false.
+                    type: boolean
+                  drDeliveryS3:
+                    description: |-
+                      DRDeliveryS3 makes /v1/dr-catchup upload the retained tail to the S3
+                      DR-tail prefix (WALG_WAL_RECEIVE_DR_S3) instead of pushing it to the
+                      standby. Flag-gated alternative to the direct push; default false.
+                      See doc/walg-receiver-s3-dr-delivery.md.
+                    type: boolean
+                  port:
+                    default: 8444
+                    description: Port the receiver's control server listens on.
+                    format: int32
+                    type: integer
+                type: object
+              credentialsSecretRef:
+                description: |-
+                  CredentialsSecretRef names the externally-managed Secret holding the
+                  receiver's mTLS material (client.crt/client.key/server-ca.crt and the
+                  Option B control-server cert/key + client-ca.crt).
+                  The operator MOUNTS it; it never creates or mutates it.
+                type: string
+              image:
+                description: Image is the wal-receive image. Operator fills a default
+                  if empty.
+                type: string
+              imagePullPolicy:
+                default: IfNotPresent
+                description: ImagePullPolicy for the receiver container.
+                type: string
+              initChownImage:
+                description: |-
+                  InitChownImage is the tiny image used by the partials-dir chown
+                  initContainer (needs only a shell + chown). Operator defaults it to
+                  a busybox image if empty.
+                type: string
+              placement:
+                description: Placement controls where the receiver pod is scheduled.
+                properties:
+                  zone:
+                    description: |-
+                      Zone pins the pod to a topology.kubernetes.io/zone (AWS AZ),
+                      e.g. "us-west-2b". Empty = scheduler chooses any NVMe node.
+                    type: string
+                type: object
+              postgresUbid:
+                description: |-
+                  PostgresUbid is the Ubicloud Postgres resource UBID. It pins
+                  every derived object name: walg-recv-<ubid>, ...-config, etc.
+                pattern: ^[a-z0-9]{26}$
+                type: string
+              primary:
+                description: PrimarySpec describes the primary the receiver streams
+                  from.
+                properties:
+                  applicationName:
+                    default: walg_sync
+                    type: string
+                  host:
+                    type: string
+                  port:
+                    default: 5432
+                    format: int32
+                    type: integer
+                  slotName:
+                    description: SlotName is the physical replication slot the receiver
+                      attaches to, e.g. "walg_sync".
+                    type: string
+                  user:
+                    description: User, e.g. "ubi_replication".
+                    type: string
+                required:
+                - host
+                - slotName
+                - user
+                type: object
+              primaryTier:
+                description: |-
+                  PrimaryTier is informational — the primary's instance size. Sizing no
+                  longer depends on it (flat default envelope), so any value is accepted
+                  (the old m8gd-only Enum hard-failed i8g/other families at admission).
+                type: string
+              resourcesOverride:
+                description: ResourcesOverride is an escape hatch that wins over the
+                  tier table.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This is an alpha field and requires enabling the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              s3:
+                description: |-
+                  S3 gives the receiver object-storage access so the S3 DR-tail delivery
+                  (control.drDeliveryS3) can upload the failover tail to the tenant bucket.
+                  Only needed when drDeliveryS3 is set. The access key id/secret are read
+                  from the credentials Secret (keys aws-access-key-id / aws-secret-access-key).
+                  PoC: static per-timeline keys; see doc/walg-receiver-s3-dr-delivery.md.
+                properties:
+                  endpoint:
+                    description: Endpoint, e.g. https://s3.us-west-2.amazonaws.com.
+                    type: string
+                  forcePathStyle:
+                    description: ForcePathStyle sets AWS_S3_FORCE_PATH_STYLE.
+                    type: boolean
+                  prefix:
+                    description: |-
+                      Prefix is the tenant WAL prefix, e.g. s3://<timeline-ubid>. The dr-tail
+                      objects go under <prefix>/dr-tail/wal_<v>/.
+                    type: string
+                  region:
+                    description: Region, e.g. us-west-2.
+                    type: string
+                type: object
+              storage:
+                description: Storage selects where the WAL partial dir lives (§5.3).
+                properties:
+                  hostPathBase:
+                    default: /mnt/nvme/walg-partials
+                    description: HostPathBase is the node mount for hostPathNVMe mode.
+                    type: string
+                  mode:
+                    default: hostPathNVMe
+                    description: 'Mode: "hostPathNVMe" (PoC EKS, /mnt/nvme), "emptyDir",
+                      or "pvc".'
+                    enum:
+                    - hostPathNVMe
+                    - emptyDir
+                    - pvc
+                    type: string
+                  sizeLimit:
+                    default: 20Gi
+                    type: string
+                type: object
+              tenantName:
+                description: TenantName is human-readable; used in logs and push labels.
+                type: string
+            required:
+            - credentialsSecretRef
+            - postgresUbid
+            - primary
+            - primaryTier
+            - tenantName
+            type: object
+          status:
+            description: WalReceiverStatus is the observed state.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              controlEndpoint:
+                description: |-
+                  ControlEndpoint is the reachable "host:port" of the receiver's control API
+                  (the LoadBalancer address), for the control plane to call. Empty until the
+                  LoadBalancer has an address.
+                type: string
+              lastFsyncLSN:
+                description: LastFsyncLSN, populated if the pod exposes it; best-effort.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration lets us tell a stale status from a
+                  fresh one.
+                format: int64
+                type: integer
+              phase:
+                enum:
+                - Pending
+                - Reconciling
+                - Running
+                - Degraded
+                - Terminating
+                type: string
+              podName:
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

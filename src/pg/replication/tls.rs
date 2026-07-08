@@ -156,6 +156,109 @@ pub async fn maybe_upgrade(
     }
 }
 
+/// Negotiate TLS on a freshly-opened BLOCKING replication socket, the sync
+/// sibling of [`maybe_upgrade`]. Sends the SSLRequest, reads the one-byte
+/// 'S'/'N' reply, and on 'S' wraps the std `TcpStream` in a sync
+/// `rustls::StreamOwned`. Reuses [`build_client_config`] (rustls is
+/// runtime-agnostic), so mTLS / verify modes behave identically to the async
+/// path. Returns the (possibly-upgraded) stream and whether TLS was applied.
+pub(crate) fn maybe_upgrade_sync(
+    mut socket: std::net::TcpStream,
+    host: &str,
+    sslmode: SslMode,
+    tls_params: &TlsParams,
+) -> Result<(SyncStream, bool)> {
+    use std::io::{Read, Write};
+
+    if !sslmode.attempts_tls() {
+        return Ok((SyncStream::Plain(socket), false));
+    }
+    // SSLRequest: i32 BE length=8, i32 BE code=80877103
+    let mut req = [0u8; 8];
+    req[0..4].copy_from_slice(&8i32.to_be_bytes());
+    req[4..8].copy_from_slice(&80877103i32.to_be_bytes());
+    socket.write_all(&req).context("send SSLRequest")?;
+
+    let mut resp = [0u8; 1];
+    socket
+        .read_exact(&mut resp)
+        .context("read SSLRequest reply")?;
+
+    match resp[0] {
+        b'S' => {
+            let config = build_client_config(sslmode, tls_params)?;
+            let server_name = ServerName::try_from(host.to_string())
+                .map_err(|e| anyhow!("invalid host for SNI: {e}"))?
+                .to_owned();
+            let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+                .map_err(|e| anyhow!("rustls client connection: {e}"))?;
+            let tls = rustls::StreamOwned::new(conn, socket);
+            Ok((SyncStream::Tls(Box::new(tls)), true))
+        }
+        b'N' => {
+            if sslmode.requires_tls() {
+                bail!("server refused SSL (sslmode={:?})", sslmode);
+            }
+            Ok((SyncStream::Plain(socket), false))
+        }
+        other => bail!("unexpected SSLRequest reply byte {other:#x} (expected 'S' or 'N')"),
+    }
+}
+
+/// A blocking replication transport: either a plain std `TcpStream` or one
+/// wrapped in a sync rustls session. Implements `Read`/`Write` so the sync
+/// connection can frame messages over it without knowing which it holds.
+pub(crate) enum SyncStream {
+    Plain(std::net::TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>),
+}
+
+impl SyncStream {
+    /// The underlying std `TcpStream`, for `set_read_timeout` / `set_nodelay`.
+    fn tcp(&self) -> &std::net::TcpStream {
+        match self {
+            SyncStream::Plain(s) => s,
+            SyncStream::Tls(s) => s.get_ref(),
+        }
+    }
+
+    /// Bound a blocking read so a quiet stream still wakes to send keepalives
+    /// and poll the shutdown / retarget signals.
+    pub(crate) fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.tcp().set_read_timeout(dur)
+    }
+
+    /// Disable Nagle: as a sync standby every commit blocks on our small status
+    /// ack, so it must not be buffered. Mirrors PG's own walreceiver.
+    pub(crate) fn set_nodelay(&self, on: bool) -> std::io::Result<()> {
+        self.tcp().set_nodelay(on)
+    }
+}
+
+impl std::io::Read for SyncStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SyncStream::Plain(s) => s.read(buf),
+            SyncStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for SyncStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SyncStream::Plain(s) => s.write(buf),
+            SyncStream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SyncStream::Plain(s) => s.flush(),
+            SyncStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
 fn build_client_config(sslmode: SslMode, tls: &TlsParams) -> Result<ClientConfig> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -228,7 +331,7 @@ fn load_client_auth(
     }
 }
 
-fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
     let certs = rustls_pemfile::certs(&mut reader)
@@ -240,7 +343,7 @@ fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+pub(crate) fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
     // private_key reads the first PKCS#8 / PKCS#1 / SEC1 block; encrypted keys
@@ -250,7 +353,7 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| anyhow!("no private key found in {path} (encrypted keys unsupported)"))
 }
 
-fn load_pem_roots(path: &str, roots: &mut RootCertStore) -> Result<()> {
+pub(crate) fn load_pem_roots(path: &str, roots: &mut RootCertStore) -> Result<()> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
     let mut added = 0usize;

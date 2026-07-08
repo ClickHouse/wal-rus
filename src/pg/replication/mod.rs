@@ -8,6 +8,7 @@ pub mod base_backup;
 pub mod conn;
 pub mod server;
 pub mod stream;
+pub mod sync_conn;
 pub mod tls;
 
 pub use base_backup::{ArchiveMeta, BackupEvent, BaseBackupOpts, run_base_backup};

@@ -207,6 +207,26 @@ impl Settings {
         Self::build_storage_for(&dst, self.retry)
     }
 
+    /// Build the DR-tail S3 storage from `WALG_S3_PREFIX` (+ AWS env), independent
+    /// of the receiver's primary storage. In sync-standby/skip-upload mode that
+    /// primary is the local file prefix (`WALG_FILE_PREFIX`), so the dr-tail lane
+    /// needs its own S3 handle. `Ok(None)` when `WALG_S3_PREFIX` is unset/empty.
+    pub fn build_dr_s3_storage(&self) -> Result<Option<DynStorage>> {
+        // env-only Vars: the DR-tail S3 config comes from WALG_S3_PREFIX + AWS_*
+        let vars = Vars::default();
+        let s3_prefix = match vars.get("WALG_S3_PREFIX") {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(None),
+        };
+        let rest = s3_prefix
+            .strip_prefix("s3://")
+            .ok_or_else(|| anyhow!("WALG_S3_PREFIX must be an s3:// URI, got {s3_prefix:?}"))?;
+        let (bucket, prefix) = split_bucket_prefix(rest);
+        let cfg = s3_config(&vars, bucket, prefix, None)?;
+        let storage = Self::build_storage_for(&StorageSettings::S3(cfg), self.retry)?;
+        Ok(Some(storage))
+    }
+
     fn build_storage_for(s: &StorageSettings, policy: RetryPolicy) -> Result<DynStorage> {
         match s {
             StorageSettings::Fs { path } => {
@@ -489,6 +509,25 @@ pub fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
         return Err(format!("invalid duration {s:?}"));
     }
     Ok(total)
+}
+
+/// Read a Go-style duration env var, falling back to `default` when unset
+pub fn duration_env(key: &str, default: Duration) -> Result<Duration> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(v) => parse_duration(&v).map_err(|e| anyhow!("{key}: {e}")),
+    }
+}
+
+pub(crate) fn parse_env_bool(key: &str, default: bool) -> Result<bool> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => bail!("parse {key}={v} as bool"),
+        },
+    }
 }
 
 #[cfg(test)]
