@@ -156,7 +156,7 @@ pub async fn maybe_upgrade(
     }
 }
 
-fn build_client_config(sslmode: SslMode, tls: &TlsParams) -> Result<ClientConfig> {
+pub fn build_client_config(sslmode: SslMode, tls: &TlsParams) -> Result<ClientConfig> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
