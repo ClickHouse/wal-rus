@@ -107,6 +107,16 @@ impl From<reqwest::Error> for StorageError {
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// Outcome of a create-if-absent PUT ([`Storage::put_if_absent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutIfAbsentOutcome {
+    /// No object existed at the key; the body was written.
+    Created,
+    /// An object already existed; nothing was written — a benign skip. The
+    /// existing object is authoritative and is never overwritten.
+    AlreadyExists,
+}
+
 /// Object storage backend
 ///
 /// Implementations stream uploads & downloads, no full-segment buffering
@@ -117,6 +127,24 @@ pub trait Storage: Send + Sync {
 
     /// Upload object. `size_hint` lets s3 backend pick single-PUT vs multipart
     async fn put(&self, key: &str, body: AsyncReader, size_hint: Option<u64>) -> Result<()>;
+
+    /// Upload `body` only if no object exists at `key`, via a backend-native
+    /// atomic create-if-absent write (S3 `If-None-Match: *`, GCS
+    /// `ifGenerationMatch=0`, fs `O_EXCL`). Returns [`PutIfAbsentOutcome::Created`]
+    /// on a fresh write and [`PutIfAbsentOutcome::AlreadyExists`] when the object
+    /// is already present (a benign skip — the existing object is never
+    /// overwritten). Backends without conditional-write support return
+    /// `Err(StorageError::Unimplemented(_))` so callers can fall back to a plain
+    /// [`Storage::put`]. `size_hint`, when known, sizes the buffer.
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        body: AsyncReader,
+        size_hint: Option<u64>,
+    ) -> Result<PutIfAbsentOutcome> {
+        let _ = (key, body, size_hint);
+        Err(StorageError::Unimplemented("put_if_absent"))
+    }
 
     /// Download object as streaming reader
     async fn get(&self, key: &str) -> Result<AsyncReader>;

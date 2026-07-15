@@ -10,7 +10,9 @@ use std::io::Cursor;
 
 use crate::retry::{RetryPolicy, with_retry};
 
-use super::{AsyncReader, CopySource, ObjectStream, Result, Storage, StorageError};
+use super::{
+    AsyncReader, CopySource, ObjectStream, PutIfAbsentOutcome, Result, Storage, StorageError,
+};
 
 /// Buffer-then-retry threshold for put bodies (matches wal-g's small-object
 /// path: sentinels, history files, manifest fragments)
@@ -49,6 +51,31 @@ impl<S: Storage + 'static> Storage for RetryingStorage<S> {
             async move {
                 let reader: AsyncReader = Box::pin(Cursor::new(bytes));
                 self.inner.put(key, reader, Some(len)).await
+            }
+        })
+        .await
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        mut body: AsyncReader,
+        size_hint: Option<u64>,
+    ) -> Result<PutIfAbsentOutcome> {
+        // Only retry small known-size bodies;
+        let bufferable = matches!(size_hint, Some(s) if s <= PUT_RETRY_BUFFER_THRESHOLD);
+        if !bufferable {
+            return self.inner.put_if_absent(key, body, size_hint).await;
+        }
+        let mut buf = Vec::with_capacity(size_hint.unwrap_or(0) as usize);
+        tokio::io::copy(&mut body, &mut buf).await?;
+        let bytes = Bytes::from(buf);
+        let len = bytes.len() as u64;
+        with_retry(&self.policy, StorageError::is_transient, || {
+            let bytes = bytes.clone();
+            async move {
+                let reader: AsyncReader = Box::pin(Cursor::new(bytes));
+                self.inner.put_if_absent(key, reader, Some(len)).await
             }
         })
         .await
@@ -113,12 +140,20 @@ mod tests {
         put_bodies: Mutex<Vec<Vec<u8>>>,
         get_script: Mutex<Vec<StubResult>>,
         put_script: Mutex<Vec<StubResult>>,
+        put_if_absent_calls: AtomicU32,
+        put_if_absent_script: Mutex<Vec<StubIfAbsent>>,
     }
 
     enum StubResult {
         TransientHttp,
         PermanentNotFound,
         Ok,
+    }
+
+    enum StubIfAbsent {
+        Transient,
+        Created,
+        AlreadyExists,
     }
 
     impl StubStorage {
@@ -129,6 +164,8 @@ mod tests {
                 put_bodies: Mutex::new(Vec::new()),
                 get_script: Mutex::new(Vec::new()),
                 put_script: Mutex::new(Vec::new()),
+                put_if_absent_calls: AtomicU32::new(0),
+                put_if_absent_script: Mutex::new(Vec::new()),
             }
         }
     }
@@ -180,6 +217,25 @@ mod tests {
         }
         async fn delete(&self, _key: &str) -> Result<()> {
             Ok(())
+        }
+        async fn put_if_absent(
+            &self,
+            _key: &str,
+            mut body: AsyncReader,
+            _size_hint: Option<u64>,
+        ) -> Result<PutIfAbsentOutcome> {
+            self.put_if_absent_calls.fetch_add(1, Ordering::SeqCst);
+            let mut buf = Vec::new();
+            body.read_to_end(&mut buf).await?;
+            self.put_bodies.lock().unwrap().push(buf);
+            match self.put_if_absent_script.lock().unwrap().remove(0) {
+                StubIfAbsent::Transient => Err(StorageError::Http {
+                    status: 503,
+                    body: "stub down".into(),
+                }),
+                StubIfAbsent::Created => Ok(PutIfAbsentOutcome::Created),
+                StubIfAbsent::AlreadyExists => Ok(PutIfAbsentOutcome::AlreadyExists),
+            }
         }
     }
 
@@ -274,5 +330,54 @@ mod tests {
         let r = retry.put("k", body, None).await;
         assert!(matches!(r, Err(StorageError::Http { status: 503, .. })));
         assert_eq!(retry.inner.put_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_retries_transient_then_returns_already_exists() {
+        let stub = StubStorage::new();
+        stub.put_if_absent_script.lock().unwrap().extend([
+            StubIfAbsent::Transient,
+            StubIfAbsent::Transient,
+            StubIfAbsent::AlreadyExists,
+        ]);
+        let retry = RetryingStorage::new(stub, fast_policy());
+        let body: AsyncReader = Box::pin(Cursor::new(b"seg".to_vec()));
+        let outcome = retry.put_if_absent("k", body, Some(3)).await.unwrap();
+        // AlreadyExists on a retry counts as success (object exists), not an error.
+        assert!(matches!(outcome, PutIfAbsentOutcome::AlreadyExists));
+        assert_eq!(retry.inner.put_if_absent_calls.load(Ordering::SeqCst), 3);
+        // body replayed byte-identically across attempts
+        let bodies = retry.inner.put_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies.iter().all(|b| b == b"seg"));
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_retries_transient_then_created() {
+        let stub = StubStorage::new();
+        stub.put_if_absent_script
+            .lock()
+            .unwrap()
+            .extend([StubIfAbsent::Transient, StubIfAbsent::Created]);
+        let retry = RetryingStorage::new(stub, fast_policy());
+        let body: AsyncReader = Box::pin(Cursor::new(b"seg".to_vec()));
+        let outcome = retry.put_if_absent("k", body, Some(3)).await.unwrap();
+        assert!(matches!(outcome, PutIfAbsentOutcome::Created));
+        assert_eq!(retry.inner.put_if_absent_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_bypasses_retry_when_size_unknown() {
+        let stub = StubStorage::new();
+        stub.put_if_absent_script
+            .lock()
+            .unwrap()
+            .push(StubIfAbsent::Transient);
+        let retry = RetryingStorage::new(stub, fast_policy());
+        // size_hint = None → not bufferable → single pass-through attempt (mirrors put).
+        let body: AsyncReader = Box::pin(Cursor::new(b"seg".to_vec()));
+        let r = retry.put_if_absent("k", body, None).await;
+        assert!(matches!(r, Err(StorageError::Http { status: 503, .. })));
+        assert_eq!(retry.inner.put_if_absent_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -22,7 +22,10 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-use super::{AsyncReader, CopySource, ObjectMeta, ObjectStream, Result, Storage, StorageError};
+use super::{
+    AsyncReader, CopySource, ObjectMeta, ObjectStream, PutIfAbsentOutcome, Result, Storage,
+    StorageError,
+};
 
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const STORAGE_HOST: &str = "https://storage.googleapis.com";
@@ -246,6 +249,47 @@ impl Storage for GcsStorage {
             });
         }
         Ok(())
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        body: AsyncReader,
+        _size_hint: Option<u64>,
+    ) -> Result<PutIfAbsentOutcome> {
+        let token = self.access_token().await?;
+        let full = self.full_key(key);
+        // ifGenerationMatch=0 makes the upload a create-if-absent: it succeeds
+        // only when no live object exists, and returns 412 otherwise.
+        let url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&ifGenerationMatch=0&name={}",
+            self.host,
+            self.cfg.bucket,
+            utf8_percent_encode(&full, NON_ALPHANUMERIC),
+        );
+        let stream = ReaderStream::new(body);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(token)
+            .header("content-type", "application/octet-stream")
+            .body(Body::wrap_stream(stream))
+            .send()
+            .await?;
+        let st = resp.status();
+        if st.is_success() {
+            Ok(PutIfAbsentOutcome::Created)
+        } else if st == reqwest::StatusCode::PRECONDITION_FAILED
+            || st == reqwest::StatusCode::CONFLICT
+        {
+            Ok(PutIfAbsentOutcome::AlreadyExists)
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(StorageError::Http {
+                status: st.as_u16(),
+                body: format!("gcs put_if_absent: {body}"),
+            })
+        }
     }
 
     async fn get(&self, key: &str) -> Result<AsyncReader> {

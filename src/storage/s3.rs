@@ -27,7 +27,10 @@ use tokio_util::io::StreamReader;
 use url::Url;
 
 pub use super::creds::{CredentialSource, Credentials, ImdsProvider};
-use super::{AsyncReader, CopySource, ObjectMeta, ObjectStream, Result, Storage, StorageError};
+use super::{
+    AsyncReader, CopySource, ObjectMeta, ObjectStream, PutIfAbsentOutcome, Result, Storage,
+    StorageError,
+};
 use crate::retry::{RetryPolicy, with_retry};
 
 const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
@@ -212,6 +215,27 @@ impl S3Storage {
             async move { self.put_single(key, body).await }
         })
         .await
+    }
+
+    /// One conditional (create-if-absent) PUT of an already-buffered body.
+    async fn put_if_absent_once(&self, key: &str, body: Bytes) -> Result<PutIfAbsentOutcome> {
+        let resp = self
+            .signed_request(
+                "PUT",
+                &self.full_key(key),
+                &[],
+                body,
+                &[("if-none-match", "*")],
+            )
+            .await?;
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::PRECONDITION_FAILED | reqwest::StatusCode::CONFLICT
+        ) {
+            return Ok(PutIfAbsentOutcome::AlreadyExists);
+        }
+        check_status(resp).await?;
+        Ok(PutIfAbsentOutcome::Created)
     }
 
     /// PUT one already-buffered part, retrying transients in place (the buffer
@@ -425,6 +449,33 @@ impl Storage for S3Storage {
                 }
             }
         }
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        mut body: AsyncReader,
+        size_hint: Option<u64>,
+    ) -> Result<PutIfAbsentOutcome> {
+        // A conditional PUT needs a rewindable body and bypasses the multipart
+        // manager, so buffer it. WAL segments compress well under the multipart
+        // threshold; a body over it is rejected rather than silently split (a
+        // multipart create-if-absent write is not atomic).
+        let mut buf = Vec::with_capacity(size_hint.unwrap_or(0) as usize);
+        body.read_to_end(&mut buf).await?;
+        if buf.len() as u64 > MULTIPART_THRESHOLD {
+            return Err(StorageError::Config(format!(
+                "put_if_absent body {} B exceeds single-PUT limit {} B",
+                buf.len(),
+                MULTIPART_THRESHOLD
+            )));
+        }
+        let body = Bytes::from(buf);
+        with_retry(&self.retry_policy, StorageError::is_transient, || {
+            let body = body.clone();
+            async move { self.put_if_absent_once(key, body).await }
+        })
+        .await
     }
 
     async fn get(&self, key: &str) -> Result<AsyncReader> {
@@ -1271,6 +1322,142 @@ mod tests {
             .await;
         assert!(matches!(err, Err(StorageError::Http { status: 503, .. })));
         assert!(uploads.lock().unwrap().is_empty(), "abort must clean up");
+    }
+
+    /// Conditional (create-if-absent) PUT roundtrip against the in-process mock.
+    /// The mock tracks presence and rejects a second write of the same key with
+    /// 412, asserting the two mappings: fresh key → Created, existing key →
+    /// AlreadyExists (never an overwrite). Also checks the `If-None-Match: *`
+    /// header actually reaches the wire.
+    #[tokio::test]
+    async fn s3_put_if_absent_maps_created_and_already_exists() {
+        use crate::storage::test_http::{Req, Resp, reader, serve};
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        let present: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+        let saw_header = Arc::new(Mutex::new(false));
+        let (p, sh) = (present.clone(), saw_header.clone());
+        let base = serve(move |req: &Req| {
+            let rest = req.path.trim_start_matches('/');
+            let key = rest
+                .split_once('/')
+                .map(|(_, k)| k)
+                .unwrap_or("")
+                .to_string();
+            match req.method.as_str() {
+                "PUT" => {
+                    if req.headers.get("if-none-match").map(String::as_str) == Some("*") {
+                        *sh.lock().unwrap() = true;
+                    }
+                    let mut set = p.lock().unwrap();
+                    if set.contains(&key) {
+                        // create-if-absent rejected: object already present
+                        Resp::new(412)
+                            .body(b"<Error><Code>PreconditionFailed</Code></Error>".to_vec())
+                    } else {
+                        set.insert(key);
+                        Resp::new(200)
+                    }
+                }
+                _ => Resp::new(400),
+            }
+        })
+        .await;
+
+        let cfg = S3Config {
+            bucket: "bkt".into(),
+            prefix: "p".into(),
+            region: "us-east-1".into(),
+            creds: CredentialSource::Static(Credentials {
+                access_key: "AKID".into(),
+                secret_key: "sek".into(),
+                session_token: None,
+                expires_at: None,
+            }),
+            endpoint: Some(base),
+            force_path_style: true,
+        };
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
+        };
+        let s = S3Storage::with_retry_policy(cfg, policy).unwrap();
+
+        // absent key → written, reported Created
+        assert_eq!(
+            s.put_if_absent("wal_005/x.lz4", reader(b"hello"), Some(5))
+                .await
+                .unwrap(),
+            PutIfAbsentOutcome::Created
+        );
+        assert!(*saw_header.lock().unwrap(), "If-None-Match: * must be sent");
+        // same key again → server 412, reported AlreadyExists (no overwrite)
+        assert_eq!(
+            s.put_if_absent("wal_005/x.lz4", reader(b"world"), Some(5))
+                .await
+                .unwrap(),
+            PutIfAbsentOutcome::AlreadyExists
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_put_if_absent_retries_transient_then_created() {
+        use crate::storage::test_http::{Req, Resp, reader, serve};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // First PUT → transient 503; the retry (in s3's put_if_absent: buffer-once
+        // + with_retry over put_if_absent_once) → 200 Created.
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let base = serve(move |req: &Req| {
+            if req.method == "PUT" {
+                if a.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Resp::new(503).body(b"<Error><Code>SlowDown</Code></Error>".to_vec())
+                } else {
+                    Resp::new(200)
+                }
+            } else {
+                Resp::new(400)
+            }
+        })
+        .await;
+
+        let cfg = S3Config {
+            bucket: "bkt".into(),
+            prefix: "p".into(),
+            region: "us-east-1".into(),
+            creds: CredentialSource::Static(Credentials {
+                access_key: "AKID".into(),
+                secret_key: "sek".into(),
+                session_token: None,
+                expires_at: None,
+            }),
+            endpoint: Some(base),
+            force_path_style: true,
+        };
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
+        };
+        let s = S3Storage::with_retry_policy(cfg, policy).unwrap();
+
+        assert_eq!(
+            s.put_if_absent("wal_005/x.lz4", reader(b"hello"), Some(5))
+                .await
+                .unwrap(),
+            PutIfAbsentOutcome::Created
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one transient retry then success"
+        );
     }
 
     /// Pipelined multipart keeps several part PUTs in flight, so they finish
