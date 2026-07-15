@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use roaring::RoaringBitmap;
 use thiserror::Error;
 
+use crate::pg::parse_hex;
+
 use crate::pg::backup::delta::PagedFileDeltaMap;
 use crate::pg::backup::format_pg_lsn;
 use crate::pg::walparser::RelFileNode;
@@ -159,22 +161,15 @@ pub fn list_summary_files(dir: &Path) -> Result<Vec<SummaryFile>, SummaryError> 
 /// empty; caller fills). Returns `None` if the name doesn't match
 pub fn parse_summary_filename(name: &str) -> Option<SummaryFile> {
     let stem = name.strip_suffix(".summary")?;
-    if stem.len() != 40 {
+    let b = stem.as_bytes();
+    if b.len() != 40 {
         return None;
     }
-    if !stem.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let timeline = u32::from_str_radix(&stem[0..8], 16).ok()?;
-    let start_hi = u32::from_str_radix(&stem[8..16], 16).ok()?;
-    let start_lo = u32::from_str_radix(&stem[16..24], 16).ok()?;
-    let end_hi = u32::from_str_radix(&stem[24..32], 16).ok()?;
-    let end_lo = u32::from_str_radix(&stem[32..40], 16).ok()?;
     Some(SummaryFile {
         path: PathBuf::new(),
-        timeline,
-        start_lsn: ((start_hi as u64) << 32) | (start_lo as u64),
-        end_lsn: ((end_hi as u64) << 32) | (end_lo as u64),
+        timeline: parse_hex(&b[0..8], 8)? as u32,
+        start_lsn: parse_hex(&b[8..24], 16)?,
+        end_lsn: parse_hex(&b[24..40], 16)?,
     })
 }
 
