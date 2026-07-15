@@ -73,19 +73,19 @@ pub enum SegmentError {
 
 impl SegmentName {
     pub fn parse(s: &str) -> Result<Self, SegmentError> {
-        if s.len() != SEGMENT_NAME_LEN {
-            return Err(SegmentError::BadLength(s.len()));
+        let b = s.as_bytes();
+        if b.len() != SEGMENT_NAME_LEN {
+            return Err(SegmentError::BadLength(b.len()));
         }
-        let timeline =
-            u32::from_str_radix(&s[0..8], 16).map_err(|_| SegmentError::NonHex(s.into()))?;
-        let log_id =
-            u32::from_str_radix(&s[8..16], 16).map_err(|_| SegmentError::NonHex(s.into()))?;
-        let seg_no =
-            u32::from_str_radix(&s[16..24], 16).map_err(|_| SegmentError::NonHex(s.into()))?;
+        let field = |i: usize| {
+            crate::pg::parse_hex(&b[i..i + 8], 8)
+                .map(|v| v as u32)
+                .ok_or_else(|| SegmentError::NonHex(s.into()))
+        };
         Ok(SegmentName {
-            timeline,
-            log_id,
-            seg_no,
+            timeline: field(0)?,
+            log_id: field(8)?,
+            seg_no: field(16)?,
         })
     }
 
@@ -160,6 +160,17 @@ mod tests {
             SegmentName::parse("00000001").unwrap_err(),
             SegmentError::BadLength(8)
         ));
+    }
+
+    #[test]
+    fn rejects_sign_and_multibyte() {
+        // from_str_radix would have accepted the '+'
+        assert!(matches!(
+            SegmentName::parse("+00000010000000000000001").unwrap_err(),
+            SegmentError::NonHex(_)
+        ));
+        // 24 bytes with char straddling field boundary: byte slicing must not panic
+        assert!(SegmentName::parse("0000000é000000000000001").is_err());
     }
 
     #[test]

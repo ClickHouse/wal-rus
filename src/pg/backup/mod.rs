@@ -9,6 +9,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::pg::parse_hex;
+
 pub mod copy;
 pub mod delete;
 pub mod delta;
@@ -107,20 +109,17 @@ pub fn format_backup_name(timeline: u32, start_lsn: u64, seg_size: u64) -> Strin
 /// the prefix, is too short, or contains non-hex digits.
 pub fn parse_timeline_from_backup_name(name: &str) -> Option<u32> {
     let rest = name.strip_prefix(BACKUP_NAME_PREFIX)?;
-    if rest.len() < 8 {
-        return None;
-    }
-    u32::from_str_radix(&rest[..8], 16).ok()
+    Some(parse_hex(rest.as_bytes().get(..8)?, 8)? as u32)
 }
 
-/// Parse `0/1A2B3C4D` (postgres pg_lsn text form) into u64
+/// Parse `0/1A2B3C4D` (postgres pg_lsn text form) into u64.
+/// Strict per pg_lsn_in_internal: 1..=8 hex digits per component, no sign
 pub fn parse_pg_lsn(s: &str) -> Result<u64> {
     let s = s.trim();
     let (hi, lo) = s
         .split_once('/')
+        .and_then(|(hi, lo)| parse_hex(hi.as_bytes(), 8).zip(parse_hex(lo.as_bytes(), 8)))
         .ok_or_else(|| anyhow!("bad LSN format: {s}"))?;
-    let hi = u64::from_str_radix(hi, 16).with_context(|| format!("bad LSN hi: {hi}"))?;
-    let lo = u64::from_str_radix(lo, 16).with_context(|| format!("bad LSN lo: {lo}"))?;
     Ok((hi << 32) | lo)
 }
 
@@ -139,13 +138,9 @@ pub fn format_pg_lsn(lsn: u64) -> impl std::fmt::Display {
 
 /// Match `base_<24hex>` and optional `_D_<24hex>` delta and `_<8hex>` LSN
 pub fn looks_like_backup_name(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix(BACKUP_NAME_PREFIX) else {
-        return false;
-    };
-    if rest.len() < 24 {
-        return false;
-    }
-    rest[..24].chars().all(|c| c.is_ascii_hexdigit())
+    s.strip_prefix(BACKUP_NAME_PREFIX)
+        .and_then(|rest| rest.as_bytes().get(..24))
+        .is_some_and(|w| w.iter().all(u8::is_ascii_hexdigit))
 }
 
 /// Strip wal-g sentinel suffix to recover backup name
@@ -564,6 +559,42 @@ mod tests {
         // high word > 10: hex parse must not collapse to decimal
         assert_eq!(parse_pg_lsn("2A/16").unwrap(), (0x2A_u64 << 32) | 0x16);
         assert_eq!(parse_pg_lsn("FF/FF").unwrap(), (0xFF_u64 << 32) | 0xFF);
+    }
+
+    #[test]
+    fn rejects_malformed_lsn() {
+        for s in [
+            "",
+            "1",
+            "/",
+            "1/",
+            "/1",
+            "0x1/0",
+            "+1/0",
+            "1/+0",
+            "-1/0",
+            "000000001/0", // 9 digits, pg caps components at 8
+            "0/000000001",
+            "1FFFFFFFF/0", // hi overflow must not shift into oblivion
+            "0/1FFFFFFFF", // lo overflow must not bleed into hi
+            "1 /0",
+            "0/ 1",
+            "g/0",
+            "1/2/3",
+        ] {
+            assert!(parse_pg_lsn(s).is_err(), "{s:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn backup_name_parsers_reject_sign_and_multibyte() {
+        assert_eq!(parse_timeline_from_backup_name("base_+0000001rest"), None);
+        // char straddling the 8- and 24-byte windows: must not panic
+        assert_eq!(parse_timeline_from_backup_name("base_0000000é0"), None);
+        assert!(!looks_like_backup_name(&format!(
+            "base_{}é",
+            "0".repeat(23)
+        )));
     }
 
     #[test]

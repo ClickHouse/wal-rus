@@ -956,7 +956,7 @@ mod tests {
         let body = parse_one_copy_data(&mut rx).unwrap().unwrap();
         assert_eq!(&body[..], &[1, 2, 3, 4]);
         // control tags surface as protocol errors
-        for tag in [b'c', b'f', b'X', b'q'] {
+        for tag in *b"cfXq" {
             let mut rx = BytesMut::from(&[tag, 0, 0, 0, 4][..]);
             assert!(parse_one_copy_data(&mut rx).is_err(), "tag {}", tag as char);
         }
