@@ -650,7 +650,7 @@ async fn get_start_timeline(
 /// `<tli>\t<switch_lsn>\t<comment>`; a switch to `tli+1` happened at
 /// `switch_lsn`, so the first row whose switch LSN exceeds `lsn` names its
 /// timeline, else the file's own (wal-g LSNToTimeLine)
-fn lsn_to_timeline(content: &[u8], lsn: u64, file_timeline: u32) -> u32 {
+pub fn lsn_to_timeline(content: &[u8], lsn: u64, file_timeline: u32) -> u32 {
     let text = String::from_utf8_lossy(content);
     let mut rows: Vec<(u32, u64)> = Vec::new();
     for line in text.lines() {
