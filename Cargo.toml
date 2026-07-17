@@ -1,6 +1,6 @@
 [package]
 name = "wal-rus"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.90"
 description = "Rust port of wal-g for PostgreSQL, optimized for no-overcommit hosts"
@@ -49,7 +49,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 rustls-pki-types = "1"
 rustls-pemfile = "2"
 webpki-roots = "1"
-dryoc = { version = "0.8", default-features = false, features = ["u64_backend"] }
+dryoc = { version = "0.9", default-features = false, features = ["u64_backend"] }
 libc = "0.2"
 glob = "0.3.3"
 
