@@ -259,11 +259,17 @@ fn storage_from_uri(vars: &Vars, uri: &str, src: &StorageSettings) -> Result<Sto
             _ => None,
         }
         .or_else(|| gcs_endpoint(vars));
+        let metadata_endpoint = match src {
+            StorageSettings::Gcs(c) => c.metadata_endpoint.clone(),
+            _ => None,
+        }
+        .or_else(|| vars.get("GCE_METADATA_HOST"));
         return Ok(StorageSettings::Gcs(gcs::GcsConfig {
             bucket,
             prefix,
             credentials_path,
             endpoint,
+            metadata_endpoint,
         }));
     }
     // bare path falls back to fs
@@ -304,7 +310,7 @@ fn s3_config(
         .or_else(|| vars.get("AWS_REGION"))
         .or_else(|| vars.get("WALG_S3_REGION"))
         .unwrap_or_else(|| "us-east-1".into());
-    let creds = s3_credentials(vars, src)?;
+    let creds = s3_credentials(vars, src, &region)?;
     let endpoint = src
         .and_then(|c| c.endpoint.clone())
         .or_else(|| vars.get("AWS_ENDPOINT_URL"))
@@ -335,11 +341,16 @@ fn force_path_style(vars: &Vars, endpoint_set: bool) -> Result<bool> {
     Ok(endpoint_set)
 }
 
-/// Pick a credential source: inherit `src`, else explicit static env keys,
-/// else the EC2 metadata service. IMDS is skipped (surfacing the missing-keys
-/// error) when AWS_EC2_METADATA_DISABLED is set. One static key without the
-/// other is a hard error rather than a silent IMDS fallback
-fn s3_credentials(vars: &Vars, src: Option<&s3::S3Config>) -> Result<s3::CredentialSource> {
+/// Pick a credential source, in the same order as the AWS SDKs: inherit `src`,
+/// else explicit static env keys, else ambient per-pod identity (web-identity
+/// then container credentials), else the EC2 metadata service. IMDS is skipped
+/// (surfacing the missing-keys error) when AWS_EC2_METADATA_DISABLED is set. One
+/// static key without the other is a hard error rather than a silent fallback
+fn s3_credentials(
+    vars: &Vars,
+    src: Option<&s3::S3Config>,
+    region: &str,
+) -> Result<s3::CredentialSource> {
     if let Some(c) = src {
         return Ok(c.creds.clone());
     }
@@ -349,26 +360,66 @@ fn s3_credentials(vars: &Vars, src: Option<&s3::S3Config>) -> Result<s3::Credent
     let secret_key = vars
         .get("AWS_SECRET_ACCESS_KEY")
         .or_else(|| vars.get("AWS_SECRET_KEY"));
-    match (access_key, secret_key) {
-        (Some(access_key), Some(secret_key)) => Ok(s3::CredentialSource::Static(s3::Credentials {
-            access_key,
-            secret_key,
+    if let (Some(access_key), Some(secret_key)) = (&access_key, &secret_key) {
+        return Ok(s3::CredentialSource::Static(s3::Credentials {
+            access_key: access_key.clone(),
+            secret_key: secret_key.clone(),
             session_token: vars.get("AWS_SESSION_TOKEN"),
             expires_at: None,
-        })),
-        (None, None) if vars.bool("AWS_EC2_METADATA_DISABLED", false)? => {
-            Err(anyhow!("AWS_ACCESS_KEY_ID not set and IMDS disabled"))
-        }
-        (None, None) => {
-            let endpoint = vars.get("AWS_EC2_METADATA_SERVICE_ENDPOINT");
-            Ok(s3::CredentialSource::Imds(Arc::new(
-                s3::ImdsProvider::new(endpoint).map_err(|e| anyhow!("{e}"))?,
-            )))
-        }
-        _ => Err(anyhow!(
-            "incomplete static credentials: set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-        )),
+        }));
     }
+    if access_key.is_some() != secret_key.is_some() {
+        bail!(
+            "incomplete static credentials: set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+        );
+    }
+    if let Some(kind) = ambient_kind(vars, region) {
+        return Ok(s3::CredentialSource::Ambient(Arc::new(
+            s3::AmbientProvider::new(kind).map_err(|e| anyhow!("{e}"))?,
+        )));
+    }
+    if vars.bool("AWS_EC2_METADATA_DISABLED", false)? {
+        bail!("AWS_ACCESS_KEY_ID not set and IMDS disabled");
+    }
+    let endpoint = vars.get("AWS_EC2_METADATA_SERVICE_ENDPOINT");
+    Ok(s3::CredentialSource::Imds(Arc::new(
+        s3::ImdsProvider::new(endpoint).map_err(|e| anyhow!("{e}"))?,
+    )))
+}
+
+/// Ambient (keyless) per-pod identity, preferring web-identity over container
+/// credentials like the AWS SDKs do. On EKS/GKE the platform injects these vars
+/// itself once the pod runs under a bound ServiceAccount
+fn ambient_kind(vars: &Vars, region: &str) -> Option<s3::AmbientKind> {
+    // IRSA: the EKS mutating webhook projects the token and sets both vars
+    if let (Some(token_file), Some(role_arn)) = (
+        vars.get("AWS_WEB_IDENTITY_TOKEN_FILE"),
+        vars.get("AWS_ROLE_ARN"),
+    ) {
+        return Some(s3::AmbientKind::WebIdentity {
+            sts_endpoint: vars
+                .get("AWS_ENDPOINT_URL_STS")
+                .unwrap_or_else(|| format!("https://sts.{region}.amazonaws.com")),
+            role_arn,
+            session_name: vars
+                .get("AWS_ROLE_SESSION_NAME")
+                .unwrap_or_else(|| "wal-rus".into()),
+            token_file,
+        });
+    }
+    // EKS Pod Identity sets FULL_URI; ECS sets the relative form
+    let url = vars.get("AWS_CONTAINER_CREDENTIALS_FULL_URI").or_else(|| {
+        vars.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+            .map(|rel| {
+                let sep = if rel.starts_with('/') { "" } else { "/" };
+                format!("http://169.254.170.2{sep}{rel}")
+            })
+    })?;
+    Some(s3::AmbientKind::Container {
+        url,
+        token_file: vars.get("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"),
+        static_token: vars.get("AWS_CONTAINER_AUTHORIZATION_TOKEN"),
+    })
 }
 
 impl DeltaSettings {
@@ -410,6 +461,7 @@ fn detect_storage(vars: &Vars) -> Result<StorageSettings> {
             prefix,
             credentials_path: vars.get("GOOGLE_APPLICATION_CREDENTIALS"),
             endpoint: gcs_endpoint(vars),
+            metadata_endpoint: vars.get("GCE_METADATA_HOST"),
         }));
     }
     bail!("no storage configured: set WALG_FILE_PREFIX, WALG_S3_PREFIX, or WALG_GS_PREFIX")
@@ -704,6 +756,7 @@ mod tests {
                 prefix: "srcp".into(),
                 credentials_path: Some("/src/sa.json".into()),
                 endpoint: None,
+                metadata_endpoint: None,
             });
             match storage_from_uri(&Vars::default(), "gs://dstb/dst/pre", &src).unwrap() {
                 StorageSettings::Gcs(c) => {
@@ -821,6 +874,12 @@ mod tests {
                 ("AWS_SECRET_ACCESS_KEY", None),
                 ("AWS_SECRET_KEY", None),
                 ("AWS_EC2_METADATA_DISABLED", None),
+                // a real IRSA / Pod-Identity host has these set, which would
+                // route ahead of IMDS
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", None),
+                ("AWS_ROLE_ARN", None),
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+                ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
             ]);
             match detect_storage(&Vars::default()).unwrap() {
                 StorageSettings::S3(c) => {
@@ -840,6 +899,10 @@ mod tests {
                 ("AWS_SECRET_ACCESS_KEY", None),
                 ("AWS_SECRET_KEY", None),
                 ("AWS_EC2_METADATA_DISABLED", Some("true")),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", None),
+                ("AWS_ROLE_ARN", None),
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+                ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
             ]);
             assert!(detect_storage(&Vars::default()).is_err());
         }
@@ -914,6 +977,7 @@ mod tests {
                 prefix: "gp".into(),
                 credentials_path: Some(sa.to_string_lossy().into()),
                 endpoint: None,
+                metadata_endpoint: None,
             }),
             RetryPolicy::default(),
         )
@@ -1014,15 +1078,116 @@ mod tests {
 
     #[test]
     fn s3_credentials_incomplete_static_is_error() {
-        // access key without its secret is a hard error, never a silent IMDS
-        // fallback
+        // access key without its secret is a hard error, never a silent fallback
+        // to IMDS or ambient identity
         let _g = EnvGuard::new(&[
             ("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE")),
             ("AWS_ACCESS_KEY", None),
             ("AWS_SECRET_ACCESS_KEY", None),
             ("AWS_SECRET_KEY", None),
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", None),
+            ("AWS_ROLE_ARN", None),
+            ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
         ]);
-        assert!(s3_credentials(&Vars::default(), None).is_err());
+        assert!(s3_credentials(&Vars::default(), None, "us-east-1").is_err());
+    }
+
+    /// The keyless chain: web-identity beats container creds, both beat IMDS,
+    /// and static keys still win over everything.
+    #[test]
+    fn s3_credentials_selects_ambient_sources_in_sdk_order() {
+        // web-identity needs both vars; the STS endpoint defaults per-region
+        {
+            let _g = EnvGuard::new(&[
+                ("AWS_ACCESS_KEY_ID", None),
+                ("AWS_ACCESS_KEY", None),
+                ("AWS_SECRET_ACCESS_KEY", None),
+                ("AWS_SECRET_KEY", None),
+                (
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    Some("/var/run/secrets/token"),
+                ),
+                ("AWS_ROLE_ARN", Some("arn:aws:iam::1:role/tenant")),
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+                ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
+            ]);
+            let c = s3_credentials(&Vars::default(), None, "eu-west-1").unwrap();
+            assert_eq!(c.identity(), "web-identity");
+        }
+        // AWS_ROLE_ARN alone is not enough (that would be plain assume-role,
+        // which we don't implement) -> falls through to IMDS
+        {
+            let _g = EnvGuard::new(&[
+                ("AWS_ACCESS_KEY_ID", None),
+                ("AWS_ACCESS_KEY", None),
+                ("AWS_SECRET_ACCESS_KEY", None),
+                ("AWS_SECRET_KEY", None),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", None),
+                ("AWS_ROLE_ARN", Some("arn:aws:iam::1:role/tenant")),
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+                ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
+                ("AWS_EC2_METADATA_DISABLED", None),
+            ]);
+            let c = s3_credentials(&Vars::default(), None, "us-east-1").unwrap();
+            assert!(matches!(c, s3::CredentialSource::Imds(_)));
+        }
+        // EKS Pod Identity injects FULL_URI
+        {
+            let _g = EnvGuard::new(&[
+                ("AWS_ACCESS_KEY_ID", None),
+                ("AWS_ACCESS_KEY", None),
+                ("AWS_SECRET_ACCESS_KEY", None),
+                ("AWS_SECRET_KEY", None),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", None),
+                ("AWS_ROLE_ARN", None),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    Some("http://169.254.170.23/v1/credentials"),
+                ),
+                ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
+            ]);
+            let c = s3_credentials(&Vars::default(), None, "us-east-1").unwrap();
+            assert_eq!(c.identity(), "container-creds");
+        }
+        // static keys win even with the ambient vars present
+        {
+            let _g = EnvGuard::new(&[
+                ("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE")),
+                ("AWS_ACCESS_KEY", None),
+                ("AWS_SECRET_ACCESS_KEY", Some("sekrit")),
+                ("AWS_SECRET_KEY", None),
+                ("AWS_SESSION_TOKEN", None),
+                (
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    Some("/var/run/secrets/token"),
+                ),
+                ("AWS_ROLE_ARN", Some("arn:aws:iam::1:role/tenant")),
+                ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+                ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", None),
+            ]);
+            let c = s3_credentials(&Vars::default(), None, "us-east-1").unwrap();
+            assert_eq!(c.identity(), "AKIAEXAMPLE");
+        }
+    }
+
+    #[test]
+    fn container_creds_relative_uri_joins_the_ecs_link_local_base() {
+        let _g = EnvGuard::new(&[
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", None),
+            ("AWS_ROLE_ARN", None),
+            ("AWS_CONTAINER_CREDENTIALS_FULL_URI", None),
+            (
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                Some("/v2/credentials/abc"),
+            ),
+        ]);
+        match ambient_kind(&Vars::default(), "us-east-1") {
+            Some(s3::AmbientKind::Container { url, .. }) => {
+                assert_eq!(url, "http://169.254.170.2/v2/credentials/abc");
+            }
+            other => panic!("expected container creds, got {other:?}"),
+        }
     }
 
     #[test]

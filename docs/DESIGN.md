@@ -65,9 +65,11 @@ Profile/shared-credentials files and STS web-identity
 
 ### GCS
 
-Service-account JWT (RS256 via aws-lc-rs) exchanged for an OAuth bearer,
-cached until 60 s before expiry. Uploads stream via `uploadType=media`.
-Resumable uploads and metadata-server auth not implemented.
+Service-account JWT (RS256 via aws-lc-rs) exchanged for an OAuth bearer, or —
+when `GOOGLE_APPLICATION_CREDENTIALS` is unset — a bearer straight from the
+GKE/GCE metadata server (Workload Identity, no key material). Either way cached
+until 60 s before expiry. Uploads stream via `uploadType=media`. Resumable
+uploads not implemented.
 
 ### Retry classification
 
