@@ -5,7 +5,9 @@
 //! Env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 //! AWS_REGION (default us-east-1), endpoint from AWS_ENDPOINT_URL / AWS_ENDPOINT
 //! / WALG_S3_ENDPOINT, path-style from AWS_S3_FORCE_PATH_STYLE. Without static
-//! keys, credentials come from the EC2 metadata service (see [`super::creds`])
+//! keys, credentials come from web-identity (IRSA), the container credentials
+//! endpoint (EKS Pod Identity / ECS), or the EC2 metadata service, in that
+//! order (see [`super::creds`])
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -26,7 +28,7 @@ use tokio::task::JoinSet;
 use tokio_util::io::StreamReader;
 use url::Url;
 
-pub use super::creds::{CredentialSource, Credentials, ImdsProvider};
+pub use super::creds::{AmbientKind, AmbientProvider, CredentialSource, Credentials, ImdsProvider};
 use super::{
     AsyncReader, CopySource, ObjectMeta, ObjectStream, PutIfAbsentOutcome, Result, Storage,
     StorageError,
@@ -780,8 +782,9 @@ fn decode_text(t: &quick_xml::events::BytesText) -> Result<String> {
 }
 
 /// Text of the first element whose local name matches `tag`. Used for the
-/// single-valued CreateMultipartUpload `UploadId`.
-fn first_tag_text(xml: &str, tag: &[u8]) -> Option<String> {
+/// single-valued CreateMultipartUpload `UploadId`, and by `creds.rs` for the
+/// STS AssumeRoleWithWebIdentity response.
+pub(crate) fn first_tag_text(xml: &str, tag: &[u8]) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     let mut capture = false;
     loop {

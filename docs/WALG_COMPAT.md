@@ -163,9 +163,6 @@ Accepted by wal-g Postgres config but not used by PG code paths:
 - `AWS_SHARED_CREDENTIALS_FILE`
 - `AWS_CONFIG_FILE`
 - `AWS_CA_BUNDLE`
-- `AWS_ROLE_ARN`
-- `AWS_ROLE_SESSION_NAME`
-- `AWS_WEB_IDENTITY_TOKEN_FILE`
 - `AWS_DUAL_STACK`
 - `WALG_S3_CA_CERT_FILE`
 - `S3_CA_CERT_FILE`
@@ -205,6 +202,16 @@ Accepted by wal-g Postgres config but not used by PG code paths:
 - `S3_ENABLE_VERSIONING`
 - `S3_DELETE_BATCH_SIZE`
 
+Credential resolution follows the AWS SDK chain — static keys, then web-identity
+(`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, optional
+`AWS_ROLE_SESSION_NAME` / `AWS_ENDPOINT_URL_STS`), then the container
+credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI` or
+`..._RELATIVE_URI`, with `AWS_CONTAINER_AUTHORIZATION_TOKEN[_FILE]`), then EC2
+IMDS. Not covered: shared config/profile files, SSO, `credential_process`, and
+`AWS_ROLE_ARN` on its own — wal-g would assume that role using ambient
+credentials, whereas walrus honors `AWS_ROLE_ARN` only together with a
+web-identity token file.
+
 ### GCS storage
 
 - `WALE_GS_PREFIX`
@@ -214,7 +221,10 @@ Accepted by wal-g Postgres config but not used by PG code paths:
 - `GCS_MAX_CHUNK_SIZE`
 - `GCS_MAX_RETRIES`
 
-GCE/GKE metadata-server auth is not implemented.
+Auth matches Google ADC apart from the gcloud well-known credentials file:
+`GOOGLE_APPLICATION_CREDENTIALS` selects the service-account JSON, and its
+absence selects the GKE/GCE metadata server (Workload Identity), with
+`GCE_METADATA_HOST` honored as the host override.
 
 ### Storage backends not implemented
 
