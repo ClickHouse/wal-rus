@@ -52,6 +52,7 @@ pub struct Identity {
     pub timeline: u32,
     pub xlogpos: u64,
     pub dbname: Option<String>,
+    pub server_version: String,
 }
 
 /// Output of the handshake: which LSN the walreceiver wants to begin
@@ -79,7 +80,7 @@ where
     // Vec / issuing its own syscall
     let mut tx = BytesMut::with_capacity(512);
     encode_auth_ok(&mut tx);
-    encode_parameter_status(&mut tx, "server_version", "16.3");
+    encode_parameter_status(&mut tx, "server_version", &identity.server_version);
     encode_parameter_status(&mut tx, "server_encoding", "UTF8");
     encode_parameter_status(&mut tx, "client_encoding", "UTF8");
     encode_parameter_status(&mut tx, "DateStyle", "ISO, MDY");
@@ -777,6 +778,7 @@ mod tests {
             timeline: 1,
             xlogpos: 0x016B_3750,
             dbname: None,
+            server_version: "16.3".into(),
         };
         let mut server = server;
         let started = handshake_and_await_start(&mut server, &identity)
@@ -1022,6 +1024,7 @@ mod tests {
             timeline: 1,
             xlogpos: 0x10,
             dbname: Some("db".into()),
+            server_version: "16.3".into(),
         };
 
         let (res, buf) = run_dispatch("IDENTIFY_SYSTEM", &identity).await;
