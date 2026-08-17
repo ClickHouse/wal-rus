@@ -7,9 +7,18 @@
 //! |---|---|
 //! | `StartupMessage` with `replication=true` | `AuthenticationOk` + ParameterStatus + `BackendKeyData` + `ReadyForQuery` |
 //! | `IDENTIFY_SYSTEM` | `(systemid, timeline, xlogpos, dbname)` row |
-//! | `TIMELINE_HISTORY <tli>` | empty history (single-timeline source) |
-//! | `START_REPLICATION [SLOT _] PHYSICAL <lsn> [TIMELINE <n>]` | `CopyBothResponse` then `'w'` frames |
+//! | `TIMELINE_HISTORY <tli>` | `(filename, content)` row from [`Identity::histories`], `undefined_file` when absent |
+//! | `START_REPLICATION [SLOT _] PHYSICAL <lsn> [TIMELINE <n>]` | `CopyBothResponse` then `'w'` frames, or the next-timeline row when that branch already ended |
 //! | other simple queries | `CommandComplete` + `ReadyForQuery` |
+//!
+//! Timelines: a server that has forked lists its finished branches in
+//! [`Identity::switches`]. A request for one of them streams to its switchpoint
+//! and then ends with [`WalSenderConn::end_timeline`], which is how a
+//! walreceiver learns where to go next — the alternative, closing the socket,
+//! leaves it re-requesting the branch that ended. History bytes matter for the
+//! same reason: a walreceiver writes what `TIMELINE_HISTORY` returns into its
+//! own `pg_wal`, and empty content there reads as a parentless timeline whose
+//! ancestor segments it will never look for.
 //!
 //! Auth: trust only, runs over a shared unix socket against PG.
 //! The `Authentication*` messages a real PG walreceiver
@@ -44,14 +53,48 @@ impl From<anyhow::Error> for ServerError {
     }
 }
 
-/// `IDENTIFY_SYSTEM` reply payload + `xlogpos`. Cached at startup
-/// from source's reply, refreshed on timeline switch
-#[derive(Debug, Clone)]
+/// A branch this server has finished: PG's `sendTimeLineValidUpto` and
+/// `sendTimeLineNextTLI` for one historic timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineSwitch {
+    pub timeline: u32,
+    /// LSN the branch ended at, one past its last byte
+    pub ends_at: u64,
+    pub next_timeline: u32,
+}
+
+/// `IDENTIFY_SYSTEM` reply payload + `xlogpos`, plus what the server can say
+/// about branches other than its current one. Cached at startup from source's
+/// reply, refreshed on timeline switch
+#[derive(Debug, Clone, Default)]
 pub struct Identity {
     pub system_id: String,
     pub timeline: u32,
     pub xlogpos: u64,
     pub dbname: Option<String>,
+    /// Finished branches. A `START_REPLICATION` naming one of these is historic:
+    /// it streams only up to that switchpoint. Empty for a server that never
+    /// forked
+    pub switches: Vec<TimelineSwitch>,
+    /// `TIMELINE_HISTORY <tli>` content per timeline, verbatim PG history-file
+    /// bytes. Timeline 1 has none and no walreceiver asks for it
+    pub histories: Vec<(u32, Vec<u8>)>,
+}
+
+impl Identity {
+    fn switch_for(&self, timeline: u32) -> Option<TimelineSwitch> {
+        self.switches
+            .iter()
+            .copied()
+            .find(|s| s.timeline == timeline)
+    }
+
+    fn history_for(&self, timeline: u32) -> Option<&[u8]> {
+        self.histories
+            .iter()
+            .find(|(tli, _)| *tli == timeline)
+            .map(|(_, bytes)| bytes.as_slice())
+    }
 }
 
 /// Output of the handshake: which LSN the walreceiver wants to begin
@@ -61,6 +104,11 @@ pub struct StartReplication {
     pub start_lsn: u64,
     pub timeline: u32,
     pub slot: Option<String>,
+    /// Set when the requested timeline is one of [`Identity::switches`]: the
+    /// stream must stop at `ends_at` and finish with
+    /// [`WalSenderConn::end_timeline`], the same cutoff PG applies through
+    /// `sendTimeLineValidUpto`
+    pub ends_at: Option<TimelineSwitch>,
 }
 
 /// Drive the startup conversation up to and including
@@ -92,12 +140,27 @@ where
     flush_tx(sock, &mut tx).await?;
 
     let mut rx = BytesMut::with_capacity(8192);
+    serve_until_start(sock, &mut rx, &mut tx, identity).await
+}
+
+/// Serve simple queries until one opens a stream. Shared by the startup
+/// handshake and by [`WalSenderConn::await_start`], which re-enters it on a
+/// connection whose previous stream ended at a switchpoint.
+async fn serve_until_start<S>(
+    sock: &mut S,
+    rx: &mut BytesMut,
+    tx: &mut BytesMut,
+    identity: &Identity,
+) -> Result<StartReplication, ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
-        let msg = read_typed_message(sock, &mut rx).await?;
+        let msg = read_typed_message(sock, rx).await?;
         match msg.kind {
             b'Q' => {
                 let query = parse_simple_query(&msg.body)?;
-                if let Some(start) = dispatch_query(sock, &mut tx, &query, identity).await? {
+                if let Some(start) = dispatch_query(sock, tx, &query, identity).await? {
                     return Ok(start);
                 }
             }
@@ -255,12 +318,33 @@ where
         flush_tx(sock, tx).await?;
         Ok(None)
     } else if upper.starts_with("TIMELINE_HISTORY") {
-        encode_timeline_history(tx, identity);
+        let requested = parse_timeline_history(trimmed)?;
+        match identity.history_for(requested) {
+            Some(content) => encode_timeline_history(tx, requested, content),
+            // PG opens the file and errors when it is not there. Answering
+            // empty instead would have the client write a parentless history
+            // file and stop looking for ancestor segments
+            None => encode_error_response(
+                tx,
+                "58P01",
+                &format!("could not open file \"pg_wal/{requested:08X}.history\""),
+            ),
+        }
         encode_ready_for_query(tx, b'I');
         flush_tx(sock, tx).await?;
         Ok(None)
     } else if upper.starts_with("START_REPLICATION") {
-        let start = parse_start_replication(trimmed)?;
+        let mut start = parse_start_replication(trimmed)?;
+        start.ends_at = identity.switch_for(start.timeline);
+        // Nothing left on a branch requested at or past its own switchpoint, so
+        // PG skips COPY and answers with the next timeline instead
+        // (`src/backend/replication/walsender.c`, `StartReplication`)
+        if let Some(switch) = start.ends_at.filter(|s| start.start_lsn >= s.ends_at) {
+            encode_timeline_end(tx, switch);
+            encode_ready_for_query(tx, b'I');
+            flush_tx(sock, tx).await?;
+            return Ok(None);
+        }
         // Switch to CopyBoth.
         encode_copy_both_response(tx);
         flush_tx(sock, tx).await?;
@@ -278,6 +362,16 @@ where
         flush_tx(sock, tx).await?;
         Err(ServerError::Unsupported(trimmed.to_string()))
     }
+}
+
+fn parse_timeline_history(query: &str) -> Result<u32, ServerError> {
+    query
+        .split_whitespace()
+        .nth(1)
+        .map(|t| t.trim_end_matches(';'))
+        .ok_or_else(|| ServerError::Protocol("TIMELINE_HISTORY requires a timeline".into()))?
+        .parse()
+        .map_err(|e| ServerError::Protocol(format!("parse timeline: {e}")))
 }
 
 fn parse_start_replication(query: &str) -> Result<StartReplication, ServerError> {
@@ -322,6 +416,7 @@ fn parse_start_replication(query: &str) -> Result<StartReplication, ServerError>
         start_lsn,
         timeline,
         slot,
+        ends_at: None,
     })
 }
 
@@ -361,13 +456,29 @@ fn encode_ready_for_query(tx: &mut BytesMut, txn_status: u8) {
 }
 
 fn encode_identify_system(tx: &mut BytesMut, identity: &Identity) {
-    // RowDescription: 4 fields (systemid text, timeline int4, xlogpos text, dbname text)
-    let fields = [
-        ("systemid", 25u32), // text
-        ("timeline", 23u32), // int4
-        ("xlogpos", 25u32),
-        ("dbname", 25u32),
-    ];
+    let timeline = identity.timeline.to_string();
+    let xlogpos = format_pg_lsn(identity.xlogpos).to_string();
+    encode_simple_result(
+        tx,
+        &[
+            ("systemid", 25u32), // text
+            ("timeline", 23u32), // int4
+            ("xlogpos", 25u32),
+            ("dbname", 25u32),
+        ],
+        &[
+            Some(identity.system_id.as_bytes()),
+            Some(timeline.as_bytes()),
+            Some(xlogpos.as_bytes()),
+            identity.dbname.as_deref().map(str::as_bytes),
+        ],
+    );
+    encode_command_complete(tx, "IDENTIFY_SYSTEM");
+}
+
+/// Append a `T`/`D` result set: one row per call, text format throughout, which
+/// is what `DestRemoteSimple` sends and what every replication client parses.
+fn encode_simple_result(tx: &mut BytesMut, fields: &[(&str, u32)], columns: &[Option<&[u8]>]) {
     let row_desc_tag_pos = tx.len();
     tx.extend_from_slice(b"T");
     let row_desc_len_pos = tx.len();
@@ -386,77 +497,53 @@ fn encode_identify_system(tx: &mut BytesMut, identity: &Identity) {
     let payload_len = (tx.len() - row_desc_tag_pos - 1) as u32;
     tx[row_desc_len_pos..row_desc_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
 
-    // DataRow with the 4 column values.
-    let xlogpos_str = format_pg_lsn(identity.xlogpos).to_string();
-    let columns: [Option<&str>; 4] = [
-        Some(identity.system_id.as_str()),
-        None, // timeline rendered below (needs a String)
-        Some(xlogpos_str.as_str()),
-        identity.dbname.as_deref(),
-    ];
-    let timeline_str = identity.timeline.to_string();
     let row_tag_pos = tx.len();
     tx.extend_from_slice(b"D");
     let row_len_pos = tx.len();
     tx.extend_from_slice(&0u32.to_be_bytes());
     tx.extend_from_slice(&(columns.len() as u16).to_be_bytes());
-    for (idx, col) in columns.iter().enumerate() {
-        let val = if idx == 1 {
-            Some(timeline_str.as_str())
-        } else {
-            *col
-        };
-        match val {
-            Some(s) => {
-                tx.extend_from_slice(&(s.len() as i32).to_be_bytes());
-                tx.extend_from_slice(s.as_bytes());
+    for col in columns {
+        match col {
+            Some(bytes) => {
+                tx.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                tx.extend_from_slice(bytes);
             }
             None => tx.extend_from_slice(&(-1i32).to_be_bytes()),
         }
     }
     let payload_len = (tx.len() - row_tag_pos - 1) as u32;
     tx[row_len_pos..row_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
-
-    encode_command_complete(tx, "IDENTIFY_SYSTEM");
 }
 
-fn encode_timeline_history(tx: &mut BytesMut, identity: &Identity) {
-    // RowDescription: 2 fields (filename text, content bytea)
-    let fields = [("filename", 25u32), ("content", 17u32)];
-    let row_desc_tag_pos = tx.len();
-    tx.extend_from_slice(b"T");
-    let row_desc_len_pos = tx.len();
-    tx.extend_from_slice(&0u32.to_be_bytes());
-    tx.extend_from_slice(&(fields.len() as u16).to_be_bytes());
-    for (name, oid) in fields {
-        tx.extend_from_slice(name.as_bytes());
-        tx.extend_from_slice(b"\0");
-        tx.extend_from_slice(&0u32.to_be_bytes());
-        tx.extend_from_slice(&0u16.to_be_bytes());
-        tx.extend_from_slice(&oid.to_be_bytes());
-        tx.extend_from_slice(&(-1i16).to_be_bytes());
-        tx.extend_from_slice(&(-1i32).to_be_bytes());
-        tx.extend_from_slice(&0u16.to_be_bytes());
-    }
-    let payload_len = (tx.len() - row_desc_tag_pos - 1) as u32;
-    tx[row_desc_len_pos..row_desc_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
-
-    // DataRow: filename = "<timeline>.history", content = "".
-    let filename = format!("{:08X}.history", identity.timeline);
-    let content: &[u8] = b"";
-    let row_tag_pos = tx.len();
-    tx.extend_from_slice(b"D");
-    let row_len_pos = tx.len();
-    tx.extend_from_slice(&0u32.to_be_bytes());
-    tx.extend_from_slice(&2u16.to_be_bytes());
-    tx.extend_from_slice(&(filename.len() as i32).to_be_bytes());
-    tx.extend_from_slice(filename.as_bytes());
-    tx.extend_from_slice(&(content.len() as i32).to_be_bytes());
-    tx.extend_from_slice(content);
-    let payload_len = (tx.len() - row_tag_pos - 1) as u32;
-    tx[row_len_pos..row_len_pos + 4].copy_from_slice(&payload_len.to_be_bytes());
-
+fn encode_timeline_history(tx: &mut BytesMut, timeline: u32, content: &[u8]) {
+    // The client checks the filename against its own `TLHistoryFileName`
+    let filename = format!("{timeline:08X}.history");
+    encode_simple_result(
+        tx,
+        &[("filename", 25u32), ("content", 25u32)],
+        &[Some(filename.as_bytes()), Some(content)],
+    );
     encode_command_complete(tx, "TIMELINE_HISTORY");
+}
+
+/// The next-timeline result a historic stream ends with: `next_tli` int8 and
+/// `next_tli_startpos` text, then *two* `CommandComplete`s.
+///
+/// The pair is not a mistake — PG sends one from `StartReplication` and one from
+/// `exec_replication_command` ("dupe, but necessary per
+/// libpqrcv_endstreaming"). libpq folds the first into the row set and only the
+/// second becomes the `PGRES_COMMAND_OK` the walreceiver requires after it, so a
+/// single tag leaves the client erroring on the result it never saw.
+fn encode_timeline_end(tx: &mut BytesMut, switch: TimelineSwitch) {
+    let next_tli = switch.next_timeline.to_string();
+    let startpos = format_pg_lsn(switch.ends_at).to_string();
+    encode_simple_result(
+        tx,
+        &[("next_tli", 20u32), ("next_tli_startpos", 25u32)],
+        &[Some(next_tli.as_bytes()), Some(startpos.as_bytes())],
+    );
+    encode_command_complete(tx, "START_STREAMING");
+    encode_command_complete(tx, "START_REPLICATION");
 }
 
 fn encode_command_complete(tx: &mut BytesMut, tag: &str) {
@@ -632,12 +719,83 @@ where
         }
     }
 
+    /// End a historic stream the way PG does: server `CopyDone`, wait for the
+    /// client's, then the next-timeline result set.
+    ///
+    /// This is what tells a walreceiver where the branch went. Closing the
+    /// socket instead leaves it re-requesting the timeline that ended, since
+    /// nothing in the stream said otherwise. Inbound standby-status frames
+    /// arriving before the client's `CopyDone` are dropped: it is on its way out.
+    ///
+    /// The connection returns to simple-query mode, so
+    /// [`await_start`](Self::await_start) can serve the next stream on it.
+    pub async fn end_timeline(&mut self, switch: TimelineSwitch) -> Result<(), ServerError> {
+        self.tx.extend_from_slice(b"c");
+        self.tx.extend_from_slice(&4u32.to_be_bytes());
+        self.flush().await?;
+        loop {
+            match parse_copy_both(&mut self.rx)? {
+                Some(CopyBothMsg::Done) => break,
+                Some(CopyBothMsg::Data(_)) => continue,
+                Some(CopyBothMsg::Fail) => {
+                    return Err(ServerError::Protocol("client sent CopyFail".into()));
+                }
+                Some(CopyBothMsg::Terminate) => {
+                    return Err(ServerError::Protocol(
+                        "client sent Terminate before CopyDone".into(),
+                    ));
+                }
+                None => {
+                    let n = self.sock.read_buf(&mut self.rx).await?;
+                    if n == 0 {
+                        return Err(ServerError::Protocol(
+                            "client closed before CopyDone".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        encode_timeline_end(&mut self.tx, switch);
+        encode_ready_for_query(&mut self.tx, b'I');
+        self.flush().await
+    }
+
+    /// Serve queries on this connection until the client opens another stream.
+    /// Follows [`end_timeline`](Self::end_timeline), where a walreceiver's next
+    /// moves are `TIMELINE_HISTORY` for the branch it just learned about and a
+    /// fresh `START_REPLICATION` on it.
+    pub async fn await_start(
+        &mut self,
+        identity: &Identity,
+    ) -> Result<StartReplication, ServerError> {
+        let Self { sock, rx, tx } = self;
+        serve_until_start(sock, rx, tx, identity).await
+    }
+
     pub fn into_inner(self) -> S {
         self.sock
     }
 }
 
+/// Client-direction message inside CopyBoth.
+enum CopyBothMsg {
+    Data(Bytes),
+    Done,
+    Fail,
+    Terminate,
+}
+
 fn parse_one_copy_data(rx: &mut BytesMut) -> Result<Option<Bytes>, ServerError> {
+    match parse_copy_both(rx)? {
+        Some(CopyBothMsg::Data(body)) => Ok(Some(body)),
+        Some(CopyBothMsg::Done) => Err(ServerError::Protocol("client sent CopyDone".into())),
+        Some(CopyBothMsg::Fail) => Err(ServerError::Protocol("client sent CopyFail".into())),
+        Some(CopyBothMsg::Terminate) => Err(ServerError::Protocol("client sent Terminate".into())),
+        None => Ok(None),
+    }
+}
+
+fn parse_copy_both(rx: &mut BytesMut) -> Result<Option<CopyBothMsg>, ServerError> {
     if rx.len() < 5 {
         return Ok(None);
     }
@@ -656,19 +814,19 @@ fn parse_one_copy_data(rx: &mut BytesMut) -> Result<Option<Bytes>, ServerError> 
         b'd' => {
             let mut frame = rx.split_to(total).freeze();
             frame.advance(5);
-            Ok(Some(frame))
+            Ok(Some(CopyBothMsg::Data(frame)))
         }
         b'c' => {
             let _ = rx.split_to(total);
-            Err(ServerError::Protocol("client sent CopyDone".into()))
+            Ok(Some(CopyBothMsg::Done))
         }
         b'f' => {
             let _ = rx.split_to(total);
-            Err(ServerError::Protocol("client sent CopyFail".into()))
+            Ok(Some(CopyBothMsg::Fail))
         }
         b'X' => {
             let _ = rx.split_to(total);
-            Err(ServerError::Protocol("client sent Terminate".into()))
+            Ok(Some(CopyBothMsg::Terminate))
         }
         other => {
             let _ = rx.split_to(total);
@@ -777,6 +935,7 @@ mod tests {
             timeline: 1,
             xlogpos: 0x016B_3750,
             dbname: None,
+            ..Default::default()
         };
         let mut server = server;
         let started = handshake_and_await_start(&mut server, &identity)
@@ -1022,19 +1181,38 @@ mod tests {
             timeline: 1,
             xlogpos: 0x10,
             dbname: Some("db".into()),
+            ..Default::default()
         };
 
         let (res, buf) = run_dispatch("IDENTIFY_SYSTEM", &identity).await;
         assert!(matches!(res, Ok(None)));
         assert_eq!(buf[0], b'T'); // RowDescription first
 
+        // Nothing known about timeline 1, so the file is absent, as on PG
         let (res, buf) = run_dispatch("TIMELINE_HISTORY 1", &identity).await;
+        assert!(matches!(res, Ok(None)), "an absent file ends the command");
+        assert_eq!(buf[0], b'E');
+        assert!(
+            buf.windows(5).any(|w| w == b"58P01"),
+            "absent history must answer undefined_file: {buf:?}",
+        );
+
+        let forked = Identity {
+            timeline: 2,
+            histories: vec![(2, b"1\t0/3000000\tno recovery target specified\n".to_vec())],
+            ..identity.clone()
+        };
+        let (res, buf) = run_dispatch("TIMELINE_HISTORY 2", &forked).await;
         assert!(matches!(res, Ok(None)));
         assert_eq!(buf[0], b'T');
         assert!(
-            buf.windows(b"00000001.history".len())
-                .any(|w| w == b"00000001.history"),
+            buf.windows(b"00000002.history".len())
+                .any(|w| w == b"00000002.history"),
             "timeline history filename missing"
+        );
+        assert!(
+            buf.windows(b"0/3000000".len()).any(|w| w == b"0/3000000"),
+            "history content must be served verbatim"
         );
 
         let (res, buf) = run_dispatch("START_REPLICATION PHYSICAL 0/0", &identity).await;
@@ -1051,5 +1229,125 @@ mod tests {
         let (res, buf) = run_dispatch("VACUUM", &identity).await;
         assert!(matches!(res, Err(ServerError::Unsupported(_))));
         assert_eq!(buf[0], b'E'); // ErrorResponse
+    }
+
+    fn forked_identity() -> Identity {
+        Identity {
+            system_id: "7340000000000000000".into(),
+            timeline: 2,
+            switches: vec![TimelineSwitch {
+                timeline: 1,
+                ends_at: 0x300_0000,
+                next_timeline: 2,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A historic request below the switchpoint still streams, and reports where
+    /// it has to stop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn historic_request_streams_up_to_its_switchpoint() {
+        let identity = forked_identity();
+        let (res, buf) =
+            run_dispatch("START_REPLICATION PHYSICAL 0/2000000 TIMELINE 1", &identity).await;
+        let start = res.unwrap().expect("CopyBoth opens");
+        assert_eq!(buf[0], b'W');
+        assert_eq!(
+            start.ends_at,
+            Some(TimelineSwitch {
+                timeline: 1,
+                ends_at: 0x300_0000,
+                next_timeline: 2
+            }),
+        );
+    }
+
+    /// At or past the switchpoint there is nothing to stream, so PG never opens
+    /// COPY: the next-timeline row goes out immediately and the client asks
+    /// again on the branch it names.
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_at_the_switchpoint_answers_without_copy() {
+        let identity = forked_identity();
+        let (res, buf) =
+            run_dispatch("START_REPLICATION PHYSICAL 0/3000000 TIMELINE 1", &identity).await;
+        assert!(matches!(res, Ok(None)), "the handshake keeps serving");
+        assert_eq!(buf[0], b'T', "result set, not CopyBothResponse");
+        assert!(buf.windows(9).any(|w| w == b"0/3000000"));
+        assert_eq!(
+            buf.windows(15).filter(|w| *w == b"START_STREAMING").count(),
+            1,
+        );
+        assert_eq!(
+            buf.windows(17)
+                .filter(|w| *w == b"START_REPLICATION")
+                .count(),
+            1,
+            "libpq only surfaces the second CommandComplete to the walreceiver",
+        );
+    }
+
+    /// A request for the current branch is not historic, whatever else the
+    /// server has forked through.
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_timeline_never_ends() {
+        let identity = forked_identity();
+        let (res, buf) =
+            run_dispatch("START_REPLICATION PHYSICAL 0/4000000 TIMELINE 2", &identity).await;
+        let start = res.unwrap().expect("CopyBoth opens");
+        assert_eq!(buf[0], b'W');
+        assert_eq!(start.ends_at, None);
+    }
+
+    /// `end_timeline` answers the client's `CopyDone`, drops the standby status
+    /// that raced it, and leaves the connection able to serve the next stream.
+    #[tokio::test(flavor = "current_thread")]
+    async fn end_timeline_hands_over_on_the_same_connection() {
+        use crate::pg::replication::stream::build_status_update;
+        use tokio::io::duplex;
+
+        let switch = TimelineSwitch {
+            timeline: 1,
+            ends_at: 0x300_0000,
+            next_timeline: 2,
+        };
+        let (server, mut client) = duplex(64 * 1024);
+        let client_task = tokio::spawn(async move {
+            // Server CopyDone first
+            let mut tag = [0u8; 5];
+            client.read_exact(&mut tag).await.unwrap();
+            assert_eq!(tag[0], b'c');
+            // A status update in flight, then our own CopyDone
+            let status = build_status_update(1, 1, 1);
+            let mut framed = vec![b'd'];
+            framed.extend_from_slice(&((4 + status.len()) as u32).to_be_bytes());
+            framed.extend_from_slice(&status);
+            client.write_all(&framed).await.unwrap();
+            client.write_all(b"c").await.unwrap();
+            client.write_all(&4u32.to_be_bytes()).await.unwrap();
+            // Then the next-timeline result, and a fresh stream request
+            let mut rest = vec![0u8; 256];
+            let n = client.read(&mut rest).await.unwrap();
+            assert_eq!(rest[0], b'T');
+            assert!(rest[..n].windows(1).any(|w| w == b"Z"));
+            client
+                .write_all(&build_simple_query(
+                    "START_REPLICATION PHYSICAL 0/3000000 TIMELINE 2",
+                ))
+                .await
+                .unwrap();
+            let mut open = [0u8; 5];
+            client.read_exact(&mut open).await.unwrap();
+            assert_eq!(open[0], b'W', "next stream opens CopyBoth");
+        });
+
+        let identity = forked_identity();
+        let mut conn = WalSenderConn::new(server);
+        conn.end_timeline(switch).await.expect("end timeline");
+        let next = conn.await_start(&identity).await.expect("next stream");
+        assert_eq!(next.timeline, 2);
+        assert_eq!(next.start_lsn, 0x300_0000);
+        assert_eq!(next.ends_at, None);
+        client_task.await.unwrap();
     }
 }

@@ -33,6 +33,7 @@ fn test_identity() -> Identity {
         timeline: 1,
         xlogpos: 0,
         dbname: None,
+        ..Default::default()
     }
 }
 
@@ -58,6 +59,7 @@ async fn protocol_roundtrip_through_tcp() {
         timeline: 1,
         xlogpos: 0x016B_3750,
         dbname: None,
+        ..Default::default()
     };
     let payload = b"hello world".to_vec();
     let server_task = tokio::spawn({
@@ -226,13 +228,19 @@ async fn ssl_request_restart_with_real_client() {
 }
 
 /// `TIMELINE_HISTORY` row encoding on the server must parse via the real
-/// client's `timeline_history`, yielding the `<tli>.history` filename + empty
-/// body for a single-timeline source.
+/// client's `timeline_history`: the served timeline yields its exact bytes, and
+/// one the server holds no file for reads as absent rather than as a parentless
+/// timeline.
 #[tokio::test]
 async fn timeline_history_round_trips_through_client() {
+    const HISTORY: &[u8] = b"1\t0/3000000\tno recovery target specified\n";
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let identity = test_identity();
+    let identity = Identity {
+        timeline: 2,
+        histories: vec![(2, HISTORY.to_vec())],
+        ..test_identity()
+    };
     let server_task = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.expect("accept");
         handshake_and_await_start(&mut sock, &identity)
@@ -244,12 +252,20 @@ async fn timeline_history_round_trips_through_client() {
         .await
         .expect("client connect");
     let (name, content) = client
-        .timeline_history(1)
+        .timeline_history(2)
         .await
         .expect("timeline_history")
         .expect("history row present");
-    assert_eq!(name, "00000001.history");
-    assert!(content.is_empty());
+    assert_eq!(name, "00000002.history");
+    assert_eq!(content, HISTORY);
+    assert!(
+        client
+            .timeline_history(1)
+            .await
+            .expect("timeline_history 1")
+            .is_none(),
+        "a timeline with no file must answer undefined_file",
+    );
 
     client
         .send_query("START_REPLICATION PHYSICAL 0/0")

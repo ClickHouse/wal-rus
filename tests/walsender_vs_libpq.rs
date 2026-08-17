@@ -46,6 +46,7 @@ async fn libpq_psql_handshakes_and_runs_identify_system() {
         timeline: 7,
         xlogpos: 0x0123_4567_89AB_CDEF,
         dbname: None,
+        ..Default::default()
     };
 
     let server_task = tokio::spawn({
