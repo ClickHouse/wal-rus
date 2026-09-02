@@ -160,7 +160,6 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
 
     while let Some(entry) = entries.next().await {
         let mut entry = entry.context("read tar entry")?;
-        let header = entry.header().clone();
         let orig_path = entry
             .path()
             .context("entry path")?
@@ -170,8 +169,9 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
             Some(p) => format!("{p}{}", orig_path),
             None => orig_path.clone(),
         };
-        let entry_size = header.size().unwrap_or(0);
-        let is_dir = header.entry_type().is_dir();
+        let entry_size = entry.effective_size();
+        let is_dir = entry.header().entry_type().is_dir();
+        let mtime = header_mtime(entry.header());
         let canonical_name = strip_dotslash(&mapped).to_string();
 
         // Delta-mode classification: paged files with a tracked delta map
@@ -187,7 +187,7 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
                 FileMeta {
                     is_incremented: false,
                     is_skipped: true,
-                    mtime: header_mtime(&header),
+                    mtime,
                 },
             );
             continue;
@@ -217,7 +217,7 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
 
         // append_data handles path encoding (auto-emits GNU LongLink for
         // > 100 char paths) and cksum, so no set_path here
-        let mut new_hdr = header.clone();
+        let mut new_hdr = entry.header().clone();
 
         // Decide whether to tee this entry
         let tee_match =
@@ -250,12 +250,12 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
                         .read_to_end(&mut buf)
                         .await
                         .context("read tee entry")?;
+                    let mut tee_hdr = new_hdr.clone();
                     ctx.builder
                         .append_data(&mut new_hdr, &mapped, &buf[..])
                         .await
                         .context("append to current part")?;
                     if let Some(tb) = tee_builder.as_mut() {
-                        let mut tee_hdr = header.clone();
                         tb.append_data(&mut tee_hdr, &mapped, &buf[..])
                             .await
                             .context("append to tee tar")?;
@@ -276,7 +276,7 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
                 FileMeta {
                     is_incremented,
                     is_skipped,
-                    mtime: header_mtime(&header),
+                    mtime,
                 },
             );
         }
