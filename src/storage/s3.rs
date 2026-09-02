@@ -287,7 +287,7 @@ impl S3Storage {
             .await?;
         let init_resp = check_status(init_resp).await?;
         let init_body = init_resp.text().await?;
-        let upload_id = first_tag_text(&init_body, b"UploadId").ok_or_else(|| {
+        let upload_id = first_tag_text(&init_body, "UploadId").ok_or_else(|| {
             StorageError::InvalidResponse("missing UploadId in CreateMultipartUpload".into())
         })?;
 
@@ -768,20 +768,17 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     }
 }
 
-/// Charset-decode then resolve XML entities. quick-xml 0.40 split unescaping
-/// out of the text event, so both steps are explicit.
+/// Resolve XML entities. quick-xml text events carry the escaped source, so
+/// unescaping is explicit.
 fn decode_text(t: &quick_xml::events::BytesText) -> Result<String> {
-    let decoded = t
-        .decode()
-        .map_err(|e| StorageError::InvalidResponse(format!("xml decode: {e}")))?;
-    let unescaped = quick_xml::escape::unescape(&decoded)
+    let unescaped = quick_xml::escape::unescape(t)
         .map_err(|e| StorageError::InvalidResponse(format!("xml unescape: {e}")))?;
     Ok(unescaped.into_owned())
 }
 
 /// Text of the first element whose local name matches `tag`. Used for the
 /// single-valued CreateMultipartUpload `UploadId`.
-fn first_tag_text(xml: &str, tag: &[u8]) -> Option<String> {
+fn first_tag_text(xml: &str, tag: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     let mut capture = false;
     loop {
@@ -825,17 +822,17 @@ fn parse_list_v2(xml: &str, strip_prefix: &str) -> Result<(Vec<ObjectMeta>, Opti
         {
             Event::Eof => break,
             Event::Start(e) => match e.local_name().as_ref() {
-                b"Contents" => {
+                "Contents" => {
                     in_contents = true;
                     key.clear();
                     size = 0;
                     last_modified = None;
                 }
-                b"Key" if in_contents => field = ListField::Key,
-                b"Size" if in_contents => field = ListField::Size,
-                b"LastModified" if in_contents => field = ListField::LastModified,
-                b"IsTruncated" => field = ListField::IsTruncated,
-                b"NextContinuationToken" => field = ListField::NextToken,
+                "Key" if in_contents => field = ListField::Key,
+                "Size" if in_contents => field = ListField::Size,
+                "LastModified" if in_contents => field = ListField::LastModified,
+                "IsTruncated" => field = ListField::IsTruncated,
+                "NextContinuationToken" => field = ListField::NextToken,
                 _ => {}
             },
             Event::Text(t) if field != ListField::None => {
@@ -855,7 +852,7 @@ fn parse_list_v2(xml: &str, strip_prefix: &str) -> Result<(Vec<ObjectMeta>, Opti
                 }
             }
             Event::End(e) => {
-                if e.local_name().as_ref() == b"Contents" {
+                if e.local_name().as_ref() == "Contents" {
                     in_contents = false;
                     let trimmed = if strip_prefix.is_empty() {
                         std::mem::take(&mut key)
@@ -998,8 +995,8 @@ mod tests {
     #[test]
     fn upload_id_extraction() {
         let xml = "<InitiateMultipartUploadResult><UploadId>abc123</UploadId></InitiateMultipartUploadResult>";
-        assert_eq!(first_tag_text(xml, b"UploadId"), Some("abc123".into()));
-        assert_eq!(first_tag_text(xml, b"Missing"), None);
+        assert_eq!(first_tag_text(xml, "UploadId"), Some("abc123".into()));
+        assert_eq!(first_tag_text(xml, "Missing"), None);
     }
 
     #[test]
