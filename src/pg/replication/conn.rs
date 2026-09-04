@@ -8,7 +8,7 @@
 //! TLS negotiation is skipped on Unix sockets to mirror libpq
 
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use postgres_protocol::authentication::sasl::{ChannelBinding, SCRAM_SHA_256, ScramSha256};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
@@ -347,12 +347,17 @@ impl ReplicationConn {
         self.server_version_num
     }
 
+    /// Cancel-safe: `tx` keeps only what the socket has not taken, so a
+    /// caller that drops this future mid-frame (a `select!` losing to a
+    /// timer) resumes the frame instead of re-sending its prefix
     async fn flush(&mut self) -> Result<()> {
-        if self.tx.is_empty() {
-            return Ok(());
+        while !self.tx.is_empty() {
+            let n = self.socket.write(&self.tx).await?;
+            if n == 0 {
+                bail!("postgres connection closed while sending");
+            }
+            self.tx.advance(n);
         }
-        self.socket.write_all(&self.tx).await?;
-        self.tx.clear();
         Ok(())
     }
 
@@ -845,6 +850,94 @@ mod tests {
 
     const SCRAM_ITERS: u32 = 4096;
     const SCRAM_SALT: &[u8] = b"0123456789abcdef";
+
+    /// Takes `chunk` bytes per write and parks once between writes, so a
+    /// multi-chunk frame always has a cancellation point mid-flight
+    struct ChokedSink {
+        wire: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        chunk: usize,
+        park: bool,
+    }
+
+    impl tokio::io::AsyncWrite for ChokedSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            if me.park {
+                me.park = false;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            let n = buf.len().min(me.chunk);
+            me.wire.lock().unwrap().extend_from_slice(&buf[..n]);
+            me.park = true;
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncRead for ChokedSink {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A status update raced against a timer and dropped after one chunk
+    /// must continue from that chunk, not restart the frame
+    #[tokio::test]
+    async fn cancelled_flush_resumes_mid_frame() {
+        use std::future::Future as _;
+
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut conn = ReplicationConn {
+            socket: Box::new(ChokedSink {
+                wire: wire.clone(),
+                chunk: 4,
+                park: false,
+            }),
+            rx: BytesMut::new(),
+            tx: BytesMut::new(),
+            server_version_num: 160003,
+            server_params: Vec::new(),
+            tls: false,
+        };
+        let payload: &[u8] = b"status-update";
+        let mut expect = BytesMut::new();
+        frontend::CopyData::new(payload).unwrap().write(&mut expect);
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut send = Box::pin(conn.send_copy_data(payload));
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+        drop(send);
+        assert_eq!(
+            wire.lock().unwrap().len(),
+            4,
+            "one chunk went out before the drop"
+        );
+
+        conn.flush().await.unwrap();
+        assert_eq!(wire.lock().unwrap().as_slice(), &expect[..]);
+    }
 
     fn b64_encode(b: &[u8]) -> String {
         use base64::Engine as _;
