@@ -66,7 +66,8 @@ pub struct GcsStorage {
 impl GcsStorage {
     pub fn new(cfg: GcsConfig) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .connect_timeout(crate::storage::CONNECT_TIMEOUT)
+            .read_timeout(crate::storage::READ_TIMEOUT)
             .build()
             .map_err(|e| StorageError::Config(e.to_string()))?;
 
