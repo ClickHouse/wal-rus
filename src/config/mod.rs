@@ -325,7 +325,7 @@ fn s3_config(
 }
 
 /// `AWS_S3_FORCE_PATH_STYLE` (wal-g name). Defaults to `endpoint_set` so a
-/// custom endpoint (minio/ceph) gets path-style addressing without an explicit
+/// custom endpoint (seaweedfs/ceph) gets path-style addressing without an explicit
 /// flag
 fn force_path_style(vars: &Vars, endpoint_set: bool) -> Result<bool> {
     let key = "AWS_S3_FORCE_PATH_STYLE";
@@ -583,7 +583,7 @@ mod tests {
             ("AWS_SECRET_KEY", Some("secret_alias")),
             ("AWS_SESSION_TOKEN", None),
             ("AWS_ENDPOINT_URL", None),
-            ("WALG_S3_ENDPOINT", Some("http://minio:9000")),
+            ("WALG_S3_ENDPOINT", Some("http://seaweedfs:8333")),
             ("AWS_S3_FORCE_PATH_STYLE", Some("true")),
         ];
         let _g = EnvGuard::new(&vars);
@@ -595,7 +595,7 @@ mod tests {
                 assert_eq!(c.region, "eu-west-2");
                 assert_eq!(static_creds(&c).access_key, "AKIA_ALIAS");
                 assert_eq!(static_creds(&c).secret_key, "secret_alias");
-                assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
+                assert_eq!(c.endpoint.as_deref(), Some("http://seaweedfs:8333"));
                 assert!(c.force_path_style);
             }
             other => panic!("expected S3, got {other:?}"),
@@ -1033,7 +1033,7 @@ mod tests {
             ("WALG_S3_PREFIX", Some("s3://bkt")),
             ("AWS_ENDPOINT_URL", None),
             ("WALG_S3_ENDPOINT", None),
-            ("AWS_ENDPOINT", Some("http://minio:9000")),
+            ("AWS_ENDPOINT", Some("http://seaweedfs:8333")),
             ("AWS_S3_FORCE_PATH_STYLE", Some("true")),
             ("AWS_REGION", Some("us-east-1")),
             ("AWS_ACCESS_KEY_ID", Some("k")),
@@ -1041,7 +1041,7 @@ mod tests {
         ]);
         match detect_storage(&Vars::default()).unwrap() {
             StorageSettings::S3(c) => {
-                assert_eq!(c.endpoint.as_deref(), Some("http://minio:9000"));
+                assert_eq!(c.endpoint.as_deref(), Some("http://seaweedfs:8333"));
                 assert!(c.force_path_style);
             }
             other => panic!("expected S3, got {other:?}"),
