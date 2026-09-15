@@ -30,7 +30,7 @@ mkdir -p "$PGHOST"
 # Configure the storage backend from WALRUS_STORAGE_BACKEND (default fs). Exports
 # the WALG_* vars the walrus binary reads, plus WALG_ARCHIVE_ENV: the `KEY=VAL`
 # prefix pg_archive_on inlines so the archive_command subprocess targets the
-# same backend. s3 points at MinIO (path-style), gcs at fake-gcs-server.
+# same backend. s3 points at SeaweedFS (path-style), gcs at fake-gcs-server.
 storage_init() {
     local backend="${WALRUS_STORAGE_BACKEND:-fs}"
     case "$backend" in
@@ -43,15 +43,15 @@ storage_init() {
         WALG_ARCHIVE_ENV="WALG_FILE_PREFIX=$WALG_FILE_PREFIX"
         ;;
     s3)
-        : "${MINIO_ENDPOINT:?set MINIO_ENDPOINT, e.g. http://127.0.0.1:9000}"
+        : "${WALRUS_S3_ENDPOINT:?set WALRUS_S3_ENDPOINT, e.g. http://127.0.0.1:8333}"
         local bucket="${WALRUS_S3_BUCKET:-walrus}"
         WALG_S3_PREFIX="s3://$bucket/$(basename "$WORKROOT")"
         export WALG_S3_PREFIX
-        export AWS_ENDPOINT_URL="$MINIO_ENDPOINT"
+        export AWS_ENDPOINT_URL="$WALRUS_S3_ENDPOINT"
         export AWS_S3_FORCE_PATH_STYLE=true
         export AWS_REGION="${AWS_REGION:-us-east-1}"
-        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
-        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
+        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-walrus}"
+        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-walrussecret}"
         WALG_ARCHIVE_ENV="WALG_S3_PREFIX=$WALG_S3_PREFIX AWS_ENDPOINT_URL=$AWS_ENDPOINT_URL AWS_S3_FORCE_PATH_STYLE=true AWS_REGION=$AWS_REGION AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
         ;;
     gcs)

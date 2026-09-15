@@ -217,7 +217,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # Object-storage lane: drive the same shell tests against MinIO (S3) and
+  # Object-storage lane: drive the same shell tests against SeaweedFS (S3) and
   # fsouza/fake-gcs-server (GCS) so the hand-rolled S3/GCS clients get exercised
   # against real APIs (SigV4 path-style, multipart, listing, server-side copy).
   pg-storage:
@@ -253,19 +253,19 @@ jobs:
       - name: Start object-storage emulators + bootstrap buckets
         run: |
           set -eux
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+          docker run -d --name seaweedfs -p 8333:8333 \
+            -e AWS_ACCESS_KEY_ID=walrus -e AWS_SECRET_ACCESS_KEY=walrussecret \
+            chrislusf/seaweedfs server -s3 -ip.bind=0.0.0.0
           docker run -d --name fakegcs -p 4443:4443 \
             fsouza/fake-gcs-server -scheme http -port 4443 -public-host 127.0.0.1:4443
           for _ in $(seq 1 60); do
-            curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break; sleep 1
+            curl -fsS http://127.0.0.1:8333/status >/dev/null 2>&1 && break; sleep 1
           done
           for _ in $(seq 1 60); do
             curl -fsS "http://127.0.0.1:4443/storage/v1/b?project=test" >/dev/null 2>&1 && break; sleep 1
           done
-          AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-            aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://walrus
+          AWS_ACCESS_KEY_ID=walrus AWS_SECRET_ACCESS_KEY=walrussecret \
+            aws --endpoint-url http://127.0.0.1:8333 s3 mb s3://walrus
           curl -fsS -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
             -H 'Content-Type: application/json' -d '{"name":"walrus"}'
 
@@ -274,7 +274,7 @@ jobs:
           PG_VERSION: 16
           PG_BIN: /usr/lib/postgresql/16/bin
           WALRUS_STORAGE_BACKEND: ${{ matrix.backend }}
-          MINIO_ENDPOINT: http://127.0.0.1:9000
+          WALRUS_S3_ENDPOINT: http://127.0.0.1:8333
           FAKE_GCS_ENDPOINT: http://127.0.0.1:4443
         run: ci/${{ matrix.test }}.sh
 

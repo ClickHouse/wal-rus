@@ -118,7 +118,7 @@ impl S3Storage {
     /// Server-side copy identity: same endpoint/region + same credential.
     /// Conservative: AWS allows cross-region CopyObject, but mismatched
     /// region ids fall back to stream-through rather than risk custom
-    /// endpoints (minio, ceph) that don't
+    /// endpoints (seaweedfs, ceph) that don't
     fn backend_id(&self) -> String {
         format!(
             "s3:{}:{}",
@@ -635,7 +635,7 @@ fn build_base_url(cfg: &S3Config) -> String {
             format!("{}/{}", ep, cfg.bucket)
         } else {
             // virtual-host style on custom endpoint: prepend bucket
-            // most setups (minio, ceph) want path-style; default conservatively path
+            // most setups (seaweedfs, ceph) want path-style; default conservatively path
             format!("{}/{}", ep, cfg.bucket)
         }
     } else {
