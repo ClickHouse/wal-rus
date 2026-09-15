@@ -84,7 +84,8 @@ impl S3Storage {
 
     pub fn with_retry_policy(cfg: S3Config, retry_policy: RetryPolicy) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .connect_timeout(crate::storage::CONNECT_TIMEOUT)
+            .read_timeout(crate::storage::READ_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| StorageError::Config(e.to_string()))?;

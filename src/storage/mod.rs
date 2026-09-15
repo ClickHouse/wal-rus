@@ -21,6 +21,18 @@ pub mod s3;
 pub(crate) mod test_http;
 pub mod tools;
 
+/// Connect-phase budget for the object-store HTTP clients. An unreachable
+/// endpoint fails here rather than hanging.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Per-read budget, reset by every successful read, rather than a deadline on
+/// the whole request. A backup part is of unbounded size, so a total timeout
+/// kills a healthy transfer purely for being large: at 60s a 400 MiB part
+/// needs a sustained 7 MiB/s or reqwest aborts it mid-body as "error decoding
+/// response body". This bounds a stall instead, which is the condition worth
+/// failing on.
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub type AsyncReader = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 pub type ObjectStream =
     Pin<Box<dyn Stream<Item = std::result::Result<ObjectMeta, StorageError>> + Send + 'static>>;
@@ -195,6 +207,68 @@ pub(crate) fn join_prefix_key(prefix: &str, key: &str) -> String {
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    /// Serve `chunks` with `gap` between them, so the body takes far longer
+    /// than any single read waits for
+    async fn drip_server(chunks: usize, chunk: usize, gap: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                chunks * chunk
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            for _ in 0..chunks {
+                tokio::time::sleep(gap).await;
+                if sock.write_all(&vec![b'x'; chunk]).await.is_err() {
+                    return;
+                }
+                sock.flush().await.unwrap();
+            }
+        });
+        format!("http://{addr}/obj")
+    }
+
+    /// The premise [`READ_TIMEOUT`] rests on: a per-read budget tolerates a
+    /// slow-but-progressing body, where a total deadline would abort it purely
+    /// for being large. A 400 MiB part against a 60s total deadline needs a
+    /// sustained 7 MiB/s or reqwest kills it as "error decoding response body"
+    #[tokio::test]
+    async fn read_timeout_survives_a_slow_body_but_not_a_stall() {
+        let gap = std::time::Duration::from_millis(40);
+        let budget = std::time::Duration::from_millis(400);
+
+        // 20 reads x 40ms = ~800ms total, well past `budget`, no single gap near it
+        let url = drip_server(20, 512, gap).await;
+        let client = reqwest::Client::builder()
+            .read_timeout(budget)
+            .build()
+            .unwrap();
+        let body = client.get(&url).send().await.unwrap().bytes().await;
+        assert_eq!(
+            body.expect("a body that keeps arriving must not time out")
+                .len(),
+            20 * 512,
+            "slow but progressing transfer was aborted",
+        );
+
+        // One gap longer than the budget: that is the condition worth failing on
+        let url = drip_server(2, 512, budget * 3).await;
+        let client = reqwest::Client::builder()
+            .read_timeout(budget)
+            .build()
+            .unwrap();
+        let stalled = match client.get(&url).send().await {
+            Ok(resp) => resp.bytes().await.err(),
+            Err(e) => Some(e),
+        };
+        assert!(stalled.is_some(), "a stalled body must fail");
+    }
 
     #[test]
     fn is_transient_classifies_each_variant() {
