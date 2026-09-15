@@ -34,7 +34,7 @@ async-compression = { version = "0.4", default-features = false, features = ["to
 hex = "0.4"
 url = "2"
 percent-encoding = "2"
-base64 = "0.22"
+base64 = "0.23"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "form", "query", "http2"] }
 crc32c = "0.6"
 roaring = "0.11"
