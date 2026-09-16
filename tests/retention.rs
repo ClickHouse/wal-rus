@@ -6,8 +6,8 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Utc;
 use walrus::config::{Settings, StorageSettings};
 use walrus::pg::backup::copy as copy_mod;
 use walrus::pg::backup::delete::{
@@ -16,6 +16,7 @@ use walrus::pg::backup::delete::{
 use walrus::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, sentinel_key, tar_part_key};
 use walrus::storage::Storage;
 use walrus::storage::fs::FsStorage;
+use walrus::time::Timestamp;
 
 fn test_settings() -> Settings {
     Settings {
@@ -465,14 +466,14 @@ async fn delete_retain_after_keeps_newer_than_boundary() {
     let store = Arc::new(FsStorage::new(dir.path()).unwrap());
     let mut names = Vec::new();
     let mut boundary = None;
-    let t0 = Utc::now() - chrono::Duration::hours(4);
+    let t0 = Timestamp::now() - Duration::from_secs(4 * 3600);
     for i in 0..4u32 {
         let lsn = (i as u64 + 1) * seg_size();
         let name = backup_name(1, lsn);
         let mut sentinel = make_sentinel(lsn, false);
-        sentinel.start_time = t0 + chrono::Duration::hours(i as i64);
+        sentinel.start_time = t0 + Duration::from_secs(i as u64 * 3600);
         if i == 2 {
-            boundary = Some(sentinel.start_time - chrono::Duration::minutes(1));
+            boundary = Some(sentinel.start_time - Duration::from_secs(60));
         }
         put_bytes(
             &store,
@@ -483,7 +484,7 @@ async fn delete_retain_after_keeps_newer_than_boundary() {
         names.push(name);
     }
     let dyn_store: walrus::storage::DynStorage = store as Arc<dyn Storage>;
-    let after = boundary.unwrap().to_rfc3339();
+    let after = boundary.unwrap().to_string();
     let plan = delete::handle(
         dyn_store.clone(),
         DeleteOp::Retain {

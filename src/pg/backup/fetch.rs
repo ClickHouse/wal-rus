@@ -233,13 +233,15 @@ pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
     }
     let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
     let mut stream = storage.list(&prefix).await?;
-    let mut latest: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+    let mut latest: Option<(crate::time::Timestamp, String)> = None;
     while let Some(item) = stream.next().await {
         let obj = item?;
         let Some(n) = name_from_sentinel_key(&obj.key) else {
             continue;
         };
-        let mtime = obj.last_modified.unwrap_or_else(chrono::Utc::now);
+        let mtime = obj
+            .last_modified
+            .unwrap_or_else(crate::time::Timestamp::now);
         match &latest {
             Some((t, _)) if *t >= mtime => {}
             _ => latest = Some((mtime, n.to_string())),

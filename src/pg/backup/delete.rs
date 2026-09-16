@@ -12,7 +12,6 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde::Serialize;
 
@@ -20,6 +19,7 @@ use crate::pg::backup::fetch::fetch_sentinel;
 use crate::pg::backup::{LATEST, name_from_sentinel_key, strip_leftmost_backup_name};
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::storage::DynStorage;
+use crate::time::Timestamp;
 
 /// `TryFetchTimelineAndLogSegNo`: find the first 24-hex chunk in `name`,
 /// parse as TTTTTTTTLLLLLLLLSSSSSSSS, return (timeline, global_seg_no)
@@ -53,7 +53,7 @@ pub struct BackupRecord {
     pub start_seg_no: u64,
     pub start_lsn: u64,
     pub finish_lsn: u64,
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
     pub is_permanent: bool,
     pub increment_from: Option<String>,
     pub increment_full_name: Option<String>,
@@ -249,11 +249,9 @@ fn resolve_before_target(
     if matches!(modifier, DeleteModifier::Full) {
         bail!("`delete before FULL` is not a supported modifier");
     }
-    let time_target = DateTime::parse_from_rfc3339(target)
-        .map(|d| d.with_timezone(&Utc))
-        .ok();
+    let time_target = target.parse::<Timestamp>().ok();
     if let Some(t) = time_target
-        && t > Utc::now()
+        && t > Timestamp::now()
     {
         bail!("cannot delete before a future timestamp");
     }
@@ -339,11 +337,9 @@ fn resolve_retain_after_target(
     after: &str,
     modifier: DeleteModifier,
 ) -> Result<Option<BackupRecord>> {
-    let time_target = DateTime::parse_from_rfc3339(after)
-        .map(|d| d.with_timezone(&Utc))
-        .ok();
+    let time_target = after.parse::<Timestamp>().ok();
     if let Some(t) = time_target
-        && t > Utc::now()
+        && t > Timestamp::now()
     {
         bail!("cannot retain after a future timestamp");
     }
@@ -365,7 +361,7 @@ fn resolve_retain_after_target(
 fn resolve_after_target(
     backups: &[BackupRecord],
     after_str: &str,
-    time_target: Option<DateTime<Utc>>,
+    time_target: Option<Timestamp>,
     modifier: DeleteModifier,
 ) -> Option<BackupRecord> {
     let mut sorted: Vec<&BackupRecord> = backups.iter().collect();
@@ -749,6 +745,8 @@ pub fn parse_garbage_scope(args: &[String]) -> Result<GarbageScope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::pg::wal::segment::DEFAULT_WAL_SEG_SIZE;
 
     fn make_record(name: &str, tli: u32, seg: u64, is_full: bool, perm: bool) -> BackupRecord {
@@ -758,7 +756,7 @@ mod tests {
             start_seg_no: seg,
             start_lsn: seg * DEFAULT_WAL_SEG_SIZE,
             finish_lsn: (seg + 1) * DEFAULT_WAL_SEG_SIZE,
-            start_time: Utc::now() - chrono::Duration::seconds(seg as i64),
+            start_time: Timestamp::now() - Duration::from_secs(seg),
             is_permanent: perm,
             increment_from: None,
             increment_full_name: if is_full {
@@ -906,7 +904,7 @@ mod tests {
             start_seg_no: 3,
             start_lsn: 3 * DEFAULT_WAL_SEG_SIZE + 100,
             finish_lsn: 5 * DEFAULT_WAL_SEG_SIZE + 100,
-            start_time: Utc::now(),
+            start_time: Timestamp::now(),
             is_permanent: true,
             increment_from: None,
             increment_full_name: None,
@@ -944,12 +942,7 @@ mod tests {
         ));
     }
 
-    fn make_record_at(
-        name: &str,
-        seg: u64,
-        start_time: DateTime<Utc>,
-        is_full: bool,
-    ) -> BackupRecord {
+    fn make_record_at(name: &str, seg: u64, start_time: Timestamp, is_full: bool) -> BackupRecord {
         let mut r = make_record(name, 1, seg, is_full, false);
         r.start_time = start_time;
         r
@@ -958,16 +951,16 @@ mod tests {
     #[test]
     fn retain_after_time_picks_older_of_two_anchors() {
         // 4 backups, ascending in time and seg_no
-        let t0 = Utc::now() - chrono::Duration::hours(4);
+        let t0 = Timestamp::now() - Duration::from_secs(4 * 3600);
         let backups = vec![
             make_record_at("base_1", 1, t0, true),
-            make_record_at("base_2", 2, t0 + chrono::Duration::hours(1), true),
-            make_record_at("base_3", 3, t0 + chrono::Duration::hours(2), true),
-            make_record_at("base_4", 4, t0 + chrono::Duration::hours(3), true),
+            make_record_at("base_2", 2, t0 + Duration::from_secs(3600), true),
+            make_record_at("base_3", 3, t0 + Duration::from_secs(2 * 3600), true),
+            make_record_at("base_4", 4, t0 + Duration::from_secs(3 * 3600), true),
         ];
         // retain N=1 alone would anchor at base_4. After-time falls between base_2 and base_3
         // so after-anchor = base_3; older = base_3 (seg 3 < seg 4)
-        let after = (t0 + chrono::Duration::hours(2)).to_rfc3339();
+        let after = (t0 + Duration::from_secs(2 * 3600)).to_string();
         let t = resolve_retain_after_target(&backups, 1, &after, DeleteModifier::None)
             .unwrap()
             .unwrap();
@@ -976,14 +969,14 @@ mod tests {
 
     #[test]
     fn retain_after_time_falls_back_to_retain_when_no_after_match() {
-        let t0 = Utc::now() - chrono::Duration::hours(4);
+        let t0 = Timestamp::now() - Duration::from_secs(4 * 3600);
         let backups = vec![
             make_record_at("base_1", 1, t0, true),
-            make_record_at("base_2", 2, t0 + chrono::Duration::hours(1), true),
-            make_record_at("base_3", 3, t0 + chrono::Duration::hours(2), true),
+            make_record_at("base_2", 2, t0 + Duration::from_secs(3600), true),
+            make_record_at("base_3", 3, t0 + Duration::from_secs(2 * 3600), true),
         ];
         // After-time is past every backup: t2=None, return t1 (Nth-newest)
-        let after = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let after = (Timestamp::now() - Duration::from_secs(60)).to_string();
         let t = resolve_retain_after_target(&backups, 2, &after, DeleteModifier::None)
             .unwrap()
             .unwrap();
@@ -1026,7 +1019,7 @@ mod tests {
     #[test]
     fn retain_after_rejects_future_timestamp() {
         let backups = vec![make_record("base_1", 1, 1, true, false)];
-        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let future = (Timestamp::now() + Duration::from_secs(3600)).to_string();
         let err =
             resolve_retain_after_target(&backups, 1, &future, DeleteModifier::None).unwrap_err();
         assert!(err.to_string().contains("future"));

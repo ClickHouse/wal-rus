@@ -21,7 +21,6 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use chrono::Utc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 use tokio_tar::{Builder, EntryType, Header};
@@ -42,6 +41,7 @@ use crate::pg::replication::PgConfig;
 use crate::pg::replication::base_backup::ChannelReader;
 use crate::pg::replication::conn::ReplicationConn;
 use crate::storage::DynStorage;
+use crate::time::Timestamp;
 
 // walk-relative path used to detect pg_control during the tree walk
 const PG_CONTROL_ENTRY: &str = "global/pg_control";
@@ -192,7 +192,7 @@ pub async fn handle(
     args: PushArgs,
     cfg: PgConfig,
 ) -> Result<()> {
-    let start_time = Utc::now();
+    let start_time = Timestamp::now();
     let pgdata = args
         .pgdata
         .clone()
@@ -254,7 +254,7 @@ pub async fn handle(
     }
 
     // pg_backup_start brackets the copy; the session must stay open until stop
-    let label = format!("walrus {}", Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let label = format!("walrus {}", Timestamp::now().basic());
     let start_lsn = backup_start(&mut conn, pg_version, &label, args.fast_checkpoint).await?;
     tracing::info!(
         target = "backup_push",
@@ -403,7 +403,7 @@ pub async fn handle(
     );
     uncompressed_size += label_tar.len() as i64;
     compressed_size += upload_bytes(settings, &storage, &key, label_tar).await? as i64;
-    let now = Utc::now();
+    let now = Timestamp::now();
     for (name, _) in &label_entries {
         all_files.insert(
             (*name).to_string(),
@@ -754,9 +754,8 @@ fn header(e: &WalkEntry, kind: EntryType, size: u64) -> Header {
     h
 }
 
-fn mtime_dt(secs: i64) -> chrono::DateTime<Utc> {
-    chrono::DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap())
+fn mtime_dt(secs: i64) -> Timestamp {
+    Timestamp::from_unix(secs, 0)
 }
 
 /// Owns a spawned task handle and aborts it on drop unless `disarm`ed. Ensures

@@ -433,7 +433,7 @@ async fn find_latest(storage: &DynStorage) -> Result<Option<(String, BackupSenti
         .list(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
-    let mut entries: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
+    let mut entries: Vec<(String, Option<crate::time::Timestamp>)> = Vec::new();
     while let Some(item) = stream.next().await {
         let obj = item.context("list iteration")?;
         if let Some(name) = name_from_sentinel_key(&obj.key) {

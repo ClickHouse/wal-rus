@@ -191,7 +191,9 @@ fn parse_creds(body: &str) -> Result<Credentials> {
     {
         return Err(StorageError::Auth(format!("imds creds code {code}")));
     }
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&raw.expiration)
+    let expires_at = raw
+        .expiration
+        .parse::<crate::time::Timestamp>()
         .map(SystemTime::from)
         .map_err(|e| StorageError::Auth(format!("imds expiration {:?}: {e}", raw.expiration)))?;
     Ok(Credentials {
@@ -206,7 +208,7 @@ fn parse_creds(body: &str) -> Result<Credentials> {
 mod tests {
     use super::*;
     use crate::storage::test_http::{Req, Resp, serve};
-    use chrono::Utc;
+    use crate::time::Timestamp;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -240,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetches_and_parses_temporary_creds() {
-        let exp = (Utc::now() + chrono::Duration::hours(6)).to_rfc3339();
+        let exp = (Timestamp::now() + Duration::from_secs(6 * 3600)).to_string();
         let (p, _) = provider(exp, true).await;
         let c = p.credentials().await.unwrap();
         assert_eq!(c.access_key, "ASIAEXAMPLE");
@@ -251,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn caches_until_near_expiry() {
-        let exp = (Utc::now() + chrono::Duration::hours(6)).to_rfc3339();
+        let exp = (Timestamp::now() + Duration::from_secs(6 * 3600)).to_string();
         let (p, fetches) = provider(exp, true).await;
         p.credentials().await.unwrap();
         p.credentials().await.unwrap();
@@ -265,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn refetches_when_expiring_within_margin() {
         // expiry inside REFRESH_MARGIN -> every call refetches
-        let exp = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let exp = (Timestamp::now() + Duration::from_secs(60)).to_string();
         let (p, fetches) = provider(exp, true).await;
         p.credentials().await.unwrap();
         p.credentials().await.unwrap();
@@ -284,7 +286,7 @@ mod tests {
                 ("GET", p) if p == format!("{IAM_PATH}myrole") => {
                     f.fetch_add(1, Ordering::SeqCst);
                     Resp::new(200).body(
-                        creds_json(&(Utc::now() + chrono::Duration::hours(6)).to_rfc3339())
+                        creds_json(&(Timestamp::now() + Duration::from_secs(6 * 3600)).to_string())
                             .into_bytes(),
                     )
                 }
@@ -310,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_source_imds_fetches_and_identity_is_constant() {
-        let exp = (Utc::now() + chrono::Duration::hours(6)).to_rfc3339();
+        let exp = (Timestamp::now() + Duration::from_secs(6 * 3600)).to_string();
         let (p, _) = provider(exp, true).await;
         let src = CredentialSource::Imds(Arc::new(p));
         // identity folds to a constant so rotating IMDS keys don't break copy

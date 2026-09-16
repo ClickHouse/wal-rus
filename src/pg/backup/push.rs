@@ -41,6 +41,7 @@ use crate::pg::replication::base_backup::{
 };
 use crate::pg::replication::conn::ReplicationConn;
 use crate::storage::DynStorage;
+use crate::time::Timestamp;
 
 /// Entry name (post-remap) that should be teed into a standalone tar so
 /// restore can apply it last
@@ -82,7 +83,7 @@ pub async fn handle(
         return super::fs_push::handle(settings, storage, args, cfg).await;
     }
 
-    let start_time = chrono::Utc::now();
+    let start_time = Timestamp::now();
 
     // Resolve a delta parent if WALG_DELTA_MAX_STEPS > 0 (or --delta-from-
     // wal-summaries). When found, build a delta map after BackupEvent::Start
@@ -170,7 +171,7 @@ pub async fn handle(
         }
     }
 
-    let label = format!("walrus {}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let label = format!("walrus {}", Timestamp::now().basic());
     let max_rate_kib = max_rate_kib_from_bytes(settings.disk_rate_limit);
     if let Some(rate) = max_rate_kib {
         tracing::info!(
@@ -499,7 +500,7 @@ pub(crate) struct Finalize<'a> {
     pub parent: Option<&'a PrevBackupInfo>,
     pub delta_context: Option<&'a DeltaContext>,
     pub args: &'a PushArgs,
-    pub start_time: chrono::DateTime<chrono::Utc>,
+    pub start_time: Timestamp,
     pub part_count: u32,
 }
 
@@ -565,7 +566,7 @@ pub(crate) async fn finalize_backup(f: Finalize<'_>) -> Result<()> {
     upload_json(storage, &files_metadata_key(&backup_name), &files_meta).await?;
 
     let hostname = hostname().unwrap_or_default();
-    let finish_time = chrono::Utc::now();
+    let finish_time = Timestamp::now();
 
     let (incr_from_lsn, incr_from_name, incr_full_name, incr_count, incr_format) =
         increment_sentinel_fields(parent, delta_context);

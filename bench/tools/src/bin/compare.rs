@@ -379,10 +379,7 @@ fn main() -> Result<()> {
         anyhow::bail!("number of --run and --label must match");
     }
     let fonts = load_fonts()?;
-    let stamp = args
-        .stamp
-        .clone()
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
+    let stamp = args.stamp.clone().unwrap_or_else(bench_tools::utc_stamp);
     let out = Path::new(&args.out);
     std::fs::create_dir_all(out).with_context(|| format!("mkdir {out:?}"))?;
 

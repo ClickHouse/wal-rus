@@ -3,8 +3,8 @@
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Utc;
 use walrus::compression::Method;
 use walrus::config::{DeltaSettings, Settings, StorageSettings};
 use walrus::pg::backup::delta as delta_mod;
@@ -18,6 +18,7 @@ use walrus::pg::backup::{
 };
 use walrus::storage::Storage;
 use walrus::storage::fs::FsStorage;
+use walrus::time::Timestamp;
 
 fn test_settings() -> Settings {
     Settings {
@@ -478,8 +479,8 @@ async fn delta_parent_picks_latest_when_enabled() {
     let older_name = format_backup_name(1, 0x0100_0000, 16 * 1024 * 1024);
     let mut older = make_sentinel_v2("/var/lib/postgres/data");
     older.sentinel.backup_start_lsn = NonZeroU64::new(0x0100_0000);
-    older.start_time = chrono::Utc::now() - chrono::Duration::hours(2);
-    older.finish_time = older.start_time + chrono::Duration::minutes(1);
+    older.start_time = Timestamp::now() - Duration::from_secs(2 * 3600);
+    older.finish_time = older.start_time + Duration::from_secs(60);
     put_bytes(
         Arc::new(FsStorage::new(dir.path()).unwrap()),
         &sentinel_key(&older_name),
@@ -490,8 +491,8 @@ async fn delta_parent_picks_latest_when_enabled() {
     let newer_name = format_backup_name(1, 0x0300_0000, 16 * 1024 * 1024);
     let mut newer = make_sentinel_v2("/var/lib/postgres/data");
     newer.sentinel.backup_start_lsn = NonZeroU64::new(0x0300_0000);
-    newer.start_time = chrono::Utc::now();
-    newer.finish_time = newer.start_time + chrono::Duration::minutes(1);
+    newer.start_time = Timestamp::now();
+    newer.finish_time = newer.start_time + Duration::from_secs(60);
     put_bytes(
         Arc::new(FsStorage::new(dir.path()).unwrap()),
         &sentinel_key(&newer_name),
@@ -714,7 +715,7 @@ async fn fetch_applies_delta_chain_wi1() {
         FileDescription {
             is_incremented: true,
             is_skipped: false,
-            mtime: Utc::now(),
+            mtime: Timestamp::now(),
             updates_count: 0,
         },
     );
@@ -830,7 +831,7 @@ async fn fetch_applies_delta_chain_walg_leading_slash() {
         FileDescription {
             is_incremented: true,
             is_skipped: false,
-            mtime: Utc::now(),
+            mtime: Timestamp::now(),
             updates_count: 0,
         },
     );
@@ -932,7 +933,7 @@ async fn fetch_walks_three_step_chain() {
         FileDescription {
             is_incremented: true,
             is_skipped: false,
-            mtime: Utc::now(),
+            mtime: Timestamp::now(),
             updates_count: 0,
         },
     );
@@ -982,7 +983,7 @@ async fn fetch_walks_three_step_chain() {
         FileDescription {
             is_incremented: true,
             is_skipped: false,
-            mtime: Utc::now(),
+            mtime: Timestamp::now(),
             updates_count: 0,
         },
     );

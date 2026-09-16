@@ -13,7 +13,6 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_SHA256, RsaKeyPair};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Utc;
 use futures::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Body, Client};
@@ -416,11 +415,7 @@ impl Storage for GcsStorage {
                         .as_deref()
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or(0);
-                    let last_modified = it
-                        .updated
-                        .as_deref()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|d| d.with_timezone(&Utc));
+                    let last_modified = it.updated.as_deref().and_then(|s| s.parse().ok());
                     out.push(ObjectMeta {
                         key,
                         size,

@@ -163,10 +163,7 @@ async fn walk(dir: &Path, root: &Path, out: &mut Vec<ObjectMeta>) -> Result<()> 
                 out.push(ObjectMeta {
                     key,
                     size: meta.len(),
-                    last_modified: meta
-                        .modified()
-                        .ok()
-                        .map(chrono::DateTime::<chrono::Utc>::from),
+                    last_modified: meta.modified().ok().map(crate::time::Timestamp::from),
                 });
             }
         }

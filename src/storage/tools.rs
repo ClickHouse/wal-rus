@@ -274,7 +274,7 @@ async fn listing_table(storage: &DynStorage, prefix: &str, recursive: bool) -> R
         metas.sort_by(|a, b| a.key.cmp(&b.key));
         for m in metas {
             let name = strip_prefix(prefix, &m.key);
-            let modified = m.last_modified.map(|t| t.to_rfc3339()).unwrap_or_default();
+            let modified = m.last_modified.map(|t| t.to_string()).unwrap_or_default();
             out.push_str(&format!("obj\t{}\t{}\t{}\n", m.size, modified, name));
         }
     } else {
@@ -283,7 +283,7 @@ async fn listing_table(storage: &DynStorage, prefix: &str, recursive: bool) -> R
             out.push_str(&format!("dir\t0\t\t{d}\n"));
         }
         for o in objs {
-            let modified = o.last_modified.map(|t| t.to_rfc3339()).unwrap_or_default();
+            let modified = o.last_modified.map(|t| t.to_string()).unwrap_or_default();
             out.push_str(&format!("obj\t{}\t{}\t{}\n", o.size, modified, o.name));
         }
     }
@@ -439,7 +439,7 @@ fn strip_prefix<'a>(prefix: &str, key: &'a str) -> &'a str {
 struct LevelObject {
     name: String,
     size: u64,
-    last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    last_modified: Option<crate::time::Timestamp>,
 }
 
 /// Split a recursive listing into immediate objects and synthesized directory
