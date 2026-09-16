@@ -14,7 +14,6 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use aws_lc_rs::{digest, hmac};
 use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use quick_xml::Reader;
@@ -32,6 +31,7 @@ use super::{
     StorageError,
 };
 use crate::retry::{RetryPolicy, with_retry};
+use crate::time::Timestamp;
 
 const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
 const PART_SIZE: usize = 8 * 1024 * 1024;
@@ -679,9 +679,9 @@ fn s3_signing_headers(
         None => parsed.host_str().unwrap_or_default().to_string(),
     };
 
-    let dt: DateTime<Utc> = time.into();
-    let amz_date = dt.format("%Y%m%dT%H%M%SZ").to_string();
-    let date_stamp = dt.format("%Y%m%d").to_string();
+    let dt = Timestamp::from(time);
+    let amz_date = dt.basic();
+    let date_stamp = dt.basic_date();
     let scope = format!("{date_stamp}/{region}/s3/aws4_request");
 
     // headers to sign: auto headers + caller extras, lowercased, value-trimmed
@@ -843,9 +843,7 @@ fn parse_list_v2(xml: &str, strip_prefix: &str) -> Result<(Vec<ObjectMeta>, Opti
                     ListField::Key => key = txt.to_string(),
                     ListField::Size => size = txt.parse().unwrap_or(0),
                     ListField::LastModified => {
-                        last_modified = chrono::DateTime::parse_from_rfc3339(txt)
-                            .ok()
-                            .map(|d| d.with_timezone(&Utc));
+                        last_modified = txt.parse().ok();
                     }
                     ListField::IsTruncated => truncated = txt == "true",
                     ListField::NextToken if !txt.is_empty() => next_token = Some(txt.to_string()),

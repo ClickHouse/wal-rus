@@ -279,6 +279,21 @@ where
         i = val_end + 1;
         params.insert(key, val);
     }
+    // A client asking for a minor beyond 3.0, or for any `_pq_.` protocol
+    // extension, must be told what is actually served. PG 19 clients reject a
+    // server that answers neither (PG
+    // `src/interfaces/libpq/fe-protocol3.c` `pqGetNegotiateProtocolVersion3`)
+    let mut unsupported: Vec<&str> = params
+        .keys()
+        .filter(|k| k.starts_with("_pq_."))
+        .map(String::as_str)
+        .collect();
+    if protocol != PROTOCOL_3_0 || !unsupported.is_empty() {
+        unsupported.sort_unstable();
+        let mut tx = BytesMut::with_capacity(64);
+        encode_negotiate_protocol_version(&mut tx, PROTOCOL_3_0, &unsupported);
+        flush_tx(sock, &mut tx).await?;
+    }
     Ok(params)
 }
 
@@ -425,6 +440,24 @@ fn parse_start_replication(query: &str) -> Result<StartReplication, ServerError>
 // Encoders append directly into a shared BytesMut so the handshake /
 // query dispatch flushes once per phase, instead of one syscall + one
 // fresh Vec per message
+
+/// `PG_PROTOCOL(3, 0)` on the wire (PG `src/include/libpq/pqcomm.h`)
+const PROTOCOL_3_0: u32 = 196608;
+
+/// `NegotiateProtocolVersion`: highest version served, then the protocol
+/// extensions the client asked for that this server does not implement
+fn encode_negotiate_protocol_version(tx: &mut BytesMut, version: u32, unsupported: &[&str]) {
+    let names_len: usize = unsupported.iter().map(|n| n.len() + 1).sum();
+    let payload_len = 4 + 4 + 4 + names_len;
+    tx.extend_from_slice(b"v");
+    tx.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    tx.extend_from_slice(&version.to_be_bytes());
+    tx.extend_from_slice(&(unsupported.len() as u32).to_be_bytes());
+    for name in unsupported {
+        tx.extend_from_slice(name.as_bytes());
+        tx.extend_from_slice(b"\0");
+    }
+}
 
 fn encode_auth_ok(tx: &mut BytesMut) {
     tx.extend_from_slice(b"R");
@@ -1019,6 +1052,66 @@ mod tests {
         assert_eq!(params.get("user").map(String::as_str), Some("u"));
         assert_eq!(params.get("replication").map(String::as_str), Some("true"));
         client_task.await.unwrap();
+    }
+
+    /// PG 19 beta clients probe with minor 9999 plus
+    /// `_pq_.test_protocol_negotiation` and drop a server that answers
+    /// neither
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_startup_negotiates_down_from_a_greased_version() {
+        let (client, server) = tokio::io::duplex(512);
+        let client_task = tokio::spawn(async move {
+            let mut client = client;
+            client
+                .write_all(&build_startup_raw(
+                    PROTOCOL_3_0 + 9999,
+                    b"user\0u\0_pq_.test_protocol_negotiation\0\0\0",
+                ))
+                .await
+                .unwrap();
+            let mut head = [0u8; 13];
+            client.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[0], b'v');
+            assert_eq!(
+                u32::from_be_bytes(head[5..9].try_into().unwrap()),
+                PROTOCOL_3_0
+            );
+            assert_eq!(u32::from_be_bytes(head[9..13].try_into().unwrap()), 1);
+            let payload_len = u32::from_be_bytes(head[1..5].try_into().unwrap()) as usize;
+            let mut name = vec![0u8; payload_len - 12];
+            client.read_exact(&mut name).await.unwrap();
+            assert_eq!(&name, b"_pq_.test_protocol_negotiation\0");
+        });
+        let mut server = server;
+        let params = read_startup(&mut server).await.expect("read_startup");
+        assert_eq!(params.get("user").map(String::as_str), Some("u"));
+        client_task.await.unwrap();
+    }
+
+    /// A 3.0 client asking for nothing extra must see no negotiation message:
+    /// libpq rejects one that reports no changes
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_startup_stays_silent_for_plain_protocol_3_0() {
+        let (client, server) = tokio::io::duplex(512);
+        let client_task = tokio::spawn(async move {
+            let mut client = client;
+            client
+                .write_all(&build_startup_message(&[("user", "u")]))
+                .await
+                .unwrap();
+            client
+        });
+        let mut server = server;
+        read_startup(&mut server).await.expect("read_startup");
+        let mut client = client_task.await.unwrap();
+        let mut byte = [0u8; 1];
+        // Server owes the client nothing yet, so the read has nothing to take
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            client.read_exact(&mut byte),
+        )
+        .await;
+        assert!(pending.is_err(), "unexpected byte {byte:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

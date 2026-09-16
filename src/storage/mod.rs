@@ -43,7 +43,7 @@ pub type ByteStream =
 pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
-    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_modified: Option<crate::time::Timestamp>,
 }
 
 /// Absolute object location for server-side copy. `backend` is an opaque

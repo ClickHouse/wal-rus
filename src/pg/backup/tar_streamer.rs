@@ -23,7 +23,6 @@ use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
@@ -36,6 +35,7 @@ use crate::pg::backup::increment::{
     self, Format as IncrementFormat, write_increment_header, write_native_increment_header,
 };
 use crate::pg::replication::base_backup::ChannelReader;
+use crate::time::Timestamp;
 
 /// wal-g default: `WALG_TAR_SIZE_THRESHOLD` = 1 GiB
 pub const DEFAULT_TAR_SIZE_THRESHOLD: u64 = 1 << 30;
@@ -109,7 +109,7 @@ pub struct FileMeta {
     #[serde(rename = "IsSkipped", default)]
     pub is_skipped: bool,
     #[serde(rename = "MTime")]
-    pub mtime: DateTime<Utc>,
+    pub mtime: Timestamp,
 }
 
 #[derive(Debug, Default)]
@@ -618,10 +618,8 @@ fn strip_dotslash(s: &str) -> &str {
     s.strip_prefix("./").unwrap_or(s)
 }
 
-fn header_mtime(h: &Header) -> DateTime<Utc> {
-    let secs = h.mtime().unwrap_or(0) as i64;
-    DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
+fn header_mtime(h: &Header) -> Timestamp {
+    Timestamp::from_unix(h.mtime().unwrap_or(0) as i64, 0)
 }
 
 fn broken_pipe() -> std::io::Error {

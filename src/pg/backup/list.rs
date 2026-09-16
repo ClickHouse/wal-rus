@@ -9,12 +9,13 @@ use futures::StreamExt;
 use crate::pg::backup::fetch::fetch_sentinel;
 use crate::pg::backup::name_from_sentinel_key;
 use crate::storage::DynStorage;
+use crate::time::Timestamp;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupSummary {
     pub name: String,
-    pub start_time: Option<chrono::DateTime<chrono::Utc>>,
-    pub finish_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub start_time: Option<Timestamp>,
+    pub finish_time: Option<Timestamp>,
     pub start_lsn: Option<NonZeroU64>,
     pub finish_lsn: Option<NonZeroU64>,
     pub pg_version: i32,
@@ -48,7 +49,7 @@ pub async fn collect(storage: DynStorage) -> Result<Vec<BackupSummary>> {
         .list(&prefix)
         .await
         .with_context(|| format!("list {prefix}"))?;
-    let mut sentinel_keys: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
+    let mut sentinel_keys: Vec<(String, Option<Timestamp>)> = Vec::new();
     while let Some(item) = stream.next().await {
         let obj = item.context("list iteration")?;
         if name_from_sentinel_key(&obj.key).is_some() {
@@ -107,11 +108,11 @@ fn print_plain(backups: &[BackupSummary]) {
     for b in backups {
         let start = b
             .start_time
-            .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .map(Timestamp::rfc3339_secs)
             .unwrap_or_else(|| "-".into());
         let finish = b
             .finish_time
-            .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .map(Timestamp::rfc3339_secs)
             .unwrap_or_else(|| "-".into());
         let host = b.hostname.as_deref().unwrap_or("-");
         println!(
@@ -126,7 +127,6 @@ mod tests {
     use super::*;
     use crate::pg::backup::test_fixtures::{fs_store, put_bytes, put_sentinel};
     use crate::pg::backup::{BackupSentinelDto, BackupSentinelDtoV2, sentinel_key};
-    use chrono::{TimeZone, Utc};
 
     fn sentinel(host: &str, ts: i64, perm: bool) -> BackupSentinelDtoV2 {
         BackupSentinelDtoV2 {
@@ -140,8 +140,8 @@ mod tests {
             },
             hostname: host.into(),
             is_permanent: perm,
-            start_time: Utc.timestamp_opt(ts, 0).unwrap(),
-            finish_time: Utc.timestamp_opt(ts + 60, 0).unwrap(),
+            start_time: Timestamp::from_unix(ts, 0),
+            finish_time: Timestamp::from_unix(ts + 60, 0),
             ..Default::default()
         }
     }

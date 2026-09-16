@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::pg::parse_hex;
+use crate::time::Timestamp;
 
 pub mod copy;
 pub mod delete;
@@ -306,7 +306,7 @@ pub struct FileDescription {
     #[serde(rename = "IsSkipped", default)]
     pub is_skipped: bool,
     #[serde(rename = "MTime")]
-    pub mtime: DateTime<Utc>,
+    pub mtime: Timestamp,
     #[serde(rename = "UpdatesCount", default)]
     pub updates_count: u64,
 }
@@ -395,8 +395,8 @@ pub struct BackupSentinelDto {
 /// Extended metadata file emitted alongside sentinel
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedMetadataDto {
-    pub start_time: DateTime<Utc>,
-    pub finish_time: DateTime<Utc>,
+    pub start_time: Timestamp,
+    pub finish_time: Timestamp,
     pub date_fmt: String,
     pub hostname: String,
     pub data_dir: String,
@@ -421,9 +421,9 @@ pub struct BackupSentinelDtoV2 {
     #[serde(rename = "Version")]
     pub version: i32,
     #[serde(rename = "StartTime")]
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
     #[serde(rename = "FinishTime")]
-    pub finish_time: DateTime<Utc>,
+    pub finish_time: Timestamp,
     #[serde(rename = "DateFmt")]
     pub date_fmt: String,
     #[serde(rename = "Hostname")]
@@ -438,12 +438,11 @@ impl Default for BackupSentinelDtoV2 {
     /// Epoch timestamps + empty host/dir; `version` 2 and the standard date
     /// format. Tests override only the fields under test via struct-update
     fn default() -> Self {
-        let epoch = DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch valid");
         Self {
             sentinel: BackupSentinelDto::default(),
             version: 2,
-            start_time: epoch,
-            finish_time: epoch,
+            start_time: Timestamp::EPOCH,
+            finish_time: Timestamp::EPOCH,
             date_fmt: METADATA_DATETIME_FORMAT.into(),
             hostname: String::new(),
             data_dir: String::new(),

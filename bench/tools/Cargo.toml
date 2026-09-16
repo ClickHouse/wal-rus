@@ -29,7 +29,6 @@ path = "src/bin/compare.rs"
 [dependencies]
 ab_glyph = "0.2.32"
 anyhow = "1.0.102"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 csv = "1.4.0"
 dejavu = "2.37.0"
