@@ -209,31 +209,73 @@ pub(super) async fn download_to_running(
     Ok(true)
 }
 
+/// Keys to try for `name`, configured compression first
+fn candidate_keys(
+    name: &str,
+    preferred: compression::Method,
+) -> impl Iterator<Item = (String, compression::Method)> {
+    let preferred_ext = preferred.extension();
+    std::iter::once(preferred_ext)
+        .chain(
+            CANDIDATE_EXTS
+                .iter()
+                .copied()
+                .filter(move |e| *e != preferred_ext),
+        )
+        .map(move |ext| {
+            let key = if ext.is_empty() {
+                format!("{}/{}", pg::WAL_FOLDER, name)
+            } else {
+                format!("{}/{}.{}", pg::WAL_FOLDER, name, ext)
+            };
+            let method =
+                compression::Method::from_extension(ext).unwrap_or(compression::Method::None);
+            (key, method)
+        })
+}
+
+/// Read one archived WAL object whole, over the same throttle, decrypt and
+/// decompress chain [`handle`] uses, without staging it on disk.
+///
+/// Unlike [`handle`], fetches each candidate directly instead of probing for
+/// it: a bucket written under one compression costs one request, not an
+/// existence check per extension
+pub async fn read_segment(
+    settings: &Settings,
+    storage: &DynStorage,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let preferred = if is_history_filename(name) {
+        compression::Method::None
+    } else {
+        settings.compression
+    };
+    for (key, method) in candidate_keys(name, preferred) {
+        let body = match storage.get(&key).await {
+            Ok(body) => body,
+            Err(StorageError::NotFound(_)) => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("get {key}"))),
+        };
+        let mut decoded =
+            compression::decode(method, settings.decrypt(settings.throttle_network(body)));
+        let mut bytes = Vec::new();
+        decoded
+            .read_to_end(&mut bytes)
+            .await
+            .with_context(|| format!("read {key}"))?;
+        return Ok(bytes);
+    }
+    Err(ArchiveNotFound(name.to_string()).into())
+}
+
 async fn find_object(
     storage: &dyn crate::storage::Storage,
     name: &str,
     preferred: compression::Method,
 ) -> Result<Option<(String, compression::Method)>> {
-    let preferred_ext = preferred.extension();
-    let mut order: Vec<&str> = vec![preferred_ext];
-    for e in CANDIDATE_EXTS {
-        if !order.contains(e) {
-            order.push(e);
-        }
-    }
-
-    for ext in order {
-        let key = if ext.is_empty() {
-            format!("{}/{}", pg::WAL_FOLDER, name)
-        } else {
-            format!("{}/{}.{}", pg::WAL_FOLDER, name, ext)
-        };
+    for (key, method) in candidate_keys(name, preferred) {
         match storage.exists(&key).await {
-            Ok(true) => {
-                let m =
-                    compression::Method::from_extension(ext).unwrap_or(compression::Method::None);
-                return Ok(Some((key, m)));
-            }
+            Ok(true) => return Ok(Some((key, method))),
             Ok(false) => continue,
             Err(StorageError::NotFound(_)) => continue,
             Err(e) => return Err(e.into()),

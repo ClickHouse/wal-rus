@@ -793,3 +793,37 @@ async fn ciphertext_overhead_matches_libsodium_layout() {
     let expected = 24 + (8192 + 17) + (2048 + 17);
     assert_eq!(stored_len, expected, "wire layout drift");
 }
+
+#[tokio::test]
+async fn read_segment_returns_bytes_across_compressions() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage_dir = dir.path().join("storage");
+    let stage = dir.path().join("stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    let name = "000000010000000000000009";
+    let src = stage.join(name);
+    std::fs::write(&src, b"in-memory wal").unwrap();
+
+    let store = Arc::new(FsStorage::new(&storage_dir).unwrap());
+    let pushed = settings_for(storage_dir.to_str().unwrap(), Method::None);
+    wal::push::handle(&pushed, store.clone(), &src)
+        .await
+        .unwrap();
+
+    // Bucket written under another compression still reads back
+    let reading = settings_for(storage_dir.to_str().unwrap(), Method::Zstd);
+    let bytes = wal::fetch::read_segment(&reading, &(store.clone() as _), name)
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"in-memory wal");
+
+    let missing = wal::fetch::read_segment(&reading, &(store as _), "000000010000000000000010")
+        .await
+        .unwrap_err();
+    assert!(
+        missing
+            .downcast_ref::<wal::fetch::ArchiveNotFound>()
+            .is_some(),
+        "{missing:#}"
+    );
+}
