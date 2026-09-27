@@ -214,7 +214,9 @@ Accepted by wal-g Postgres config but not used by PG code paths:
 - `GCS_MAX_CHUNK_SIZE`
 - `GCS_MAX_RETRIES`
 
-GCE/GKE metadata-server auth is not implemented.
+Without `GOOGLE_APPLICATION_CREDENTIALS`, tokens come from the GCE/GKE
+metadata server (the VM's attached service account). `GCE_METADATA_HOST` is
+not read.
 
 ### Storage backends not implemented
 
