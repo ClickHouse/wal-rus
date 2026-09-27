@@ -1,7 +1,8 @@
 //! GCS backend
 //!
 //! Auth: service-account JSON file pointed to by GOOGLE_APPLICATION_CREDENTIALS
-//! Streaming uploads via chunked transfer encoding (uploadType=media)
+//! when set, else the GCE/GKE metadata server (the VM's attached service
+//! account). Streaming uploads via chunked transfer encoding (uploadType=media)
 //!
 //! Env: GOOGLE_APPLICATION_CREDENTIALS, WALG_GS_PREFIX (parsed by config layer)
 
@@ -29,6 +30,8 @@ use super::{
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const STORAGE_HOST: &str = "https://storage.googleapis.com";
 const SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
+const METADATA_HOST: &str = "http://metadata.google.internal";
+const METADATA_TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
 
 #[derive(Debug, Deserialize)]
 struct ServiceAccount {
@@ -53,12 +56,20 @@ pub struct GcsConfig {
     pub endpoint: Option<String>,
 }
 
+enum TokenSource {
+    /// fake-gcs-server (emulator): no auth at all
+    None,
+    /// Service-account key file: self-signed JWT exchanged at its token endpoint
+    Static(ServiceAccount),
+    /// GCE/GKE instance metadata server.
+    Imds { endpoint: String, client: Client },
+}
+
 pub struct GcsStorage {
     cfg: GcsConfig,
     client: Client,
     host: String,
-    /// None in emulator mode (fake-gcs-server): no service account, no oauth2
-    sa: Option<ServiceAccount>,
+    token_source: TokenSource,
     token: Arc<Mutex<Option<CachedToken>>>,
 }
 
@@ -83,26 +94,28 @@ impl GcsStorage {
                 cfg,
                 client,
                 host,
-                sa: None,
+                token_source: TokenSource::None,
                 token: Arc::new(Mutex::new(None)),
             });
         }
 
-        let path = cfg.credentials_path.clone().ok_or_else(|| {
-            StorageError::Config(
-                "GOOGLE_APPLICATION_CREDENTIALS not set; metadata-server auth not yet supported"
-                    .into(),
-            )
-        })?;
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| StorageError::Config(format!("read credentials {}: {}", path, e)))?;
-        let sa: ServiceAccount = serde_json::from_str(&raw)
-            .map_err(|e| StorageError::Config(format!("parse credentials: {e}")))?;
+        // No key file: fall back to the metadata server, mirroring the S3
+        // "no static keys -> IMDS" default
+        let token_source = match cfg.credentials_path.as_deref().filter(|s| !s.is_empty()) {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|e| StorageError::Config(format!("read credentials {path}: {e}")))?;
+                let sa: ServiceAccount = serde_json::from_str(&raw)
+                    .map_err(|e| StorageError::Config(format!("parse credentials: {e}")))?;
+                TokenSource::Static(sa)
+            }
+            None => imds_source(METADATA_HOST.to_string())?,
+        };
         Ok(Self {
             cfg,
             client,
             host: STORAGE_HOST.to_string(),
-            sa: Some(sa),
+            token_source,
             token: Arc::new(Mutex::new(None)),
         })
     }
@@ -113,9 +126,9 @@ impl GcsStorage {
 
     async fn access_token(&self) -> Result<String> {
         // Emulator mode: fake-gcs-server ignores the bearer token
-        let Some(sa) = self.sa.as_ref() else {
+        if matches!(self.token_source, TokenSource::None) {
             return Ok("emulator".into());
-        };
+        }
         let mut guard = self.token.lock().await;
         let now = SystemTime::now();
         if let Some(c) = guard.as_ref()
@@ -124,6 +137,42 @@ impl GcsStorage {
             return Ok(c.token.clone());
         }
 
+        // Both sources answer with the same OAuth2 token document
+        let req = match &self.token_source {
+            TokenSource::None => unreachable!("handled above"),
+            TokenSource::Static(sa) => self.jwt_bearer_request(sa, now)?,
+            TokenSource::Imds { endpoint, client } => client
+                .get(format!("{endpoint}{METADATA_TOKEN_PATH}"))
+                .header("Metadata-Flavor", "Google"),
+        };
+        let resp = req.send().await?;
+
+        if !resp.status().is_success() {
+            let st = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(StorageError::Auth(format!("token endpoint {st}: {body}")));
+        }
+
+        #[derive(Deserialize)]
+        struct TokenResp {
+            access_token: String,
+            expires_in: u64,
+        }
+        let tr: TokenResp = resp.json().await?;
+        let exp = now + Duration::from_secs(tr.expires_in);
+        *guard = Some(CachedToken {
+            token: tr.access_token.clone(),
+            expires_at: exp,
+        });
+        Ok(tr.access_token)
+    }
+
+    /// JWT-bearer assertion signed with the service-account key
+    fn jwt_bearer_request(
+        &self,
+        sa: &ServiceAccount,
+        now: SystemTime,
+    ) -> Result<reqwest::RequestBuilder> {
         let now_secs = now
             .duration_since(UNIX_EPOCH)
             .map_err(|e| StorageError::Auth(e.to_string()))?
@@ -151,34 +200,10 @@ impl GcsStorage {
         let jwt = format!("{signing_input}.{s_b64}");
 
         let token_url = sa.token_uri.as_deref().unwrap_or(TOKEN_URL);
-        let resp = self
-            .client
-            .post(token_url)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-                ("assertion", jwt.as_str()),
-            ])
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(StorageError::Auth(format!("token endpoint {st}: {body}")));
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResp {
-            access_token: String,
-            expires_in: u64,
-        }
-        let tr: TokenResp = resp.json().await?;
-        let exp = now + Duration::from_secs(tr.expires_in);
-        *guard = Some(CachedToken {
-            token: tr.access_token.clone(),
-            expires_at: exp,
-        });
-        Ok(tr.access_token)
+        Ok(self.client.post(token_url).form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", jwt.as_str()),
+        ]))
     }
 
     fn object_url(&self, key: &str) -> String {
@@ -189,13 +214,24 @@ impl GcsStorage {
 
     /// Server-side copy identity: rewriteTo authorizes both sides with one
     /// token, so same service account (or same emulator host) is the safe
-    /// equivalence
+    /// equivalence. IMDS is one identity per host
     fn backend_id(&self) -> String {
-        match self.sa.as_ref() {
-            Some(sa) => format!("gs:{}", sa.client_email),
-            None => format!("gs:emulator:{}", self.host),
+        match &self.token_source {
+            TokenSource::Static(sa) => format!("gs:{}", sa.client_email),
+            TokenSource::Imds { .. } => "gs:imds".into(),
+            TokenSource::None => format!("gs:emulator:{}", self.host),
         }
     }
+}
+
+fn imds_source(endpoint: String) -> Result<TokenSource> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(1))
+        .no_proxy()
+        .build()
+        .map_err(|e| StorageError::Config(format!("metadata client: {e}")))?;
+    Ok(TokenSource::Imds { endpoint, client })
 }
 
 /// rewriteTo URL; object names percent-encoded as single path segments
@@ -579,7 +615,7 @@ mod tests {
             endpoint: Some("http://127.0.0.1:4443".into()),
         })
         .expect("emulator mode needs no credentials");
-        assert!(s.sa.is_none());
+        assert!(matches!(s.token_source, TokenSource::None));
         assert_eq!(s.host, "http://127.0.0.1:4443");
         assert!(
             s.object_url("wal_005/x")
@@ -587,7 +623,68 @@ mod tests {
         );
     }
 
-    /// Emulator-mode GcsStorage (sa = None) built directly against an
+    #[test]
+    fn no_credentials_falls_back_to_metadata_server() {
+        for credentials_path in [None, Some(String::new())] {
+            let s = GcsStorage::new(GcsConfig {
+                bucket: "b".into(),
+                prefix: "p".into(),
+                credentials_path,
+                endpoint: None,
+            })
+            .expect("no key file selects metadata auth");
+            assert!(
+                matches!(&s.token_source, TokenSource::Imds { endpoint, .. } if endpoint == METADATA_HOST)
+            );
+            assert_eq!(s.host, STORAGE_HOST);
+            assert_eq!(s.backend_id(), "gs:imds");
+        }
+    }
+
+    #[tokio::test]
+    async fn access_token_from_metadata_server_and_caches() {
+        use crate::storage::test_http::{Resp, serve};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let h = hits.clone();
+        let base = serve(move |req| {
+            h.fetch_add(1, Ordering::SeqCst);
+            if req.path != METADATA_TOKEN_PATH
+                || req.headers.get("metadata-flavor").map(String::as_str) != Some("Google")
+            {
+                return Resp::new(403);
+            }
+            Resp::new(200).body(
+                b"{\"access_token\":\"vmtok\",\"expires_in\":3599,\"token_type\":\"Bearer\"}"
+                    .to_vec(),
+            )
+        })
+        .await;
+
+        let s = GcsStorage {
+            cfg: GcsConfig {
+                bucket: "b".into(),
+                prefix: "p".into(),
+                credentials_path: None,
+                endpoint: None,
+            },
+            client: Client::builder().build().unwrap(),
+            host: STORAGE_HOST.into(),
+            token_source: imds_source(base).unwrap(),
+            token: Arc::new(Mutex::new(None)),
+        };
+
+        assert_eq!(s.access_token().await.unwrap(), "vmtok");
+        assert_eq!(s.access_token().await.unwrap(), "vmtok");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second token request must hit the cache"
+        );
+    }
+
+    /// Emulator-mode GcsStorage built directly against an
     /// in-process mock of the GCS JSON API; drives put/get/exists/list/
     /// delete/rewrite without env or credentials.
     fn emulator(host: String) -> GcsStorage {
@@ -600,7 +697,7 @@ mod tests {
             },
             client: Client::builder().build().unwrap(),
             host,
-            sa: None,
+            token_source: TokenSource::None,
             token: Arc::new(Mutex::new(None)),
         }
     }
@@ -765,7 +862,7 @@ mod tests {
             },
             client: Client::builder().build().unwrap(),
             host: "http://127.0.0.1:1".into(), // unused: access_token only hits token_uri
-            sa: Some(ServiceAccount {
+            token_source: TokenSource::Static(ServiceAccount {
                 client_email: "svc@test.iam.gserviceaccount.com".into(),
                 private_key: pem,
                 token_uri: Some(format!("{token_base}/token")),
