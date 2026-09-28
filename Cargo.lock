@@ -2244,6 +2244,7 @@ dependencies = [
  "glob",
  "hex",
  "libc",
+ "memchr",
  "percent-encoding",
  "postgres-protocol",
  "quick-xml",

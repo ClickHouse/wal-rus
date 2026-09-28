@@ -42,5 +42,5 @@ pub use types::{
 /// All-zero pages mark the unwritten tail of a WAL segment; both parse.rs
 /// (page header check) and state.rs (continuation-record skip) need it
 pub(crate) fn all_zero(buf: &[u8]) -> bool {
-    buf.iter().all(|&b| b == 0)
+    memchr::memchr_iter(0, buf).count() == buf.len()
 }

@@ -106,6 +106,13 @@ impl PagedFileDeltaMap {
         }
     }
 
+    /// Union `blocks` into rel's set, empty sets add no entry
+    pub fn add_blocks(&mut self, rel: RelFileNode, blocks: RoaringBitmap) {
+        if !blocks.is_empty() {
+            *self.by_rel.entry(rel).or_default() |= blocks;
+        }
+    }
+
     /// Per-rel set union of another map. Disjoint LSN sub-ranges of one delta
     /// (eg summaries + a raw-walked gap) compose by changed-block union
     pub fn merge(&mut self, other: PagedFileDeltaMap) {

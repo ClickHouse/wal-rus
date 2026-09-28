@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use roaring::RoaringBitmap;
@@ -102,14 +102,8 @@ pub fn read_for_range(
     }
     let mut delta = PagedFileDeltaMap::new();
     for (key, st) in state {
-        if key.fork_num != MAIN_FORK_NUM {
-            continue;
-        }
-        for block in st.blocks {
-            delta.add_location(crate::pg::walparser::BlockLocation {
-                rel: key.rel,
-                block_no: block,
-            });
+        if key.fork_num == MAIN_FORK_NUM {
+            delta.add_blocks(key.rel, st.blocks);
         }
     }
     Ok((delta, covered_start, covered_end))
@@ -229,8 +223,9 @@ fn parse_summary_file(
     path: &Path,
     state: &mut BTreeMap<RelForkKey, RelForkState>,
 ) -> Result<(), SummaryError> {
-    let mut f = File::open(path)?;
+    let mut f = BufReader::new(File::open(path)?);
     let mut hasher = Crc32cHasher::new();
+    let mut buf = Vec::new();
 
     let mut magic_buf = [0u8; 4];
     read_full(&mut f, &mut magic_buf, &mut hasher)?;
@@ -269,6 +264,7 @@ fn parse_summary_file(
         parse_chunks(
             &mut f,
             &mut hasher,
+            &mut buf,
             nchunks,
             spc_oid,
             db_oid,
@@ -282,8 +278,9 @@ fn parse_summary_file(
 
 #[allow(clippy::too_many_arguments)]
 fn parse_chunks(
-    f: &mut File,
+    f: &mut impl Read,
     hasher: &mut Crc32cHasher,
+    buf: &mut Vec<u8>,
     nchunks: u32,
     spc_oid: u32,
     db_oid: u32,
@@ -310,37 +307,21 @@ fn parse_chunks(
     }
     let mut usage_buf = vec![0u8; nchunks as usize * 2];
     read_full(f, &mut usage_buf, hasher)?;
-    let usage: Vec<u16> = (0..nchunks as usize)
-        .map(|i| u16::from_le_bytes(usage_buf[i * 2..i * 2 + 2].try_into().unwrap()))
-        .collect();
-    for (chunk_no, &used) in usage.iter().enumerate() {
+    for (chunk_no, used) in usage_buf.as_chunks::<2>().0.iter().enumerate() {
+        let used = u16::from_le_bytes(*used);
         if used == 0 {
             continue;
         }
         let base = chunk_no as u32 * BLOCKS_PER_CHUNK;
+        buf.resize(used as usize * 2, 0);
+        read_full(f, buf, hasher)?;
         if used == MAX_ENTRIES_PER_CHUNK as u16 {
-            // 4096 u16 words = 8 KiB bitmap; bit j of word i → block base + i*16 + j
-            let mut buf = vec![0u8; MAX_ENTRIES_PER_CHUNK as usize * 2];
-            read_full(f, &mut buf, hasher)?;
-            for i in 0..MAX_ENTRIES_PER_CHUNK as usize {
-                let w = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
-                if w == 0 {
-                    continue;
-                }
-                for bit in 0..BLOCKS_PER_ENTRY as usize {
-                    if w & (1u16 << bit) != 0 {
-                        st.blocks
-                            .insert(base + i as u32 * BLOCKS_PER_ENTRY + bit as u32);
-                    }
-                }
-            }
+            // 8 KiB of LE u16 words, bit j of byte i → block base + i*8 + j
+            st.blocks |= RoaringBitmap::from_lsb0_bytes(base, buf);
         } else {
             // array of `used` u16 offsets within the chunk
-            let mut buf = vec![0u8; used as usize * 2];
-            read_full(f, &mut buf, hasher)?;
-            for i in 0..used as usize {
-                let off = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
-                st.blocks.insert(base + off as u32);
+            for off in buf.as_chunks::<2>().0 {
+                st.blocks.insert(base + u16::from_le_bytes(*off) as u32);
             }
         }
     }
@@ -744,6 +725,7 @@ mod tests {
                 &[1, 2],
             )
             .entry_array(1663, 16385, 100, 2, INVALID_BLOCK_NUMBER, &[7, 8])
+            .entry_no_chunks(1663, 16385, 101, MAIN_FORK_NUM, 0)
             .finish();
         // filename must cover [0x100, 0x200) on timeline 1
         let fname = "0000000100000000000001000000000000000200.summary";
@@ -760,5 +742,6 @@ mod tests {
             vec![1u32, 2u32],
             "vm fork must be excluded"
         );
+        assert_eq!(m.blocks_for("base/16385/101").unwrap(), None);
     }
 }
