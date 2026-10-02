@@ -1,6 +1,6 @@
 [package]
 name = "wal-rus"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 rust-version = "1.90"
 description = "Rust port of wal-g for PostgreSQL, optimized for no-overcommit hosts"
@@ -49,13 +49,16 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 rustls-pki-types = "1"
 rustls-pemfile = "2"
 webpki-roots = "1"
-dryoc = { version = "1", default-features = false, features = ["u64_backend"] }
+dryoc = { version = "2", default-features = false, features = ["std"] }
 libc = "0.2"
 glob = "0.3.3"
 
 [dev-dependencies]
 tempfile = "3"
 tar = "0.4"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [features]
 # Enabled only on the VM test runner: hits a real PG cluster at PGPORT
