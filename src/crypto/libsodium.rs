@@ -21,8 +21,15 @@ use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
-use dryoc::dryocstream::{DryocStream, Header, Key, Pull, Push, Tag};
-use dryoc::types::ByteArray;
+use dryoc::classic::crypto_secretstream_xchacha20poly1305::{
+    State, crypto_secretstream_xchacha20poly1305_init_pull,
+    crypto_secretstream_xchacha20poly1305_init_push, crypto_secretstream_xchacha20poly1305_pull,
+    crypto_secretstream_xchacha20poly1305_push,
+};
+use dryoc::constants::{
+    CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_FINAL as TAG_FINAL,
+    CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_TAG_MESSAGE as TAG_MESSAGE,
+};
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::compression::AsyncReader;
@@ -182,7 +189,7 @@ fn drain_into(out: &mut Vec<u8>, out_pos: &mut usize, buf: &mut ReadBuf<'_>) -> 
 
 struct EncryptReader {
     inner: AsyncReader,
-    stream: Option<DryocStream<Push>>,
+    stream: Option<State>,
     key: [u8; KEY_BYTES],
     /// Ciphertext (and the leading header) waiting to be drained
     out: Vec<u8>,
@@ -216,30 +223,29 @@ impl EncryptReader {
         if self.stream.is_some() {
             return;
         }
-        let key: Key = self.key.into();
-        let (push, header): (DryocStream<Push>, Header) = DryocStream::init_push(&key);
-        self.out.extend_from_slice(header.as_array());
-        self.stream = Some(push);
+        let mut state = State::new();
+        let mut header = [0u8; HEADER_BYTES];
+        crypto_secretstream_xchacha20poly1305_init_push(&mut state, &mut header, &self.key);
+        self.out.extend_from_slice(&header);
+        self.stream = Some(state);
     }
 
     fn push_chunk(&mut self, last: bool) -> std::io::Result<()> {
         let s = self.stream.as_mut().expect("init_if_needed called");
-        let tag = if last { Tag::FINAL } else { Tag::MESSAGE };
-        // dryoc's `Bytes` impl needs a `Sized` Input — `&[u8]` qualifies,
-        // so pass-by-double-reference here to keep the call zero-copy
-        let plaintext: &[u8] = &self.in_buf[..self.in_filled];
-        let ct: Vec<u8> = s
-            .push(&plaintext, None, tag)
-            .map_err(|e| std::io::Error::other(format!("libsodium push: {e}")))?;
-        // When out is fully drained (out_pos == len), adopt dryoc's Vec
-        // directly instead of copying via extend_from_slice. The header
-        // path & rare partial-drain interleavings still extend
-        if self.out_pos == self.out.len() {
-            self.out = ct;
-            self.out_pos = 0;
-        } else {
-            self.out.extend_from_slice(&ct);
-        }
+        let tag = if last { TAG_FINAL } else { TAG_MESSAGE };
+        debug_assert!(self.out.is_empty(), "push only after full drain");
+        self.out.resize(self.in_filled + ABYTES, 0);
+        crypto_secretstream_xchacha20poly1305_push(
+            s,
+            &mut self.out,
+            &self.in_buf[..self.in_filled],
+            None,
+            tag,
+        )
+        .map_err(|e| {
+            self.out.clear();
+            std::io::Error::other(format!("libsodium push: {e}"))
+        })?;
         self.in_filled = 0;
         if last {
             self.finalized = true;
@@ -295,7 +301,7 @@ impl AsyncRead for EncryptReader {
 
 struct DecryptReader {
     inner: AsyncReader,
-    stream: Option<DryocStream<Pull>>,
+    stream: Option<State>,
     key: [u8; KEY_BYTES],
     /// Header bytes accumulated until init_pull runs. Pre-allocated,
     /// length-tracked by `header_filled` to avoid per-poll allocs
@@ -331,20 +337,23 @@ impl DecryptReader {
 
     fn pull_chunk(&mut self) -> std::io::Result<()> {
         let s = self.stream.as_mut().expect("init done");
-        // See comment in `push_chunk` re: `&&[u8]` shape
-        let ciphertext: &[u8] = &self.in_buf[..self.in_filled];
-        let (pt, tag): (Vec<u8>, Tag) = s
-            .pull(&ciphertext, None)
-            .map_err(|e| std::io::Error::other(format!("libsodium pull: {e}")))?;
-        if self.out_pos == self.out.len() {
-            // Drained; adopt dryoc's Vec without copying
-            self.out = pt;
-            self.out_pos = 0;
-        } else {
-            self.out.extend_from_slice(&pt);
-        }
+        debug_assert!(self.out.is_empty(), "pull only after full drain");
+        self.out.resize(self.in_filled - ABYTES, 0);
+        let mut tag = 0u8;
+        crypto_secretstream_xchacha20poly1305_pull(
+            s,
+            &mut self.out,
+            &mut tag,
+            &self.in_buf[..self.in_filled],
+            None,
+        )
+        .map_err(|e| {
+            // Drop zeroed placeholder so a retried poll can't drain it as plaintext
+            self.out.clear();
+            std::io::Error::other(format!("libsodium pull: {e}"))
+        })?;
         self.in_filled = 0;
-        if matches!(tag, Tag::FINAL) {
+        if tag == TAG_FINAL {
             self.finalized = true;
         }
         Ok(())
@@ -384,9 +393,13 @@ impl AsyncRead for DecryptReader {
                 }
                 me.header_filled += n;
                 if me.header_filled == HEADER_BYTES {
-                    let key: Key = me.key.into();
-                    let hdr: Header = me.header_buf.into();
-                    me.stream = Some(DryocStream::<Pull>::init_pull(&key, &hdr));
+                    let mut state = State::new();
+                    crypto_secretstream_xchacha20poly1305_init_pull(
+                        &mut state,
+                        &me.header_buf,
+                        &me.key,
+                    );
+                    me.stream = Some(state);
                 }
                 continue;
             }

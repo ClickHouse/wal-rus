@@ -1,17 +1,20 @@
-//! Minimal in-process HTTP/1.1 server for storage backend tests.
-//!
-//! Speaks just enough to mock S3 / GCS REST against the reqwest client:
-//! one request per connection, `Connection: close`, Content-Length or
-//! chunked request bodies, optional `Expect: 100-continue`. Test-only; the
-//! signature/auth headers the backends emit are accepted blindly so the
-//! signing code runs without the mock having to validate it.
+//! In-process HTTP/1.1 server mocking S3 / GCS REST for storage backend
+//! tests. Signature/auth headers are accepted blindly so signing code runs
+//! without the mock validating it
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::StreamExt;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 
 use super::{AsyncReader, ObjectStream, Storage};
 
@@ -77,138 +80,39 @@ where
                 break;
             };
             let handler = handler.clone();
-            tokio::spawn(async move {
-                let _ = handle_conn(sock, handler).await;
+            let svc = service_fn(move |req| {
+                let handler = handler.clone();
+                async move { respond(req, &*handler).await }
             });
+            tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(sock), svc));
         }
     });
     format!("http://{addr}")
 }
 
-async fn handle_conn<H>(sock: TcpStream, handler: Arc<H>) -> std::io::Result<()>
+async fn respond<H>(req: Request<Incoming>, handler: &H) -> hyper::Result<Response<Full<Bytes>>>
 where
-    H: Fn(&Req) -> Resp + Send + Sync + 'static,
+    H: Fn(&Req) -> Resp,
 {
-    let (rd, mut wr) = tokio::io::split(sock);
-    let mut reader = BufReader::new(rd);
-
-    let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
-        return Ok(());
-    }
-    let mut it = line.trim_end().split(' ');
-    let method = it.next().unwrap_or("").to_string();
-    let target = it.next().unwrap_or("").to_string();
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut h = String::new();
-        if reader.read_line(&mut h).await? == 0 {
-            break;
-        }
-        let t = h.trim_end();
-        if t.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = t.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-
-    if headers
-        .get("expect")
-        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
-    {
-        wr.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-        wr.flush().await?;
-    }
-
-    let body = if headers
-        .get("transfer-encoding")
-        .is_some_and(|v| v.contains("chunked"))
-    {
-        read_chunked(&mut reader).await?
-    } else if let Some(n) = headers
-        .get("content-length")
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        let mut b = vec![0u8; n];
-        reader.read_exact(&mut b).await?;
-        b
-    } else {
-        Vec::new()
-    };
-
-    let (path, qs) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), q),
-        None => (target.clone(), ""),
-    };
+    let (parts, body) = req.into_parts();
+    let headers = parts
+        .headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+        .collect();
     let req = Req {
-        method,
-        path,
-        query: parse_query(qs),
+        method: parts.method.to_string(),
+        path: parts.uri.path().to_string(),
+        query: parse_query(parts.uri.query().unwrap_or("")),
         headers,
-        body,
+        body: body.collect().await?.to_bytes().to_vec(),
     };
     let resp = handler(&req);
-    write_resp(&mut wr, resp).await
-}
-
-async fn read_chunked(
-    reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
-) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line).await?;
-        let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
-        if size == 0 {
-            // consume trailing CRLF / any trailers
-            loop {
-                let mut l = String::new();
-                if reader.read_line(&mut l).await? == 0 || l.trim().is_empty() {
-                    break;
-                }
-            }
-            break;
-        }
-        let mut chunk = vec![0u8; size];
-        reader.read_exact(&mut chunk).await?;
-        out.append(&mut chunk);
-        let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf).await?;
-    }
-    Ok(out)
-}
-
-async fn write_resp(wr: &mut tokio::io::WriteHalf<TcpStream>, resp: Resp) -> std::io::Result<()> {
-    let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, reason(resp.status));
-    let mut has_len = false;
+    let mut out = Response::builder().status(resp.status);
     for (k, v) in &resp.headers {
-        if k.eq_ignore_ascii_case("content-length") {
-            has_len = true;
-        }
-        head.push_str(&format!("{k}: {v}\r\n"));
+        out = out.header(k, v);
     }
-    if !has_len {
-        head.push_str(&format!("content-length: {}\r\n", resp.body.len()));
-    }
-    head.push_str("connection: close\r\n\r\n");
-    wr.write_all(head.as_bytes()).await?;
-    wr.write_all(&resp.body).await?;
-    wr.flush().await
-}
-
-fn reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "Status",
-    }
+    Ok(out.body(Full::new(Bytes::from(resp.body))).unwrap())
 }
 
 fn parse_query(q: &str) -> Vec<(String, String)> {
