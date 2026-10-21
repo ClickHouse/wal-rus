@@ -51,7 +51,7 @@ pub struct Cli {
 }
 
 /// Parse argv, honoring the `walg-daemon-client` multicall name. wal-g ships a
-/// separate `walg-daemon-client SOCKET COMMAND [ARGS]` binary; when argv[0]'s
+/// separate `walg-daemon-client SOCKET COMMAND [ARGS]` binary; when `argv[0]`'s
 /// basename is `walg-daemon-client` (a symlink to this binary) we expose the
 /// same behavior by rewriting to the native `daemon-client` subcommand
 pub fn parse() -> Cli {

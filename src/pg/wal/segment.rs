@@ -96,6 +96,16 @@ impl SegmentName {
         )
     }
 
+    /// Segment containing `lsn`, inverse of [`Self::start_lsn`]
+    pub fn from_lsn(timeline: u32, lsn: u64, seg_size: u64) -> Self {
+        debug_assert!(seg_size > 0 && seg_size.is_power_of_two());
+        SegmentName {
+            timeline,
+            log_id: (lsn >> 32) as u32,
+            seg_no: ((lsn & 0xFFFF_FFFF) / seg_size) as u32,
+        }
+    }
+
     /// Starting LSN of the segment given seg size in bytes
     pub fn start_lsn(&self, seg_size: u64) -> u64 {
         ((self.log_id as u64) << 32) | (self.seg_no as u64).wrapping_mul(seg_size)
@@ -180,6 +190,13 @@ mod tests {
         // expected = (2 << 32) + 3*16MB
         let expected = (2u64 << 32) + 3 * 16 * 1024 * 1024;
         assert_eq!(s.start_lsn(DEFAULT_WAL_SEG_SIZE), expected);
+        assert_eq!(SegmentName::from_lsn(1, expected, DEFAULT_WAL_SEG_SIZE), s);
+        assert_eq!(
+            SegmentName::from_lsn(1, expected - 1, DEFAULT_WAL_SEG_SIZE).seg_no,
+            2
+        );
+        let gib = SegmentName::from_lsn(1, (2u64 << 32) + 3 * (1 << 30), 1 << 30);
+        assert_eq!(gib.format(), "000000010000000200000003");
     }
 
     #[test]

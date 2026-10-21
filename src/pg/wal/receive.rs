@@ -123,13 +123,7 @@ impl SegmentAccumulator {
     }
 
     fn segment_for_lsn(&self, lsn: u64) -> SegmentName {
-        let seg_no = lsn / self.seg_size;
-        let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / self.seg_size;
-        SegmentName {
-            timeline: self.timeline,
-            log_id: (seg_no / xlog_segs_per_xlog_id) as u32,
-            seg_no: (seg_no % xlog_segs_per_xlog_id) as u32,
-        }
+        SegmentName::from_lsn(self.timeline, lsn, self.seg_size)
     }
 
     /// Write `data` starting at `start_lsn`. Splits across segment

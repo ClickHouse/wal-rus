@@ -601,7 +601,9 @@ fn encode_copy_both_response(tx: &mut BytesMut) {
     tx.extend_from_slice(&0u16.to_be_bytes());
 }
 
-fn encode_error_response(tx: &mut BytesMut, code: &str, message: &str) {
+/// Append an `ErrorResponse`. Inside CopyBoth this aborts the stream, as PG's
+/// walsender does for a start it cannot serve, eg `58P01` for a removed segment
+pub fn encode_error_response(tx: &mut BytesMut, code: &str, message: &str) {
     let payload_len = 1 + b"ERROR\0".len() + 1 + code.len() + 1 + 1 + message.len() + 1 + 1;
     let len = 4 + payload_len;
     tx.extend_from_slice(b"E");
@@ -1241,6 +1243,15 @@ mod tests {
         assert_eq!(buf[8], b'd');
         assert_eq!(u32::from_be_bytes(buf[9..13].try_into().unwrap()), 6);
         assert_eq!(&buf[13..15], &[9, 9]);
+
+        let mut err = BytesMut::new();
+        encode_error_response(&mut err, "58P01", "gone");
+        conn.write_framed(&err).await.unwrap();
+        let mut buf = [0u8; 26];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], b'E');
+        assert_eq!(u32::from_be_bytes(buf[1..5].try_into().unwrap()), 25);
+        assert_eq!(&buf[5..], b"SERROR\0C58P01\0Mgone\0\0");
 
         let _sock = conn.into_inner();
     }

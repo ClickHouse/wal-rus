@@ -8,9 +8,11 @@
 //! Replicas aggregate to median, band = min..max
 //!
 //! Raw exports:
-//!   samples_<stamp>.csv  long table, one row per sample per run
-//!   summary_<stamp>.csv  one row per run: metadata + aggregates
-//!   summary.json         same per-run aggregates as JSON
+//! ```text
+//! samples_<stamp>.csv  long table, one row per sample per run
+//! summary_<stamp>.csv  one row per run: metadata + aggregates
+//! summary.json         same per-run aggregates as JSON
+//! ```
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

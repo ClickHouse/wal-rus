@@ -3,8 +3,10 @@
 //!
 //! Layout matches wal-g (`pg_wal/.wal-g/prefetch/`):
 //!
-//!   <pg_wal>/.wal-g/prefetch/running/<seg>   — partial download
-//!   <pg_wal>/.wal-g/prefetch/<seg>           — ready to promote
+//! ```text
+//! <pg_wal>/.wal-g/prefetch/running/<seg>   — partial download
+//! <pg_wal>/.wal-g/prefetch/<seg>           — ready to promote
+//! ```
 //!
 //! wal-fetch consults `<pg_wal>/.wal-g/prefetch/<seg>` first (see
 //! `super::fetch::handle`); a successful prefetch turns a network round-trip
