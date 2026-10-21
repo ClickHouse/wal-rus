@@ -30,7 +30,7 @@
 //! A user with a wal-g bucket that's *already* encrypted with OpenPGP must
 //! re-encrypt to libsodium before switching to walrus (or stay on wal-g).
 //! `WALG_PGP_*` env vars are detected and produce a hard error directing the
-//! user here rather than silently writing plaintext — see [`forbid_pgp_env`]
+//! user here rather than silently writing plaintext — see [`forbid_pgp`]
 
 use std::sync::Arc;
 

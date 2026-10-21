@@ -233,15 +233,8 @@ pub async fn integrity_for_backup(
         return Ok(Vec::new());
     };
     let seg_size = wal_segment_size();
-    let start_seg_no = backup_start_lsn / seg_size;
-    let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / seg_size;
-    let start = SegmentName {
-        timeline,
-        log_id: (start_seg_no / xlog_segs_per_xlog_id) as u32,
-        seg_no: (start_seg_no % xlog_segs_per_xlog_id) as u32,
-    };
     let mut gaps = Vec::new();
-    let mut cursor = start;
+    let mut cursor = SegmentName::from_lsn(timeline, backup_start_lsn, seg_size);
     loop {
         if !segs.contains(&cursor) {
             let mut probe = cursor;

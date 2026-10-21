@@ -336,7 +336,7 @@ pub struct SegmentBoundary {
 /// reparse can fan these across cores and union the results; records crossing a
 /// boundary are reconstructed by the caller from
 /// `trailing_head[i] ++ leading_tail[i+1]`. Shares
-/// [`process_locations_from_page`]'s allocation-light location-only walk.
+/// `process_locations_from_page`'s allocation-light location-only walk.
 /// Mirrors wal-g's per-segment `WalDeltaRecordingReader`
 pub fn walk_segment_locations<F: FnMut(BlockLocation)>(
     bytes: &[u8],

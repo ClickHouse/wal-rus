@@ -1,4 +1,4 @@
-//! wal-push: read local WAL segment, compress, upload to wal_005/<name>.<ext>
+//! wal-push: read local WAL segment, compress, upload to `wal_005/<name>.<ext>`
 
 use std::path::Path;
 

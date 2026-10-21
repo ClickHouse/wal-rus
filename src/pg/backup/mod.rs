@@ -94,14 +94,8 @@ pub fn tar_part_key(name: &str, file_no: u32, ext: &str) -> String {
 /// `base_TTTTTTTTLLLLLLLLSSSSSSSS` from start LSN, using xlog_internal.h math
 pub fn format_backup_name(timeline: u32, start_lsn: u64, seg_size: u64) -> String {
     assert!(seg_size > 0 && seg_size.is_power_of_two());
-    let seg_no = start_lsn / seg_size;
-    let xlog_segs_per_xlog_id = 0x1_0000_0000u64 / seg_size;
-    let log_id = (seg_no / xlog_segs_per_xlog_id) as u32;
-    let seg_low = (seg_no % xlog_segs_per_xlog_id) as u32;
-    format!(
-        "{}{:08X}{:08X}{:08X}",
-        BACKUP_NAME_PREFIX, timeline, log_id, seg_low
-    )
+    let seg = crate::pg::wal::segment::SegmentName::from_lsn(timeline, start_lsn, seg_size);
+    format!("{BACKUP_NAME_PREFIX}{}", seg.format())
 }
 
 /// Inverse of [`format_backup_name`]: parse the timeline ID from the first

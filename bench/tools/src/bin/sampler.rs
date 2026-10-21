@@ -184,7 +184,7 @@ fn detect_default_iface() -> Option<String> {
 // --------------------------------------------------------------------------
 // /proc readers
 // --------------------------------------------------------------------------
-/// /proc/<pid>/status memory fields, kB
+/// `/proc/<pid>/status` memory fields, kB
 #[derive(Default, Clone, Copy)]
 struct MemStats {
     vmpeak: Option<u64>,
@@ -243,7 +243,7 @@ fn read_proc_status(pid: i32) -> MemStats {
     out
 }
 
-/// utime/stime ticks from /proc/<pid>/stat
+/// utime/stime ticks from `/proc/<pid>/stat`
 fn read_proc_cpu_jiffies(pid: i32) -> Option<(u64, u64)> {
     let data = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rparen = data.rfind(')')?;

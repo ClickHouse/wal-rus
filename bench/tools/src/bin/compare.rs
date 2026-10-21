@@ -1,9 +1,11 @@
 //! bench-compare, grouped-bar comparison across tools
 //!
 //! Reads op_metrics.txt, cpu.csv, and mem.csv from each --run. Emits:
-//!   backup_compare.png   stacked bar panels: size, duration, CPU, RSS, VM
-//!   ops_summary.md       per-op table (size / elapsed / CPU / RSS)
-//!   ops_compare_<stamp>.csv  one row per (op, variant): every metric
+//! ```text
+//! backup_compare.png   stacked bar panels: size, duration, CPU, RSS, VM
+//! ops_summary.md       per-op table (size / elapsed / CPU / RSS)
+//! ops_compare_<stamp>.csv  one row per (op, variant): every metric
+//! ```
 //!
 //! Replicas aggregate to median
 
