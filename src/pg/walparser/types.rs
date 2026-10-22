@@ -141,6 +141,18 @@ impl BlockLocation {
         }
     }
 
+    /// Delta file tuple: spc, db, rel, block as LE u32s
+    pub fn from_le_bytes(b: [u8; 16]) -> Self {
+        let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        Self::new(u32_at(0), u32_at(4), u32_at(8), u32_at(12))
+    }
+
+    pub fn to_le_bytes(&self) -> [u8; 16] {
+        let r = &self.rel;
+        let words = [r.spc_node, r.db_node, r.rel_node, self.block_no].map(u32::to_le_bytes);
+        words.as_flattened().try_into().unwrap()
+    }
+
     /// All-zero sentinel: terminator in delta file streams
     pub fn terminal() -> Self {
         Self::default()

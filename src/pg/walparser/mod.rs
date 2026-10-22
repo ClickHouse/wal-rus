@@ -22,7 +22,10 @@ mod parse;
 mod state;
 mod types;
 
-pub use parse::{ExtractError, ParseError, extract_block_locations, parse_record_from_bytes};
+pub use parse::{
+    ExtractError, ParseError, extract_block_locations, parse_record_from_bytes,
+    read_xlog_record_header,
+};
 pub use state::{
     ParsePageError, ReadLocationsError, SegmentBoundary, WalParser,
     extract_locations_from_wal_file, read_locations_from, walk_segment_locations,

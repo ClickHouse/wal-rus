@@ -63,6 +63,30 @@ impl PgConfig {
     }
 }
 
+/// `IDENTIFY_SYSTEM` result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemIdentity {
+    pub system_id: u64,
+    pub timeline: u32,
+    pub xlogpos: u64,
+}
+
+impl SystemIdentity {
+    /// Parse the `systemid`, `timeline`, `xlogpos` columns of the result row
+    pub fn from_row(cols: &[Option<String>]) -> Result<Self> {
+        let col = |i: usize, name: &str| {
+            cols.get(i)
+                .and_then(|c| c.as_deref())
+                .ok_or_else(|| anyhow!("IDENTIFY_SYSTEM missing {name}"))
+        };
+        Ok(Self {
+            system_id: col(0, "systemid")?.parse().context("parse systemid")?,
+            timeline: col(1, "timeline")?.parse().context("parse timeline")?,
+            xlogpos: crate::pg::backup::parse_pg_lsn(col(2, "xlogpos")?)?,
+        })
+    }
+}
+
 pub struct ReplicationConn {
     socket: Box<dyn SocketStream>,
     rx: BytesMut,
@@ -188,6 +212,15 @@ impl ReplicationConn {
             }
         }
         Ok(rows)
+    }
+
+    /// `IDENTIFY_SYSTEM`, needs a replication connection
+    pub async fn identify_system(&mut self) -> Result<SystemIdentity> {
+        let rows = self.query_rows("IDENTIFY_SYSTEM").await?;
+        SystemIdentity::from_row(
+            rows.first()
+                .ok_or_else(|| anyhow!("IDENTIFY_SYSTEM returned no rows"))?,
+        )
     }
 
     /// Collect the current result set's `DataRow`s as text columns, consuming
@@ -540,6 +573,35 @@ mod tests {
     use super::*;
 
     use bytes::BufMut;
+
+    #[test]
+    fn system_identity_from_row() {
+        let row = |cols: &[Option<&str>]| -> Vec<Option<String>> {
+            cols.iter().map(|c| c.map(String::from)).collect()
+        };
+        assert_eq!(
+            SystemIdentity::from_row(&row(&[
+                Some("7340000000000000000"),
+                Some("3"),
+                Some("1/2A000060"),
+                None,
+            ]))
+            .unwrap(),
+            SystemIdentity {
+                system_id: 7340000000000000000,
+                timeline: 3,
+                xlogpos: 0x1_2A00_0060,
+            }
+        );
+        for bad in [
+            row(&[Some("7340000000000000000"), Some("3")]),
+            row(&[None, Some("3"), Some("0/0")]),
+            row(&[Some("x"), Some("3"), Some("0/0")]),
+            row(&[Some("1"), Some("3"), Some("0-0")]),
+        ] {
+            assert!(SystemIdentity::from_row(&bad).is_err(), "{bad:?}");
+        }
+    }
 
     /// Frame `tag` + length + `payload` and run it through the backend parser
     fn framed(tag: u8, payload: &[u8]) -> Message {

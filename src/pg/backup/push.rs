@@ -134,9 +134,7 @@ pub async fn handle(
     );
     let mut conn = ReplicationConn::connect(&cfg).await?;
     let pg_version = conn.server_pg_version();
-    let system_identifier = identify_system(&mut conn)
-        .await
-        .context("IDENTIFY_SYSTEM")?;
+    let system_identifier = conn.identify_system().await?.system_id;
     let data_directory = match args.pgdata.as_ref() {
         Some(p) => p
             .canonicalize()
@@ -628,16 +626,6 @@ pub(crate) async fn finalize_backup(f: Finalize<'_>) -> Result<()> {
     );
     println!("{backup_name}");
     Ok(())
-}
-
-async fn identify_system(conn: &mut ReplicationConn) -> Result<u64> {
-    let rows = conn.query_rows("IDENTIFY_SYSTEM").await?;
-    rows.first()
-        .and_then(|cols| cols.first())
-        .and_then(|c| c.as_deref())
-        .ok_or_else(|| anyhow!("IDENTIFY_SYSTEM did not return system identifier"))?
-        .parse()
-        .context("parse system_identifier")
 }
 
 async fn fetch_setting(conn: &mut ReplicationConn, name: &str) -> Result<String> {

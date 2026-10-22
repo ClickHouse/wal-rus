@@ -44,7 +44,9 @@ use tokio::task::JoinSet;
 
 use crate::config::Settings;
 use crate::pg::backup::{format_pg_lsn, parse_pg_lsn};
-use crate::pg::replication::conn::{PgConfig, ReplicationConn, error_message, message_kind};
+use crate::pg::replication::conn::{
+    PgConfig, ReplicationConn, SystemIdentity, error_message, message_kind,
+};
 use crate::pg::replication::stream::{Frame, build_status_update, decode_frame};
 use crate::pg::wal::push;
 use crate::pg::wal::segment::{self, SegmentName};
@@ -407,7 +409,11 @@ pub async fn handle(
         cfg.database
     );
     let mut conn = ReplicationConn::connect(&cfg).await?;
-    let (sysid, sys_timeline, xlogpos) = identify_system(&mut conn).await?;
+    let SystemIdentity {
+        system_id: sysid,
+        timeline: sys_timeline,
+        xlogpos,
+    } = conn.identify_system().await?;
 
     // With a slot, resume from its restart_lsn so the server's retained WAL
     // isn't skipped, creating it if missing. Slotless: start from the server's
@@ -790,27 +796,6 @@ async fn send_status(conn: &mut ReplicationConn, acc: &SegmentAccumulator) -> Re
     let flush = acc.flush_position().min(write);
     let payload = build_status_update(write, flush, flush);
     conn.send_copy_data(&payload).await
-}
-
-async fn identify_system(conn: &mut ReplicationConn) -> Result<(String, u32, u64)> {
-    let rows = conn.query_rows("IDENTIFY_SYSTEM").await?;
-    let cols = rows
-        .first()
-        .ok_or_else(|| anyhow!("IDENTIFY_SYSTEM returned an empty result"))?;
-    let col = |i: usize| cols.get(i).and_then(|c| c.as_deref());
-    let sysid = col(0).unwrap_or_default().to_string();
-    let tli: u32 = match col(1) {
-        Some(v) => v.parse().context("timeline parse")?,
-        None => 0,
-    };
-    let xlogpos = match col(2) {
-        Some(v) => crate::pg::backup::parse_pg_lsn(v)?,
-        None => 0,
-    };
-    if sysid.is_empty() || tli == 0 {
-        bail!("IDENTIFY_SYSTEM returned an empty result");
-    }
-    Ok((sysid, tli, xlogpos))
 }
 
 #[cfg(test)]

@@ -526,10 +526,7 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadStatu
 /// be built by appending segment fragments before the terminator is written
 pub fn write_location_tuples<W: Write>(mut w: W, locations: &[BlockLocation]) -> io::Result<()> {
     for loc in locations {
-        w.write_all(&loc.rel.spc_node.to_le_bytes())?;
-        w.write_all(&loc.rel.db_node.to_le_bytes())?;
-        w.write_all(&loc.rel.rel_node.to_le_bytes())?;
-        w.write_all(&loc.block_no.to_le_bytes())?;
+        w.write_all(&loc.to_le_bytes())?;
     }
     Ok(())
 }
@@ -553,12 +550,7 @@ pub fn read_locations_from<R: Read>(mut r: R) -> Result<Vec<BlockLocation>, Read
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(out),
             Err(e) => return Err(e.into()),
         }
-        let loc = BlockLocation::new(
-            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-        );
+        let loc = BlockLocation::from_le_bytes(buf);
         if loc.is_terminal() {
             return Ok(out);
         }

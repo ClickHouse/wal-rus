@@ -702,12 +702,7 @@ fn fold_sidecar_stream(
             }
             Err(e) => return Err(anyhow::Error::from(e).context("read sidecar tuple")),
         }
-        let loc = BlockLocation::new(
-            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-        );
+        let loc = BlockLocation::from_le_bytes(buf);
         if loc.is_terminal() {
             let parser = WalParser::load(&mut r).context("load sidecar parser state")?;
             return Ok((map, parser));
