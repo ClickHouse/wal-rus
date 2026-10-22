@@ -11,7 +11,7 @@ pub mod stream;
 pub mod tls;
 
 pub use base_backup::{ArchiveMeta, BackupEvent, BaseBackupOpts, run_base_backup};
-pub use conn::{PgConfig, ReplicationConn};
+pub use conn::{PgConfig, ReplicationConn, SystemIdentity};
 pub use server::{
     Identity as WalSenderIdentity, ServerError as WalSenderError, WalSenderConn,
     encode_error_response,

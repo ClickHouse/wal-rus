@@ -151,7 +151,8 @@ fn read_u64(buf: &mut &[u8], field: &'static str) -> Result<u64, ParseError> {
     Ok(u64::from_le_bytes(take(buf, 8, field)?.try_into().unwrap()))
 }
 
-pub(crate) fn read_xlog_record_header(buf: &mut &[u8]) -> Result<XLogRecordHeader, ParseError> {
+/// Fixed 24-byte record header off the front of `buf`, rejecting bad length or rmgr
+pub fn read_xlog_record_header(buf: &mut &[u8]) -> Result<XLogRecordHeader, ParseError> {
     let total_record_length = read_u32(buf, "totalRecordLength")?;
     let xact_id = read_u32(buf, "xactID")?;
     let prev_record_ptr = read_u64(buf, "prevRecordPtr")?;
