@@ -2,10 +2,13 @@
 //!
 //! Auth: service-account JSON file pointed to by GOOGLE_APPLICATION_CREDENTIALS
 //! when set, else the GCE/GKE metadata server (the VM's attached service
-//! account). Streaming uploads via chunked transfer encoding (uploadType=media)
+//! account). Single-request uploads (uploadType=media): bodies up to
+//! BUFFERED_UPLOAD_LIMIT are buffered so transient failures retry in place;
+//! larger ones stream via chunked transfer encoding, one attempt
 //!
 //! Env: GOOGLE_APPLICATION_CREDENTIALS, WALG_GS_PREFIX (parsed by config layer)
 
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,11 +17,13 @@ use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_SHA256, RsaKeyPair};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Body, Client};
 use rustls_pki_types::PrivateKeyDer;
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
@@ -26,12 +31,17 @@ use super::{
     AsyncReader, CopySource, ObjectMeta, ObjectStream, PutIfAbsentOutcome, Result, Storage,
     StorageError,
 };
+use crate::retry::{RetryPolicy, with_retry};
 
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const STORAGE_HOST: &str = "https://storage.googleapis.com";
 const SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const METADATA_HOST: &str = "http://metadata.google.internal";
 const METADATA_TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
+/// Upload bodies up to this size are buffered so a transient failure can
+/// replay them; matches S3's single-PUT threshold. Every WAL segment fits
+/// (16 MiB raw, smaller compressed)
+const BUFFERED_UPLOAD_LIMIT: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ServiceAccount {
@@ -71,10 +81,40 @@ pub struct GcsStorage {
     host: String,
     token_source: TokenSource,
     token: Arc<Mutex<Option<CachedToken>>>,
+    retry_policy: RetryPolicy,
+}
+
+/// An upload body: buffered (replayable, so retried) or streamed (one shot)
+enum UploadBody {
+    Buffered(Bytes),
+    Streamed(AsyncReader),
+}
+
+impl UploadBody {
+    /// Buffer `body` when it fits [`BUFFERED_UPLOAD_LIMIT`]. An unknown size
+    /// reads one byte past the cap to tell a fitting EOF from overflow; on
+    /// overflow the buffered prefix is chained back onto the unread remainder
+    async fn read(body: AsyncReader, size_hint: Option<u64>) -> Result<Self> {
+        if matches!(size_hint, Some(s) if s > BUFFERED_UPLOAD_LIMIT) {
+            return Ok(Self::Streamed(body));
+        }
+        let mut limited = body.take(BUFFERED_UPLOAD_LIMIT + 1);
+        let mut buf = Vec::with_capacity(size_hint.unwrap_or(0) as usize);
+        limited.read_to_end(&mut buf).await?;
+        if buf.len() as u64 <= BUFFERED_UPLOAD_LIMIT {
+            return Ok(Self::Buffered(Bytes::from(buf)));
+        }
+        let combined = Cursor::new(buf).chain(limited.into_inner());
+        Ok(Self::Streamed(Box::pin(combined)))
+    }
 }
 
 impl GcsStorage {
     pub fn new(cfg: GcsConfig) -> Result<Self> {
+        Self::with_retry_policy(cfg, RetryPolicy::default())
+    }
+
+    pub fn with_retry_policy(cfg: GcsConfig, retry_policy: RetryPolicy) -> Result<Self> {
         let client = Client::builder()
             .connect_timeout(crate::storage::CONNECT_TIMEOUT)
             .read_timeout(crate::storage::READ_TIMEOUT)
@@ -96,6 +136,7 @@ impl GcsStorage {
                 host,
                 token_source: TokenSource::None,
                 token: Arc::new(Mutex::new(None)),
+                retry_policy,
             });
         }
 
@@ -117,6 +158,7 @@ impl GcsStorage {
             host: STORAGE_HOST.to_string(),
             token_source,
             token: Arc::new(Mutex::new(None)),
+            retry_policy,
         })
     }
 
@@ -150,6 +192,16 @@ impl GcsStorage {
         if !resp.status().is_success() {
             let st = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            // A throttled or briefly unavailable token endpoint (429/5xx) is
+            // transient like any other HTTP failure, so callers retry it;
+            // everything else (bad key, missing scope, no SA) is a real auth error
+            let err = StorageError::Http {
+                status: st.as_u16(),
+                body: format!("token endpoint: {body}"),
+            };
+            if err.is_transient() {
+                return Err(err);
+            }
             return Err(StorageError::Auth(format!("token endpoint {st}: {body}")));
         }
 
@@ -206,6 +258,59 @@ impl GcsStorage {
         ]))
     }
 
+    /// Media-upload URL; `if_absent` adds `ifGenerationMatch=0`, which makes
+    /// the upload a create-if-absent (412 when a live object exists)
+    fn upload_url(&self, key: &str, if_absent: bool) -> String {
+        let full = self.full_key(key);
+        let precondition = if if_absent {
+            "&ifGenerationMatch=0"
+        } else {
+            ""
+        };
+        format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media{precondition}&name={}",
+            self.host,
+            self.cfg.bucket,
+            utf8_percent_encode(&full, NON_ALPHANUMERIC),
+        )
+    }
+
+    /// One upload attempt; the token is fetched per attempt so a retry also
+    /// covers a transient token-endpoint failure
+    async fn upload_once(&self, url: &str, body: Body) -> Result<reqwest::Response> {
+        let token = self.access_token().await?;
+        Ok(self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await?)
+    }
+
+    /// Upload `body` to `url`, retrying transients when it was buffered.
+    /// `check` maps the response to the result; it must return a transient
+    /// error for statuses worth retrying
+    async fn upload<T, F, Fut>(&self, url: &str, body: UploadBody, check: F) -> Result<T>
+    where
+        F: Fn(reqwest::Response) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        match body {
+            UploadBody::Buffered(bytes) => {
+                with_retry(&self.retry_policy, StorageError::is_transient, || async {
+                    check(self.upload_once(url, Body::from(bytes.clone())).await?).await
+                })
+                .await
+            }
+            UploadBody::Streamed(reader) => {
+                let body = Body::wrap_stream(ReaderStream::new(reader));
+                check(self.upload_once(url, body).await?).await
+            }
+        }
+    }
+
     fn object_url(&self, key: &str) -> String {
         let full = self.full_key(key);
         let enc = utf8_percent_encode(&full, NON_ALPHANUMERIC);
@@ -258,74 +363,48 @@ impl Storage for GcsStorage {
         format!("gs://{}/{}", self.cfg.bucket, self.cfg.prefix)
     }
 
-    async fn put(&self, key: &str, body: AsyncReader, _size_hint: Option<u64>) -> Result<()> {
-        let token = self.access_token().await?;
-        let full = self.full_key(key);
-        let url = format!(
-            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
-            self.host,
-            self.cfg.bucket,
-            utf8_percent_encode(&full, NON_ALPHANUMERIC),
-        );
-        let stream = ReaderStream::new(body);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header("content-type", "application/octet-stream")
-            .body(Body::wrap_stream(stream))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(StorageError::Http {
-                status: st.as_u16(),
-                body: format!("gcs put: {body}"),
-            });
-        }
-        Ok(())
+    async fn put(&self, key: &str, body: AsyncReader, size_hint: Option<u64>) -> Result<()> {
+        let body = UploadBody::read(body, size_hint).await?;
+        self.upload(&self.upload_url(key, false), body, |resp| async move {
+            if !resp.status().is_success() {
+                let st = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(StorageError::Http {
+                    status: st.as_u16(),
+                    body: format!("gcs put: {body}"),
+                });
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn put_if_absent(
         &self,
         key: &str,
         body: AsyncReader,
-        _size_hint: Option<u64>,
+        size_hint: Option<u64>,
     ) -> Result<PutIfAbsentOutcome> {
-        let token = self.access_token().await?;
-        let full = self.full_key(key);
-        // ifGenerationMatch=0 makes the upload a create-if-absent: it succeeds
-        // only when no live object exists, and returns 412 otherwise.
-        let url = format!(
-            "{}/upload/storage/v1/b/{}/o?uploadType=media&ifGenerationMatch=0&name={}",
-            self.host,
-            self.cfg.bucket,
-            utf8_percent_encode(&full, NON_ALPHANUMERIC),
-        );
-        let stream = ReaderStream::new(body);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header("content-type", "application/octet-stream")
-            .body(Body::wrap_stream(stream))
-            .send()
-            .await?;
-        let st = resp.status();
-        if st.is_success() {
-            Ok(PutIfAbsentOutcome::Created)
-        } else if st == reqwest::StatusCode::PRECONDITION_FAILED
-            || st == reqwest::StatusCode::CONFLICT
-        {
-            Ok(PutIfAbsentOutcome::AlreadyExists)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(StorageError::Http {
-                status: st.as_u16(),
-                body: format!("gcs put_if_absent: {body}"),
-            })
-        }
+        // A retry after an attempt whose response was lost sees its own write
+        // and reports AlreadyExists; the object is in place either way
+        let body = UploadBody::read(body, size_hint).await?;
+        self.upload(&self.upload_url(key, true), body, |resp| async move {
+            let st = resp.status();
+            if st.is_success() {
+                Ok(PutIfAbsentOutcome::Created)
+            } else if st == reqwest::StatusCode::PRECONDITION_FAILED
+                || st == reqwest::StatusCode::CONFLICT
+            {
+                Ok(PutIfAbsentOutcome::AlreadyExists)
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                Err(StorageError::Http {
+                    status: st.as_u16(),
+                    body: format!("gcs put_if_absent: {body}"),
+                })
+            }
+        })
+        .await
     }
 
     async fn get(&self, key: &str) -> Result<AsyncReader> {
@@ -673,6 +752,7 @@ mod tests {
             host: STORAGE_HOST.into(),
             token_source: imds_source(base).unwrap(),
             token: Arc::new(Mutex::new(None)),
+            retry_policy: RetryPolicy::default(),
         };
 
         assert_eq!(s.access_token().await.unwrap(), "vmtok");
@@ -699,6 +779,7 @@ mod tests {
             host,
             token_source: TokenSource::None,
             token: Arc::new(Mutex::new(None)),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -868,6 +949,7 @@ mod tests {
                 token_uri: Some(format!("{token_base}/token")),
             }),
             token: Arc::new(Mutex::new(None)),
+            retry_policy: RetryPolicy::default(),
         };
 
         assert_eq!(s.access_token().await.unwrap(), "tok123");
@@ -878,5 +960,174 @@ mod tests {
             1,
             "second token request must hit the cache"
         );
+    }
+
+    /// Fast, deterministic retries for the mock-server tests below
+    fn quick_retries() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
+        }
+    }
+
+    /// Mock whose first `fail_first` upload POSTs answer `fail_status`, then
+    /// `ok_status`. Returns the base URL, the attempt counter and the body of
+    /// the last attempt, plus whether every attempt carried ifGenerationMatch=0.
+    async fn flaky_upload_server(
+        fail_first: u32,
+        fail_status: u16,
+        ok_status: u16,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::storage::test_http::{Resp, serve};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let hits = Arc::new(AtomicU32::new(0));
+        let last = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let conditional = Arc::new(AtomicBool::new(true));
+        let (h, l, c) = (hits.clone(), last.clone(), conditional.clone());
+        let base = serve(move |req| {
+            if !req.path.starts_with("/upload/storage/v1/") {
+                return Resp::new(404);
+            }
+            if req.query("ifGenerationMatch") != Some("0") {
+                c.store(false, Ordering::SeqCst);
+            }
+            *l.lock().unwrap() = req.body.clone();
+            if h.fetch_add(1, Ordering::SeqCst) < fail_first {
+                Resp::new(fail_status)
+            } else {
+                Resp::new(ok_status).body(b"{}".to_vec())
+            }
+        })
+        .await;
+        (base, hits, last, conditional)
+    }
+
+    #[tokio::test]
+    async fn put_retries_transient_failures_for_unknown_size_bodies() {
+        use crate::storage::test_http::reader;
+        use std::sync::atomic::Ordering;
+
+        // Unknown size is the compressed/encrypted WAL case: it must still be
+        // buffered and replayed, not streamed once
+        let (base, hits, last, _) = flaky_upload_server(2, 503, 200).await;
+        let mut s = emulator(base);
+        s.retry_policy = quick_retries();
+        s.put("wal_005/x.zst", reader(b"segment"), None)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(*last.lock().unwrap(), b"segment", "replayed body intact");
+
+        // permanent errors are not retried
+        let (base, hits, _, _) = flaky_upload_server(1, 403, 200).await;
+        let mut s = emulator(base);
+        s.retry_policy = quick_retries();
+        let err = s.put("k", reader(b"x"), Some(1)).await;
+        assert!(matches!(err, Err(StorageError::Http { status: 403, .. })));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // exhausting the attempts surfaces the last transient error
+        let (base, hits, _, _) = flaky_upload_server(u32::MAX, 503, 200).await;
+        let mut s = emulator(base);
+        s.retry_policy = quick_retries();
+        let err = s.put("k", reader(b"x"), None).await;
+        assert!(matches!(err, Err(StorageError::Http { status: 503, .. })));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn put_streams_oversized_bodies_in_one_attempt() {
+        use crate::storage::test_http::{payload, reader};
+        use std::sync::atomic::Ordering;
+
+        // Over the buffer limit the body cannot be replayed: one attempt, and
+        // the buffered prefix must be stitched back onto the remainder
+        let big = payload(BUFFERED_UPLOAD_LIMIT as usize + 1024);
+        let (base, hits, last, _) = flaky_upload_server(0, 503, 200).await;
+        let mut s = emulator(base);
+        s.retry_policy = quick_retries();
+        s.put("big", reader(&big), None).await.unwrap();
+        assert_eq!(*last.lock().unwrap(), big);
+
+        let (base, hits2, _, _) = flaky_upload_server(1, 503, 200).await;
+        let mut s = emulator(base);
+        s.retry_policy = quick_retries();
+        let err = s.put("big", reader(&big), Some(big.len() as u64)).await;
+        assert!(matches!(err, Err(StorageError::Http { status: 503, .. })));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits2.load(Ordering::SeqCst), 1, "streamed body not retried");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_retries_then_maps_outcome() {
+        use crate::storage::test_http::reader;
+        use std::sync::atomic::Ordering;
+
+        let (base, hits, last, conditional) = flaky_upload_server(1, 503, 200).await;
+        let mut s = emulator(base);
+        s.retry_policy = quick_retries();
+        let out = s.put_if_absent("k", reader(b"seg"), None).await.unwrap();
+        assert!(matches!(out, PutIfAbsentOutcome::Created));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(*last.lock().unwrap(), b"seg");
+        assert!(
+            conditional.load(Ordering::SeqCst),
+            "every attempt is conditional"
+        );
+
+        // the retry of a write whose response was lost finds its own object
+        let (base, hits, _, _) = flaky_upload_server(1, 503, 412).await;
+        let mut s = emulator(base);
+        s.retry_policy = quick_retries();
+        let out = s.put_if_absent("k", reader(b"seg"), None).await.unwrap();
+        assert!(matches!(out, PutIfAbsentOutcome::AlreadyExists));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_errors_are_transient_only_for_throttling_and_5xx() {
+        use crate::storage::test_http::{Resp, reader, serve};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        for (status, transient) in [(503u16, true), (429, true), (403, false), (404, false)] {
+            let base = serve(move |_req| Resp::new(status)).await;
+            let mut s = emulator(STORAGE_HOST.into());
+            s.token_source = imds_source(base).unwrap();
+            let err = s.access_token().await.unwrap_err();
+            assert_eq!(err.is_transient(), transient, "{status}: {err}");
+            assert_eq!(matches!(err, StorageError::Auth(_)), !transient, "{status}");
+        }
+
+        // End to end: a metadata server that blips once no longer fails the
+        // upload, since the token is fetched inside the retried attempt
+        let token_hits = Arc::new(AtomicU32::new(0));
+        let t = token_hits.clone();
+        let base = serve(move |req| {
+            if req.path == METADATA_TOKEN_PATH {
+                if t.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Resp::new(503);
+                }
+                return Resp::new(200)
+                    .body(b"{\"access_token\":\"vmtok\",\"expires_in\":3599}".to_vec());
+            }
+            if req.headers.get("authorization").map(String::as_str) != Some("Bearer vmtok") {
+                return Resp::new(401);
+            }
+            Resp::new(200).body(b"{}".to_vec())
+        })
+        .await;
+        let mut s = emulator(base.clone());
+        s.token_source = imds_source(base).unwrap();
+        s.retry_policy = quick_retries();
+        s.put("k", reader(b"x"), None).await.unwrap();
+        assert_eq!(token_hits.load(Ordering::SeqCst), 2);
     }
 }

@@ -221,7 +221,8 @@ impl Settings {
             }
             StorageSettings::Gcs(c) => {
                 let cfg = c.clone();
-                let s = gcs::GcsStorage::new(cfg).context("init gcs storage")?;
+                let s =
+                    gcs::GcsStorage::with_retry_policy(cfg, policy).context("init gcs storage")?;
                 Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
             }
         }
