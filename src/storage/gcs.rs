@@ -18,6 +18,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Body, Client};
 use rustls_pki_types::PrivateKeyDer;
+use rustls_pki_types::pem::{self, PemObject};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
@@ -554,12 +555,12 @@ impl Storage for GcsStorage {
 }
 
 fn parse_pkcs8_or_pkcs1(pem: &str) -> Result<RsaKeyPair> {
-    // service account keys come as PKCS#8 PEM by default; rustls-pemfile labels
+    // service account keys come as PKCS#8 PEM by default; the PEM decoder labels
     // the section so we route to the matching aws-lc-rs constructor
-    let mut reader = std::io::Cursor::new(pem.as_bytes());
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| StorageError::Auth(format!("read private key: {e}")))?
-        .ok_or_else(|| StorageError::Auth("no private key in credentials".into()))?;
+    let key = PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|e| match e {
+        pem::Error::NoItemsFound => StorageError::Auth("no private key in credentials".into()),
+        e => StorageError::Auth(format!("read private key: {e}")),
+    })?;
     match key {
         PrivateKeyDer::Pkcs8(der) => RsaKeyPair::from_pkcs8(der.secret_pkcs8_der()),
         PrivateKeyDer::Pkcs1(der) => RsaKeyPair::from_der(der.secret_pkcs1_der()),
@@ -578,14 +579,23 @@ mod tests {
 
     #[test]
     fn private_key_reads_pkcs8_armor() {
-        // rustls-pemfile decodes the base64 body and tags the section kind; the
+        // The PEM decoder decodes the base64 body and tags the section kind; the
         // 3-byte payload isn't a real key, only the armor handling is exercised
         let pem = "-----BEGIN PRIVATE KEY-----\nAAEC\n-----END PRIVATE KEY-----\n";
-        let mut rd = std::io::Cursor::new(pem.as_bytes());
-        match rustls_pemfile::private_key(&mut rd).unwrap().unwrap() {
+        match PrivateKeyDer::from_pem_slice(pem.as_bytes()).unwrap() {
             PrivateKeyDer::Pkcs8(der) => assert_eq!(der.secret_pkcs8_der(), &[0, 1, 2]),
             other => panic!("expected pkcs8, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn private_key_missing_is_auth_error() {
+        let pem = "-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n";
+        let err = parse_pkcs8_or_pkcs1(pem).err().unwrap();
+        assert!(
+            err.to_string().contains("no private key in credentials"),
+            "{err}"
+        );
     }
 
     #[test]
