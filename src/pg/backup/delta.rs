@@ -35,7 +35,7 @@ use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
 use crate::concurrency::BoundedTasks;
-use crate::pg::backup::fetch::fetch_sentinel;
+use crate::pg::backup::fetch_sentinel;
 use crate::pg::backup::wal_delta::{
     WAL_FILES_IN_DELTA, delta_group_name, delta_group_no, delta_storage_key, seg_name_from_global,
 };
@@ -49,7 +49,7 @@ use crate::pg::walparser::{
 use crate::retry::{RetryPolicy, with_retry};
 use crate::storage::{DynStorage, StorageError};
 
-pub const PG_PAGE_SIZE: u64 = 8192;
+pub use super::increment::PG_PAGE_SIZE;
 /// PG's per-file size cap before splitting into `<rel>.<n>` segments
 pub const REL_FILE_SIZE_BOUND: u64 = 1 << 30;
 pub const BLOCKS_IN_REL_FILE: u32 = (REL_FILE_SIZE_BOUND / PG_PAGE_SIZE) as u32;

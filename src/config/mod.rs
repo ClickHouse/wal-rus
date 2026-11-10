@@ -9,7 +9,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::compression;
 use crate::crypto::{self, DynCrypter};
 use crate::retry::RetryPolicy;
-use crate::storage::{DynStorage, Storage, fs::FsStorage, gcs, retrying::RetryingStorage, s3};
+#[cfg(feature = "gcs")]
+use crate::storage::gcs;
+#[cfg(any(feature = "s3", feature = "gcs"))]
+use crate::storage::retrying::RetryingStorage;
+#[cfg(feature = "s3")]
+use crate::storage::s3;
+use crate::storage::{DynStorage, Storage, fs::FsStorage};
 
 mod vars;
 pub use vars::Vars;
@@ -64,21 +70,32 @@ pub struct DeltaSettings {
 
 #[derive(Debug, Clone)]
 pub enum StorageSettings {
-    Fs { path: String },
+    Fs {
+        path: String,
+    },
+    #[cfg(feature = "s3")]
     S3(s3::S3Config),
+    #[cfg(feature = "gcs")]
     Gcs(gcs::GcsConfig),
 }
 
+/// Error for a storage scheme whose backend feature is compiled out. Keeps a
+/// configured-but-unavailable backend from falling through to another one
+#[cfg(not(all(feature = "s3", feature = "gcs")))]
+fn backend_not_built(what: &str, feature: &str) -> anyhow::Error {
+    anyhow!("{what} requires walrus built with the `{feature}` feature")
+}
+
 impl Default for Settings {
-    /// Convenience defaults: single-worker fs pipeline at lz4, no throttling
-    /// or encryption. Production constructs via [`Settings::resolve`]; this
+    /// Convenience defaults: single-worker fs pipeline at the default codec
+    /// (lz4 when built), no throttling or encryption. Production constructs via [`Settings::resolve`]; this
     /// lets tests vary only the fields they exercise via `..Default::default()`
     fn default() -> Self {
         Settings {
             storage: StorageSettings::Fs {
                 path: String::new(),
             },
-            compression: compression::Method::Lz4,
+            compression: compression::Method::default(),
             compression_level: 3,
             upload_concurrency: 1,
             upload_queue: 1,
@@ -100,9 +117,18 @@ impl Settings {
     pub fn resolve(vars: &Vars, config_path: Option<PathBuf>) -> Result<Self> {
         let storage = detect_storage(vars)?;
         let compression = match vars.get("WALG_COMPRESSION_METHOD").as_deref() {
-            None => compression::Method::Lz4,
-            Some(s) => compression::Method::from_name(s)
-                .ok_or_else(|| anyhow!("unsupported WALG_COMPRESSION_METHOD={s}"))?,
+            None => compression::Method::default(),
+            Some(s) => {
+                let m = compression::Method::from_name(s)
+                    .ok_or_else(|| anyhow!("unsupported WALG_COMPRESSION_METHOD={s}"))?;
+                if !m.is_available() {
+                    bail!(
+                        "WALG_COMPRESSION_METHOD={s} requires walrus built with the `{}` feature",
+                        m.feature()
+                    );
+                }
+                m
+            }
         };
         let compression_level = vars.int("WALG_COMPRESSION_LEVEL", 1)? as i32;
         let upload_concurrency = upload_concurrency(vars)?;
@@ -207,6 +233,7 @@ impl Settings {
         Self::build_storage_for(&dst, self.retry)
     }
 
+    #[cfg_attr(not(any(feature = "s3", feature = "gcs")), allow(unused_variables))]
     fn build_storage_for(s: &StorageSettings, policy: RetryPolicy) -> Result<DynStorage> {
         match s {
             StorageSettings::Fs { path } => {
@@ -214,11 +241,13 @@ impl Settings {
                 let s = FsStorage::new(path).context("init fs storage")?;
                 Ok(Arc::new(s) as Arc<dyn Storage>)
             }
+            #[cfg(feature = "s3")]
             StorageSettings::S3(c) => {
                 let s = s3::S3Storage::with_retry_policy(c.clone(), policy)
                     .context("init s3 storage")?;
                 Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
             }
+            #[cfg(feature = "gcs")]
             StorageSettings::Gcs(c) => {
                 let cfg = c.clone();
                 let s = gcs::GcsStorage::new(cfg).context("init gcs storage")?;
@@ -231,6 +260,7 @@ impl Settings {
 /// Build `StorageSettings` from a destination URI, inheriting credentials
 /// from the source settings. Cross-scheme is allowed; cross-bucket within
 /// the same scheme is allowed too. Bare paths (`/tmp/foo`) are treated as fs
+#[cfg_attr(not(any(feature = "s3", feature = "gcs")), allow(unused_variables))]
 fn storage_from_uri(vars: &Vars, uri: &str, src: &StorageSettings) -> Result<StorageSettings> {
     if let Some(rest) = uri.strip_prefix("file://") {
         return Ok(StorageSettings::Fs {
@@ -238,33 +268,49 @@ fn storage_from_uri(vars: &Vars, uri: &str, src: &StorageSettings) -> Result<Sto
         });
     }
     if let Some(rest) = uri.strip_prefix("s3://") {
-        let (bucket, prefix) = split_bucket_prefix(rest);
-        let s3_src = match src {
-            StorageSettings::S3(c) => Some(c),
-            _ => None,
-        };
-        return Ok(StorageSettings::S3(s3_config(
-            vars, bucket, prefix, s3_src,
-        )?));
+        #[cfg(feature = "s3")]
+        {
+            let (bucket, prefix) = split_bucket_prefix(rest);
+            let s3_src = match src {
+                StorageSettings::S3(c) => Some(c),
+                _ => None,
+            };
+            return Ok(StorageSettings::S3(s3_config(
+                vars, bucket, prefix, s3_src,
+            )?));
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = rest;
+            return Err(backend_not_built(uri, "s3"));
+        }
     }
     if let Some(rest) = uri.strip_prefix("gs://") {
-        let (bucket, prefix) = split_bucket_prefix(rest);
-        let credentials_path = match src {
-            StorageSettings::Gcs(c) => c.credentials_path.clone(),
-            _ => None,
+        #[cfg(feature = "gcs")]
+        {
+            let (bucket, prefix) = split_bucket_prefix(rest);
+            let gcs_src = match src {
+                StorageSettings::Gcs(c) => Some(c),
+                _ => None,
+            };
+            let credentials_path = gcs_src
+                .and_then(|c| c.credentials_path.clone())
+                .or_else(|| vars.get("GOOGLE_APPLICATION_CREDENTIALS"));
+            let endpoint = gcs_src
+                .and_then(|c| c.endpoint.clone())
+                .or_else(|| gcs_endpoint(vars));
+            return Ok(StorageSettings::Gcs(gcs::GcsConfig {
+                bucket,
+                prefix,
+                credentials_path,
+                endpoint,
+            }));
         }
-        .or_else(|| vars.get("GOOGLE_APPLICATION_CREDENTIALS"));
-        let endpoint = match src {
-            StorageSettings::Gcs(c) => c.endpoint.clone(),
-            _ => None,
+        #[cfg(not(feature = "gcs"))]
+        {
+            let _ = rest;
+            return Err(backend_not_built(uri, "gcs"));
         }
-        .or_else(|| gcs_endpoint(vars));
-        return Ok(StorageSettings::Gcs(gcs::GcsConfig {
-            bucket,
-            prefix,
-            credentials_path,
-            endpoint,
-        }));
     }
     // bare path falls back to fs
     Ok(StorageSettings::Fs {
@@ -274,12 +320,14 @@ fn storage_from_uri(vars: &Vars, uri: &str, src: &StorageSettings) -> Result<Sto
 
 /// Emulator endpoint for GCS: `WALG_GS_ENDPOINT` then `STORAGE_EMULATOR_HOST`
 /// (fake-gcs-server). Empty values count as unset
+#[cfg(feature = "gcs")]
 fn gcs_endpoint(vars: &Vars) -> Option<String> {
     vars.get("WALG_GS_ENDPOINT")
         .or_else(|| vars.get("STORAGE_EMULATOR_HOST"))
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(any(feature = "s3", feature = "gcs"))]
 fn split_bucket_prefix(rest: &str) -> (String, String) {
     match rest.split_once('/') {
         Some((b, p)) => (b.to_string(), p.trim_end_matches('/').to_string()),
@@ -293,6 +341,7 @@ fn split_bucket_prefix(rest: &str) -> (String, String) {
 /// resolution read the same names: AWS_REGION/WALG_S3_REGION,
 /// AWS_ACCESS_KEY_ID/AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY/AWS_SECRET_KEY,
 /// AWS_SESSION_TOKEN, AWS_ENDPOINT_URL/WALG_S3_ENDPOINT, AWS_S3_FORCE_PATH_STYLE
+#[cfg(feature = "s3")]
 fn s3_config(
     vars: &Vars,
     bucket: String,
@@ -327,6 +376,7 @@ fn s3_config(
 /// `AWS_S3_FORCE_PATH_STYLE` (wal-g name). Defaults to `endpoint_set` so a
 /// custom endpoint (seaweedfs/ceph) gets path-style addressing without an explicit
 /// flag
+#[cfg(feature = "s3")]
 fn force_path_style(vars: &Vars, endpoint_set: bool) -> Result<bool> {
     let key = "AWS_S3_FORCE_PATH_STYLE";
     if vars.contains(key) {
@@ -339,6 +389,7 @@ fn force_path_style(vars: &Vars, endpoint_set: bool) -> Result<bool> {
 /// else the EC2 metadata service. IMDS is skipped (surfacing the missing-keys
 /// error) when AWS_EC2_METADATA_DISABLED is set. One static key without the
 /// other is a hard error rather than a silent IMDS fallback
+#[cfg(feature = "s3")]
 fn s3_credentials(vars: &Vars, src: Option<&s3::S3Config>) -> Result<s3::CredentialSource> {
     if let Some(c) = src {
         return Ok(c.creds.clone());
@@ -400,21 +451,38 @@ fn detect_storage(vars: &Vars) -> Result<StorageSettings> {
         return Ok(StorageSettings::Fs { path: prefix });
     }
     if let Some(s3_prefix) = vars.get("WALG_S3_PREFIX") {
-        let (bucket, prefix) = parse_uri_prefix(&s3_prefix, "s3://")?;
-        return Ok(StorageSettings::S3(s3_config(vars, bucket, prefix, None)?));
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = s3_prefix;
+            return Err(backend_not_built("WALG_S3_PREFIX", "s3"));
+        }
+        #[cfg(feature = "s3")]
+        {
+            let (bucket, prefix) = parse_uri_prefix(&s3_prefix, "s3://")?;
+            return Ok(StorageSettings::S3(s3_config(vars, bucket, prefix, None)?));
+        }
     }
     if let Some(gs_prefix) = vars.get("WALG_GS_PREFIX") {
-        let (bucket, prefix) = parse_uri_prefix(&gs_prefix, "gs://")?;
-        return Ok(StorageSettings::Gcs(gcs::GcsConfig {
-            bucket,
-            prefix,
-            credentials_path: vars.get("GOOGLE_APPLICATION_CREDENTIALS"),
-            endpoint: gcs_endpoint(vars),
-        }));
+        #[cfg(not(feature = "gcs"))]
+        {
+            let _ = gs_prefix;
+            return Err(backend_not_built("WALG_GS_PREFIX", "gcs"));
+        }
+        #[cfg(feature = "gcs")]
+        {
+            let (bucket, prefix) = parse_uri_prefix(&gs_prefix, "gs://")?;
+            return Ok(StorageSettings::Gcs(gcs::GcsConfig {
+                bucket,
+                prefix,
+                credentials_path: vars.get("GOOGLE_APPLICATION_CREDENTIALS"),
+                endpoint: gcs_endpoint(vars),
+            }));
+        }
     }
     bail!("no storage configured: set WALG_FILE_PREFIX, WALG_S3_PREFIX, or WALG_GS_PREFIX")
 }
 
+#[cfg(any(feature = "s3", feature = "gcs"))]
 fn parse_uri_prefix(uri: &str, scheme: &str) -> Result<(String, String)> {
     let rest = uri
         .strip_prefix(scheme)
@@ -500,6 +568,7 @@ mod tests {
     // serialize env-touching tests so they can't observe each other's writes
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(feature = "s3")]
     fn static_creds(c: &s3::S3Config) -> &s3::Credentials {
         match &c.creds {
             s3::CredentialSource::Static(cr) => cr,
@@ -545,6 +614,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     #[test]
     fn parses_s3_uri() {
         let (b, p) = parse_uri_prefix("s3://my-bucket/some/prefix", "s3://").unwrap();
@@ -556,11 +626,13 @@ mod tests {
         assert_eq!(p, "");
     }
 
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     #[test]
     fn rejects_wrong_scheme() {
         assert!(parse_uri_prefix("gs://x/y", "s3://").is_err());
     }
 
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     #[test]
     fn parse_uri_prefix_trims_trailing_slash_and_rejects_empty_bucket() {
         let (b, p) = parse_uri_prefix("s3://bucket/some/prefix/", "s3://").unwrap();
@@ -569,6 +641,7 @@ mod tests {
         assert!(parse_uri_prefix("s3:///prefix", "s3://").is_err());
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn s3_dst_from_non_s3_src_honors_walg_aliases() {
         // file://->s3:// copy: no S3 source to inherit, so credential fields
@@ -665,6 +738,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     #[test]
     fn split_bucket_prefix_variants() {
         assert_eq!(
@@ -685,15 +759,18 @@ mod tests {
         let src = StorageSettings::Fs { path: "/x".into() };
         match storage_from_uri(&Vars::default(), "file:///tmp/dst", &src).unwrap() {
             StorageSettings::Fs { path } => assert_eq!(path, "/tmp/dst"),
+            #[allow(unreachable_patterns)]
             other => panic!("expected Fs, got {other:?}"),
         }
         // bare path with no scheme falls back to fs verbatim
         match storage_from_uri(&Vars::default(), "/var/backups", &src).unwrap() {
             StorageSettings::Fs { path } => assert_eq!(path, "/var/backups"),
+            #[allow(unreachable_patterns)]
             other => panic!("expected Fs, got {other:?}"),
         }
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn storage_from_uri_gs_inherits_then_falls_back_to_env() {
         // gs src carries credentials_path -> inherited, env ignored
@@ -729,6 +806,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn storage_from_uri_s3_inherits_credentials_from_s3_src() {
         // S3 source -> every credential field copied, env not consulted
@@ -765,6 +843,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "s3", feature = "gcs"))]
     #[test]
     fn detect_storage_arms() {
         // file prefix wins
@@ -871,6 +950,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "s3", feature = "gcs"))]
     #[test]
     fn build_storage_for_each_backend() {
         let dir = tempfile::tempdir().unwrap();
@@ -1012,6 +1092,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn s3_credentials_incomplete_static_is_error() {
         // access key without its secret is a hard error, never a silent IMDS
@@ -1025,6 +1106,7 @@ mod tests {
         assert!(s3_credentials(&Vars::default(), None).is_err());
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn s3_reads_walg_endpoint_and_force_path_style_names() {
         let _g = EnvGuard::new(&[
@@ -1071,5 +1153,32 @@ mod tests {
         assert_eq!(vars.get("WALG_S3_PREFIX").as_deref(), Some("s3://envbkt"));
         assert_eq!(vars.get("AWS_REGION").as_deref(), Some("eu-west-3"));
         assert_eq!(vars.get("AWS_ACCESS_KEY_ID").as_deref(), Some("quoted"));
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[test]
+    fn s3_without_feature_is_error_not_fallthrough() {
+        let _g = EnvGuard::new(&[
+            ("WALG_FILE_PREFIX", None),
+            ("WALG_S3_PREFIX", Some("s3://b/p")),
+        ]);
+        let err = detect_storage(&Vars::default()).unwrap_err();
+        assert!(err.to_string().contains("`s3` feature"), "{err}");
+        let src = StorageSettings::Fs { path: "/x".into() };
+        assert!(storage_from_uri(&Vars::default(), "s3://b/p", &src).is_err());
+    }
+
+    #[cfg(not(feature = "gcs"))]
+    #[test]
+    fn gcs_without_feature_is_error_not_fallthrough() {
+        let _g = EnvGuard::new(&[
+            ("WALG_FILE_PREFIX", None),
+            ("WALG_S3_PREFIX", None),
+            ("WALG_GS_PREFIX", Some("gs://b/p")),
+        ]);
+        let err = detect_storage(&Vars::default()).unwrap_err();
+        assert!(err.to_string().contains("`gcs` feature"), "{err}");
+        let src = StorageSettings::Fs { path: "/x".into() };
+        assert!(storage_from_uri(&Vars::default(), "gs://b/p", &src).is_err());
     }
 }

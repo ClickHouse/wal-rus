@@ -1,8 +1,10 @@
 pub mod backup;
+#[cfg(feature = "replication")]
 pub mod replication;
 pub mod wal;
+#[cfg(feature = "backup")]
 pub mod wal_summaries;
-pub mod walparser;
+pub use pg_walparser as walparser;
 
 pub const WAL_FOLDER: &str = "wal_005";
 pub const BASEBACKUP_FOLDER: &str = "basebackups_005";

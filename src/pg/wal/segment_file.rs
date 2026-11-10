@@ -191,11 +191,17 @@ mod tests {
 
     #[tokio::test]
     async fn open_round_trip_all_codecs() {
-        round_trip(Method::None, "").await;
-        round_trip(Method::Zstd, "zst").await;
-        round_trip(Method::Brotli, "br").await;
-        round_trip(Method::Lz4, "lz4").await;
-        round_trip(Method::Lzma, "lzma").await;
-        round_trip(Method::Gz, "gz").await;
+        for (method, ext) in [
+            (Method::None, ""),
+            (Method::Zstd, "zst"),
+            (Method::Brotli, "br"),
+            (Method::Lz4, "lz4"),
+            (Method::Lzma, "lzma"),
+            (Method::Gz, "gz"),
+        ] {
+            if method.is_available() {
+                round_trip(method, ext).await;
+            }
+        }
     }
 }

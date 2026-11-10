@@ -602,6 +602,7 @@ mod tests {
     /// (`base/16384/16385` block `block`), rest zero-padded. No FPI, no
     /// cross-page tail, so a per-segment parser sees exactly one in-segment
     /// record and leaves no trailing head
+    #[cfg(feature = "backup")]
     fn one_record_segment(block: u32) -> Vec<u8> {
         use crate::pg::walparser::{RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER};
         let mut body = Vec::new();
@@ -640,6 +641,7 @@ mod tests {
         page
     }
 
+    #[cfg(feature = "backup")]
     fn test_settings(bucket: &Path) -> Settings {
         use crate::config::StorageSettings;
         Settings {
@@ -657,6 +659,7 @@ mod tests {
     /// tail in group 32. Only segment 32's raw WAL is uploaded, so a fallback to
     /// the raw-WAL walk could recover *only* block 1032 — recovering the full
     /// 1016..=1032 set proves the consumer read the group-16 sidecar
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn record_then_consume_uses_sidecar() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -732,6 +735,7 @@ mod tests {
     /// 32..=47), then raw-walk the trailing segment 48 — recovering 1020..=1048.
     /// Before the leading-partial fix this errored on the absent group-16 sidecar
     /// and fell back to a raw walk of the (unfetchable) sidecar-only segments
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn unaligned_start_walks_leading_partial() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -818,6 +822,7 @@ mod tests {
     /// raw-walk the sidecar-less group 32, fold the present group-48 sidecar, then
     /// raw-walk the trailing segment 64 — recovering 1032..=1064 — instead of
     /// failing the whole range to a full reparse on the absent group-32 sidecar
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn aligned_start_walks_missing_first_group() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -905,6 +910,7 @@ mod tests {
     /// group 0 so `build_delta_map_from_wal` bails to the full walk. Exercises
     /// the fetch-vs-parse prefetch pipeline (segment N+1 fetched while N parses)
     /// and proves the changed-block set is the union across all segments
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn full_walk_pipelines_multiple_segments() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -955,6 +961,7 @@ mod tests {
     /// A missing segment in the required range is a hard error, never a silent
     /// skip: dropping segment 2 would omit its changed pages from the increment
     /// and restore stale parent data. Segments 1 and 3 present, 2 missing
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn full_walk_errors_on_missing_segment() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -996,6 +1003,7 @@ mod tests {
     /// back to the archive only for what is absent locally. Segment 1 lives only
     /// on disk, segments 2 and 3 only in the bucket: recovering 3001, 3002 and
     /// 3003 proves local-first read with archive fallback for the rest
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn full_walk_prefers_local_pg_wal() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -1048,6 +1056,7 @@ mod tests {
 
     /// Build a `total`-byte heap record referencing `base/200/300` block 7
     /// (24 header + 20 block-0 header + 5 LONG main-data marker + main data)
+    #[cfg(feature = "backup")]
     fn boundary_block_record(total: usize) -> Vec<u8> {
         use crate::pg::walparser::{RmId, X_LOG_RECORD_HEADER_SIZE, XLR_BLOCK_ID_DATA_LONG};
         let main_len = total - X_LOG_RECORD_HEADER_SIZE - 20 - 5;
@@ -1075,6 +1084,7 @@ mod tests {
     }
 
     /// Long-header page (36 B header + 4 B align) holding `body` bytes, zero-padded
+    #[cfg(feature = "backup")]
     fn long_header_page(body: &[u8]) -> Vec<u8> {
         use crate::pg::walparser::XLP_LONG_HEADER;
         let mut page = Vec::with_capacity(WAL_PAGE_SIZE as usize);
@@ -1094,6 +1104,7 @@ mod tests {
 
     /// Short-header continuation page (20 B header + 4 B align) carrying `rem`
     /// bytes of remaining-data length and `body` bytes, zero-padded
+    #[cfg(feature = "backup")]
     fn cont_header_page(rem: u32, body: &[u8]) -> Vec<u8> {
         use crate::pg::walparser::XLP_FIRST_IS_CONT_RECORD;
         let mut page = Vec::with_capacity(WAL_PAGE_SIZE as usize);
@@ -1108,6 +1119,7 @@ mod tests {
         page
     }
 
+    #[cfg(feature = "backup")]
     async fn put_segment(storage: &DynStorage, seg: u64, bytes: Vec<u8>) {
         let name = seg_name_from_global(1, seg, wal_segment_size()).format();
         let r: compression::AsyncReader = Box::pin(std::io::Cursor::new(bytes));
@@ -1120,6 +1132,7 @@ mod tests {
     /// End-to-end parallel full walk over a record whose body spans the seg 1 /
     /// seg 2 boundary: seg 1 holds the head, seg 2 the tail. The boundary stitch
     /// must recover block 7, which neither segment's in-segment parse sees alone
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn full_walk_stitches_boundary_record() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -1164,6 +1177,7 @@ mod tests {
     /// tail in seg 3) can't be reconstructed pairwise; the parallel walk detects
     /// the fully-middle seg 2 and falls back to the serial threaded walk, which
     /// still recovers block 7
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn full_walk_falls_back_on_multi_segment_record() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -1216,6 +1230,7 @@ mod tests {
     /// trailing head only seg 2 can complete. With seg 2 absent the parallel
     /// walk must error, never return a map missing the stitched block — a
     /// partial increment would restore stale parent data for that page
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn parallel_parse_missing_boundary_neighbor_errors() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -1254,6 +1269,7 @@ mod tests {
     /// interrupted upload) must never fold as a partial map: the consumer errors
     /// the sidecar path and re-walks the group's raw WAL, recovering exactly the
     /// real blocks. The truncated sidecar's stray tuple must not leak through
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn truncated_sidecar_falls_back_to_raw_walk() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -1307,6 +1323,7 @@ mod tests {
     /// must error rather than silently drop that group's changed blocks. Records
     /// segs 32..=63 (group 48 finalizes, group 32 never does) but uploads no raw
     /// segments, so group 32 is recoverable by neither sidecar nor raw walk
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn aligned_first_group_missing_sidecar_and_raw_errors() {
         use crate::pg::backup::delta::build_delta_map_from_wal;
@@ -1375,6 +1392,7 @@ mod tests {
     /// the success case), but group 16's raw segments are absent from the archive
     /// too, so the build must error rather than fold the corrupt sidecar's partial
     /// map — a partial increment would restore stale parent data
+    #[cfg(feature = "backup")]
     #[tokio::test]
     async fn corrupt_sidecar_without_raw_wal_errors() {
         use crate::pg::backup::delta::build_delta_map_from_wal;

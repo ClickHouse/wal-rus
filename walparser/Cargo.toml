@@ -1,0 +1,20 @@
+[package]
+name = "pg-walparser"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "PostgreSQL WAL (XLOG) record parser, no_std + alloc"
+license = "Apache-2.0"
+repository = "https://github.com/ClickHouse/wal-rus"
+readme = "README.md"
+keywords = ["postgres", "postgresql", "wal", "no_std"]
+categories = ["parser-implementations", "no-std", "database"]
+
+[dependencies]
+thiserror = { version = "2", default-features = false }
+
+[features]
+default = ["std"]
+# std::io adapters: WalParser::save/load, extract_locations_from_wal_file,
+# delta location list readers/writers
+std = ["thiserror/std"]

@@ -2,6 +2,9 @@
 //! tests. Signature/auth headers are accepted blindly so signing code runs
 //! without the mock validating it
 
+// Some helpers only serve one backend's tests
+#![cfg_attr(not(all(feature = "s3", feature = "gcs")), allow(dead_code))]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

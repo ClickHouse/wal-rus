@@ -12,12 +12,15 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 
 pub mod check;
+#[cfg(feature = "s3")]
 pub mod creds;
 pub mod fs;
+#[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod retrying;
+#[cfg(feature = "s3")]
 pub mod s3;
-#[cfg(test)]
+#[cfg(all(test, any(feature = "s3", feature = "gcs")))]
 pub(crate) mod test_http;
 pub mod tools;
 
@@ -104,6 +107,7 @@ impl StorageError {
     }
 }
 
+#[cfg(any(feature = "s3", feature = "gcs"))]
 impl From<reqwest::Error> for StorageError {
     fn from(e: reqwest::Error) -> Self {
         if let Some(st) = e.status() {
@@ -191,6 +195,7 @@ pub type DynStorage = Arc<dyn Storage>;
 /// Join a storage `prefix` to an object `key`, collapsing the slash between
 /// them. Empty prefix returns the key unchanged. Shared by object backends so
 /// their `full_key` mappings stay identical
+#[cfg(any(feature = "s3", feature = "gcs"))]
 pub(crate) fn join_prefix_key(prefix: &str, key: &str) -> String {
     if prefix.is_empty() {
         key.to_string()
@@ -210,6 +215,7 @@ mod tests {
 
     /// Serve `chunks` with `gap` between them, so the body takes far longer
     /// than any single read waits for
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     async fn drip_server(chunks: usize, chunk: usize, gap: std::time::Duration) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -238,6 +244,7 @@ mod tests {
     /// slow-but-progressing body, where a total deadline would abort it purely
     /// for being large. A 400 MiB part against a 60s total deadline needs a
     /// sustained 7 MiB/s or reqwest kills it as "error decoding response body"
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     #[tokio::test]
     async fn read_timeout_survives_a_slow_body_but_not_a_stall() {
         let gap = std::time::Duration::from_millis(40);
@@ -303,6 +310,7 @@ mod tests {
         assert!(!StorageError::Unimplemented("x").is_transient());
     }
 
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     #[test]
     fn join_prefix_key_collapses_separators() {
         assert_eq!(join_prefix_key("", "wal_005/x"), "wal_005/x");
@@ -311,6 +319,7 @@ mod tests {
         assert_eq!(join_prefix_key("a/b/", "c"), "a/b/c");
     }
 
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     #[tokio::test]
     async fn reqwest_connect_error_maps_to_transport() {
         // 127.0.0.1:1 is closed → connection refused, no HTTP status, so the
