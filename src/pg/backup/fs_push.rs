@@ -15,15 +15,16 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll, ready};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
-use tokio_tar::{Builder, EntryType, Header};
 
 use crate::compression::{self, AsyncBufReader, AsyncReader};
 use crate::config::Settings;
@@ -31,9 +32,10 @@ use crate::pg::backup::delta;
 use crate::pg::backup::increment::Format as IncrementFormat;
 use crate::pg::backup::push::{self, Finalize, PushArgs};
 use crate::pg::backup::tar_streamer::{
-    DeltaClass, DeltaContext, IncrementBodyReader, PG_PAGE_HEADER_SIZE, PartWriter,
+    DeltaClass, DeltaContext, IncrementBodyReader, PG_PAGE_HEADER_SIZE, PartWriter, ZERO_PAGE,
     classify_for_delta, increment_class_for_blocks, page_changed_since,
 };
+use crate::pg::backup::tarball::{Entry, Kind, Writer, poll_read_via_fill_buf};
 use crate::pg::backup::{
     FileDescription, TablespaceSpec, format_backup_name, format_pg_lsn, parse_pg_lsn, tar_part_key,
 };
@@ -48,7 +50,7 @@ const PG_CONTROL_ENTRY: &str = "global/pg_control";
 // tar entry name for the pg_control tee, restores without a files_metadata entry
 const TAR_PG_CONTROL_ENTRY: &str = "/global/pg_control";
 
-/// Coalesce file-body reads. tokio_tar copies each body through io::copy's 8 KB
+/// Coalesce file-body reads. tarball::Writer copies each body through io::copy's 8 KB
 /// buffer, and every tokio::fs::File read is a blocking-pool dispatch; reading a
 /// multi-GB relation in 8 KB units floods the pool and bounds single-stream
 /// throughput. A BufReader turns ~CAP/8KB dispatches into one. 256 KB is the knee
@@ -489,7 +491,7 @@ async fn pack_worker(
         let upload = tokio::spawn(upload_part(reader, key, settings.clone(), storage.clone()));
 
         let counter_bytes = Arc::new(AtomicU64::new(0));
-        let mut builder = Builder::new(PartWriter::new(byte_tx, counter_bytes.clone()));
+        let mut builder = Writer::new(PartWriter::new(byte_tx, counter_bytes.clone()));
         // Abort the upload if this worker errors or is cancelled before the part
         // is fully written, so it can't keep reading PGDATA / uploading after
         // backup-push has returned. Declared after `builder` so on drop it aborts
@@ -504,8 +506,7 @@ async fn pack_worker(
                     .push(e.tar_path.clone());
             }
         }
-        builder.finish().await.context("finish part")?;
-        let mut writer = builder.into_inner().await.context("into_inner part")?;
+        let mut writer = builder.finish().await.context("finish part")?;
         writer.shutdown().await.context("flush part")?;
         // Drop the writer (and its PollSender) to close the channel so the
         // upload's ChannelReader sees EOF; shutdown only flushes, it doesn't
@@ -524,15 +525,15 @@ async fn pack_worker(
 /// Append one walked entry to `builder`, recording per-file metadata. Returns
 /// whether anything was written to the tar (delta-skipped files write nothing)
 async fn append_entry(
-    builder: &mut Builder<PartWriter>,
+    builder: &mut Writer<PartWriter>,
     e: &WalkEntry,
     delta_context: &Option<DeltaContext>,
     res: &mut WorkerResult,
 ) -> Result<bool> {
     if matches!(e.kind, EntryKind::Dir) {
-        let mut h = header(e, EntryType::Directory, 0);
+        let h = header(e, Kind::Directory, 0);
         builder
-            .append_data(&mut h, &e.tar_path, tokio::io::empty())
+            .append(&h, tokio::io::empty())
             .await
             .with_context(|| format!("append dir {}", e.tar_path))?;
         return Ok(true);
@@ -633,9 +634,9 @@ async fn append_entry(
                             tokio::fs::File::from_std(std_file),
                         );
                         let body = FixedSizeReader::new(file, e.size);
-                        let mut h = header(e, EntryType::Regular, e.size);
+                        let h = header(e, Kind::Regular, e.size);
                         builder
-                            .append_data(&mut h, &e.tar_path, body)
+                            .append(&h, body)
                             .await
                             .with_context(|| format!("append {}", e.tar_path))?;
                         res.files.insert(
@@ -656,10 +657,10 @@ async fn append_entry(
 
             let mut file =
                 BufReader::with_capacity(FILE_READ_BUF, tokio::fs::File::from_std(std_file));
-            let mut h = header(e, EntryType::Regular, total_size);
+            let h = header(e, Kind::Regular, total_size);
             let body = IncrementBodyReader::new(header_bytes, &mut file, blocks, e.size);
             builder
-                .append_data(&mut h, &e.tar_path, body)
+                .append(&h, body)
                 .await
                 .with_context(|| format!("append increment {}", e.tar_path))?;
             res.files.insert(
@@ -678,9 +679,9 @@ async fn append_entry(
                 return Ok(false);
             };
             let body = FixedSizeReader::new(file, e.size);
-            let mut h = header(e, EntryType::Regular, e.size);
+            let h = header(e, Kind::Regular, e.size);
             builder
-                .append_data(&mut h, &e.tar_path, body)
+                .append(&h, body)
                 .await
                 .with_context(|| format!("append {}", e.tar_path))?;
             res.files.insert(
@@ -745,13 +746,8 @@ async fn open_walked(abs: &Path) -> Result<Option<BufReader<tokio::fs::File>>> {
     }
 }
 
-fn header(e: &WalkEntry, kind: EntryType, size: u64) -> Header {
-    let mut h = Header::new_gnu();
-    h.set_size(size);
-    h.set_mode(e.mode);
-    h.set_mtime(e.mtime.max(0) as u64);
-    h.set_entry_type(kind);
-    h
+fn header(e: &WalkEntry, kind: Kind, size: u64) -> Entry {
+    Entry::new(&e.tar_path, kind, size, e.mode, e.mtime.max(0) as u64)
 }
 
 fn mtime_dt(secs: i64) -> Timestamp {
@@ -826,39 +822,31 @@ async fn build_pg_control_tar(abs: &Path) -> Result<Bytes> {
     let data = tokio::fs::read(abs)
         .await
         .with_context(|| format!("read {}", abs.display()))?;
-    let mut b = Builder::new(Vec::new());
-    let mut h = Header::new_gnu();
-    // leading-slash name matches wal-g; set_path rejects absolute paths, so
-    // write the name bytes directly (fits in the 100-byte GNU name field)
-    let name = TAR_PG_CONTROL_ENTRY.as_bytes();
-    h.as_old_mut().name[..name.len()].copy_from_slice(name);
-    h.set_size(data.len() as u64);
-    h.set_mode(0o600);
-    h.set_mtime(0);
-    h.set_entry_type(EntryType::Regular);
-    h.set_cksum();
+    // leading-slash name matches wal-g
+    let h = Entry::new(
+        TAR_PG_CONTROL_ENTRY,
+        Kind::Regular,
+        data.len() as u64,
+        0o600,
+        0,
+    );
+    let mut b = Writer::new(Vec::new());
     b.append(&h, &data[..])
         .await
         .context("append pg_control tee")?;
-    b.finish().await.context("finish pg_control tar")?;
-    let buf = b.into_inner().await.context("into_inner pg_control tar")?;
+    let buf = b.finish().await.context("finish pg_control tar")?;
     Ok(Bytes::from(buf))
 }
 
 async fn build_small_tar(entries: &[(&str, &str)]) -> Result<Bytes> {
-    let mut b = Builder::new(Vec::new());
+    let mut b = Writer::new(Vec::new());
     for (name, content) in entries {
-        let mut h = Header::new_gnu();
-        h.set_size(content.len() as u64);
-        h.set_mode(0o600);
-        h.set_mtime(0);
-        h.set_entry_type(EntryType::Regular);
-        b.append_data(&mut h, name, content.as_bytes())
+        let h = Entry::new(*name, Kind::Regular, content.len() as u64, 0o600, 0);
+        b.append(&h, content.as_bytes())
             .await
             .with_context(|| format!("append {name}"))?;
     }
-    b.finish().await.context("finish tar")?;
-    let buf = b.into_inner().await.context("into_inner tar")?;
+    let buf = b.finish().await.context("finish tar")?;
     Ok(Bytes::from(buf))
 }
 
@@ -1133,49 +1121,43 @@ impl<R> FixedSizeReader<R> {
     }
 }
 
-impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for FixedSizeReader<R> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use std::task::Poll;
+impl<R: AsyncBufRead + Unpin> AsyncBufRead for FixedSizeReader<R> {
+    fn poll_fill_buf(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<&[u8]>> {
         let me = self.get_mut();
-        if me.remaining == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let want = (buf.remaining() as u64).min(me.remaining) as usize;
+        let want = usize::try_from(me.remaining).unwrap_or(usize::MAX);
         if want == 0 {
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(&[]));
         }
-        if me.inner_eof {
-            // initialize_unfilled_to zeroes the region; emit padding
-            buf.initialize_unfilled_to(want);
-            buf.advance(want);
-            me.remaining -= want as u64;
-            return Poll::Ready(Ok(()));
-        }
-        let n;
-        {
-            let dst = buf.initialize_unfilled_to(want);
-            let mut tmp = tokio::io::ReadBuf::new(dst);
-            match std::pin::Pin::new(&mut me.inner).poll_read(cx, &mut tmp) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => n = tmp.filled().len(),
+        if !me.inner_eof {
+            let buf = ready!(Pin::new(&mut me.inner).poll_fill_buf(cx))?;
+            if !buf.is_empty() {
+                return Poll::Ready(Ok(&buf[..buf.len().min(want)]));
             }
-        }
-        if n == 0 {
             // file shorter than recorded size: pad the rest with zeros
             me.inner_eof = true;
-            buf.initialize_unfilled_to(want);
-            buf.advance(want);
-            me.remaining -= want as u64;
-        } else {
-            buf.advance(n);
-            me.remaining -= n as u64;
         }
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(&ZERO_PAGE[..ZERO_PAGE.len().min(want)]))
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        if !me.inner_eof {
+            Pin::new(&mut me.inner).consume(amt);
+        }
+        me.remaining -= amt as u64;
+    }
+}
+
+impl<R: AsyncBufRead + Unpin> AsyncRead for FixedSizeReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        poll_read_via_fill_buf(self, cx, out)
     }
 }
 

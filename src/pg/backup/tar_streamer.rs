@@ -10,8 +10,8 @@
 //! into its own part (wal-g matches this behavior; mirrors a real PG tar
 //! that occasionally carries multi-GB segment files)
 //!
-//! The streamer runs as a `tokio::spawn` task over `astral-tokio-tar`'s async
-//! `Archive` / `Builder`; per-part output flows over an mpsc of `Bytes` that
+//! The streamer runs as a `tokio::spawn` task over `tarball`'s `Reader` /
+//! `Writer`; per-part output flows over an mpsc of `Bytes` that
 //! the caller reads as an `AsyncRead` (see `ChannelReader`)
 
 use std::collections::{HashMap, HashSet};
@@ -19,21 +19,20 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context as TaskContext, Poll};
+use std::task::{Context as TaskContext, Poll, ready};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use futures::StreamExt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tar::{Archive, Builder, Header};
 use tokio_util::sync::PollSender;
 
 use crate::pg::backup::delta::{self as delta_mod, PG_PAGE_SIZE, PagedFileDeltaMap};
 use crate::pg::backup::increment::{
     self, Format as IncrementFormat, write_increment_header, write_native_increment_header,
 };
+use crate::pg::backup::tarball::{Reader, Writer, poll_read_via_fill_buf};
 use crate::pg::replication::base_backup::ChannelReader;
 use crate::time::Timestamp;
 
@@ -145,33 +144,22 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
     opts: StreamerOpts,
     parts_tx: mpsc::Sender<Result<Part>>,
 ) -> Result<StreamerResult> {
-    let mut archive = Archive::new(input);
-    let mut entries = archive.entries().context("open tar entries")?;
+    let mut reader = Reader::new(input);
 
     let mut result = StreamerResult::default();
     let mut file_no = opts.starting_file_no;
-    let mut tee_builder: Option<Builder<Vec<u8>>> = if opts.tee_names.is_empty() {
-        None
-    } else {
-        Some(Builder::new(Vec::new()))
-    };
+    let mut tee_builder = (!opts.tee_names.is_empty()).then(|| Writer::new(Vec::new()));
 
     let mut current: Option<PartCtx> = None;
 
-    while let Some(entry) = entries.next().await {
-        let mut entry = entry.context("read tar entry")?;
-        let orig_path = entry
-            .path()
-            .context("entry path")?
-            .to_string_lossy()
-            .into_owned();
+    while let Some((mut new_hdr, mut body)) = reader.next().await.context("read tar entry")? {
         let mapped = match &opts.prefix {
-            Some(p) => format!("{p}{}", orig_path),
-            None => orig_path.clone(),
+            Some(p) => format!("{p}{}", new_hdr.path),
+            None => new_hdr.path.clone(),
         };
-        let entry_size = entry.effective_size();
-        let is_dir = entry.header().entry_type().is_dir();
-        let mtime = header_mtime(entry.header());
+        let entry_size = new_hdr.size;
+        let is_dir = new_hdr.is_dir();
+        let mtime = Timestamp::from_unix(new_hdr.mtime as i64, 0);
         let canonical_name = strip_dotslash(&mapped).to_string();
 
         // Delta-mode classification: paged files with a tracked delta map
@@ -181,7 +169,7 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
 
         if matches!(delta_class, DeltaClass::Skip) {
             // Skip entry: record as IsSkipped, don't write to tar at all.
-            // `entries.next()` will advance past the unread bytes.
+            // `reader.next()` will advance past the unread bytes.
             result.files.insert(
                 canonical_name.clone(),
                 FileMeta {
@@ -215,9 +203,7 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
         }
         let ctx = current.as_mut().unwrap();
 
-        // append_data handles path encoding (auto-emits GNU LongLink for
-        // > 100 char paths) and cksum, so no set_path here
-        let mut new_hdr = entry.header().clone();
+        new_hdr.path = canonical_name.clone();
 
         // Decide whether to tee this entry
         let tee_match =
@@ -233,11 +219,10 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
                 // pages from the input entry through IncrementBodyReader.
                 // Tee + increment is impossible (paged files never tee), so
                 // no need to mirror to tee_builder
-                new_hdr.set_size(total_size);
-                new_hdr.set_cksum();
-                let body = IncrementBodyReader::new(header_bytes, &mut entry, blocks, entry_size);
+                new_hdr.size = total_size;
+                let body = IncrementBodyReader::new(header_bytes, &mut body, blocks, entry_size);
                 ctx.builder
-                    .append_data(&mut new_hdr, &mapped, body)
+                    .append(&new_hdr, body)
                     .await
                     .context("append increment to current part")?;
                 (true, false)
@@ -246,23 +231,19 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
                 if tee_match {
                     // Tee path: buffer in memory (only used for small files like pg_control)
                     let mut buf = Vec::with_capacity(entry_size as usize);
-                    entry
-                        .read_to_end(&mut buf)
-                        .await
-                        .context("read tee entry")?;
-                    let mut tee_hdr = new_hdr.clone();
+                    body.read_to_end(&mut buf).await.context("read tee entry")?;
                     ctx.builder
-                        .append_data(&mut new_hdr, &mapped, &buf[..])
+                        .append(&new_hdr, &buf[..])
                         .await
                         .context("append to current part")?;
                     if let Some(tb) = tee_builder.as_mut() {
-                        tb.append_data(&mut tee_hdr, &mapped, &buf[..])
+                        tb.append(&new_hdr, &buf[..])
                             .await
                             .context("append to tee tar")?;
                     }
                 } else {
                     ctx.builder
-                        .append_data(&mut new_hdr, &mapped, &mut entry)
+                        .append(&new_hdr, &mut body)
                         .await
                         .context("append to current part")?;
                 }
@@ -291,9 +272,8 @@ async fn run_async<R: AsyncRead + Send + Unpin + 'static>(
     if let Some(ctx) = current.take() {
         finalize_part(ctx).await?;
     }
-    if let Some(mut tb) = tee_builder.take() {
-        tb.finish().await.context("finish tee tar")?;
-        let buf = tb.into_inner().await.context("into_inner tee tar")?;
+    if let Some(tb) = tee_builder.take() {
+        let buf = tb.finish().await.context("finish tee tar")?;
         if !buf.is_empty() {
             result.tee_bytes = Some(Bytes::from(buf));
         }
@@ -446,14 +426,18 @@ pub(crate) fn page_changed_since(header: &[u8], parent_start_lsn: u64) -> bool {
     page_lsn(header) >= parent_start_lsn
 }
 
-/// `AsyncRead` impl that emits a pre-encoded increment header followed by the
-/// subset of input pages whose block numbers appear in `blocks`. Reads the
-/// input strictly forward — pages before each target are read & discarded
+/// `AsyncBufRead` impl that emits a pre-encoded increment header followed by the
+/// subset of input pages whose block numbers appear in ascending `blocks`.
+/// Reads the input strictly forward, consuming pages before each target unread
+/// and passing target pages through from the input's buffer. Input ending early
+/// pads remaining pages with zeros: PG truncates a dropped relation to 0 bytes
+/// and defers unlink to next checkpoint, VACUUM truncates trailing pages; WAL
+/// replay from backup start redoes either
 enum IncrementPhase {
     Header,
-    /// load the next target page (skipping intervening pages first)
-    Load,
-    /// emit the page currently buffered in `page_buf`
+    /// consume `left` bytes of pages preceding the current target
+    Skip,
+    /// emit `left` remaining bytes of the current target page
     Emit,
     Done,
 }
@@ -464,17 +448,14 @@ pub(crate) struct IncrementBodyReader<'a, R> {
     input: &'a mut R,
     blocks: Vec<u32>,
     next_idx: usize,
-    /// next block index still to be read off the input
+    /// block number of next unread input page
     cur_block: u32,
-    page_buf: [u8; PG_PAGE_SIZE as usize],
-    /// bytes filled into `page_buf` while loading the current page
-    fill: usize,
-    /// emit cursor into `page_buf`
-    emit_pos: usize,
+    left: usize,
     phase: IncrementPhase,
+    input_eof: bool,
 }
 
-impl<'a, R: AsyncRead + Unpin> IncrementBodyReader<'a, R> {
+impl<'a, R: AsyncBufRead + Unpin> IncrementBodyReader<'a, R> {
     pub(crate) fn new(
         header: Vec<u8>,
         input: &'a mut R,
@@ -488,86 +469,96 @@ impl<'a, R: AsyncRead + Unpin> IncrementBodyReader<'a, R> {
             blocks,
             next_idx: 0,
             cur_block: 0,
-            page_buf: [0u8; PG_PAGE_SIZE as usize],
-            fill: 0,
-            emit_pos: 0,
+            left: 0,
             phase: IncrementPhase::Header,
+            input_eof: false,
+        }
+    }
+
+    fn next_target(&mut self) {
+        let Some(&target) = self.blocks.get(self.next_idx) else {
+            self.phase = IncrementPhase::Done;
+            return;
+        };
+        let skip = target.saturating_sub(self.cur_block);
+        self.left = skip as usize * PG_PAGE_SIZE as usize;
+        self.cur_block += skip + 1;
+        self.phase = IncrementPhase::Skip;
+    }
+}
+
+pub(crate) static ZERO_PAGE: [u8; PG_PAGE_SIZE as usize] = [0; PG_PAGE_SIZE as usize];
+
+impl<'a, R: AsyncBufRead + Unpin> AsyncBufRead for IncrementBodyReader<'a, R> {
+    fn poll_fill_buf(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<&[u8]>> {
+        let me = self.get_mut();
+        loop {
+            match me.phase {
+                IncrementPhase::Header => {
+                    if me.header_pos < me.header.len() {
+                        return Poll::Ready(Ok(&me.header[me.header_pos..]));
+                    }
+                    me.next_target();
+                }
+                IncrementPhase::Skip => {
+                    if me.left == 0 || me.input_eof {
+                        me.left = PG_PAGE_SIZE as usize;
+                        me.phase = IncrementPhase::Emit;
+                        continue;
+                    }
+                    let buf = ready!(Pin::new(&mut *me.input).poll_fill_buf(cx))?;
+                    if buf.is_empty() {
+                        me.input_eof = true;
+                        continue;
+                    }
+                    let n = buf.len().min(me.left);
+                    Pin::new(&mut *me.input).consume(n);
+                    me.left -= n;
+                }
+                IncrementPhase::Emit => {
+                    if !me.input_eof {
+                        let buf = ready!(Pin::new(&mut *me.input).poll_fill_buf(cx))?;
+                        if !buf.is_empty() {
+                            return Poll::Ready(Ok(&buf[..buf.len().min(me.left)]));
+                        }
+                        me.input_eof = true;
+                    }
+                    return Poll::Ready(Ok(&ZERO_PAGE[..me.left]));
+                }
+                IncrementPhase::Done => return Poll::Ready(Ok(&[])),
+            }
+        }
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        match me.phase {
+            IncrementPhase::Header => me.header_pos += amt,
+            IncrementPhase::Emit => {
+                if !me.input_eof {
+                    Pin::new(&mut *me.input).consume(amt);
+                }
+                me.left -= amt;
+                if me.left == 0 {
+                    me.next_idx += 1;
+                    me.next_target();
+                }
+            }
+            IncrementPhase::Skip | IncrementPhase::Done => {}
         }
     }
 }
 
-impl<'a, R: AsyncRead + Unpin> AsyncRead for IncrementBodyReader<'a, R> {
+impl<'a, R: AsyncBufRead + Unpin> AsyncRead for IncrementBodyReader<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let me = self.get_mut();
-        let page = PG_PAGE_SIZE as usize;
-        loop {
-            match me.phase {
-                IncrementPhase::Header => {
-                    if me.header_pos < me.header.len() {
-                        let n = (me.header.len() - me.header_pos).min(out.remaining());
-                        if n == 0 {
-                            return Poll::Ready(Ok(()));
-                        }
-                        out.put_slice(&me.header[me.header_pos..me.header_pos + n]);
-                        me.header_pos += n;
-                        return Poll::Ready(Ok(()));
-                    }
-                    me.phase = IncrementPhase::Load;
-                }
-                IncrementPhase::Load => {
-                    if me.next_idx >= me.blocks.len() {
-                        me.phase = IncrementPhase::Done;
-                        continue;
-                    }
-                    let target = me.blocks[me.next_idx];
-                    // fill page_buf with one full page from the input
-                    while me.fill < page {
-                        let mut rb = ReadBuf::new(&mut me.page_buf[me.fill..]);
-                        match Pin::new(&mut *me.input).poll_read(cx, &mut rb) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Ready(Ok(())) => {
-                                let got = rb.filled().len();
-                                if got == 0 {
-                                    return Poll::Ready(Err(std::io::Error::new(
-                                        std::io::ErrorKind::UnexpectedEof,
-                                        "increment input ended mid-page",
-                                    )));
-                                }
-                                me.fill += got;
-                            }
-                        }
-                    }
-                    me.fill = 0;
-                    if me.cur_block < target {
-                        // intervening page: discard & advance
-                        me.cur_block += 1;
-                        continue;
-                    }
-                    me.emit_pos = 0;
-                    me.phase = IncrementPhase::Emit;
-                }
-                IncrementPhase::Emit => {
-                    let n = (page - me.emit_pos).min(out.remaining());
-                    if n == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    out.put_slice(&me.page_buf[me.emit_pos..me.emit_pos + n]);
-                    me.emit_pos += n;
-                    if me.emit_pos == page {
-                        me.next_idx += 1;
-                        me.cur_block += 1;
-                        me.phase = IncrementPhase::Load;
-                    }
-                    return Poll::Ready(Ok(()));
-                }
-                IncrementPhase::Done => return Poll::Ready(Ok(())),
-            }
-        }
+        poll_read_via_fill_buf(self, cx, out)
     }
 }
 
@@ -578,7 +569,7 @@ fn _bind_increment(_: increment::IncrementHeader) {}
 
 struct PartCtx {
     file_no: u32,
-    builder: Builder<PartWriter>,
+    builder: Writer<PartWriter>,
     bytes_counter: Arc<AtomicU64>,
 }
 
@@ -599,7 +590,7 @@ async fn start_part(file_no: u32, parts_tx: &mpsc::Sender<Result<Part>>) -> Resu
     let writer = PartWriter::new(byte_tx, counter.clone());
     Ok(PartCtx {
         file_no,
-        builder: Builder::new(writer),
+        builder: Writer::new(writer),
         bytes_counter: counter,
     })
 }
@@ -607,19 +598,13 @@ async fn start_part(file_no: u32, parts_tx: &mpsc::Sender<Result<Part>>) -> Resu
 async fn finalize_part(ctx: PartCtx) -> Result<()> {
     // finish writes the two trailing zero blocks; shutdown flushes the tail
     // chunk, then dropping the writer closes the channel → ChannelReader EOF
-    let mut builder = ctx.builder;
-    builder.finish().await.context("finish tar part")?;
-    let mut writer = builder.into_inner().await.context("into_inner tar part")?;
+    let mut writer = ctx.builder.finish().await.context("finish tar part")?;
     writer.shutdown().await.context("flush part")?;
     Ok(())
 }
 
 fn strip_dotslash(s: &str) -> &str {
     s.strip_prefix("./").unwrap_or(s)
-}
-
-fn header_mtime(h: &Header) -> Timestamp {
-    Timestamp::from_unix(h.mtime().unwrap_or(0) as i64, 0)
 }
 
 fn broken_pipe() -> std::io::Error {
@@ -752,6 +737,34 @@ mod tests {
             out.push((name, h.size().unwrap()));
         }
         out
+    }
+
+    #[tokio::test]
+    async fn increment_body_reader_pages_straddle_buffer() {
+        let page = PG_PAGE_SIZE as usize;
+        let input: Vec<u8> = (0..6u8).flat_map(|b| vec![b; page]).collect();
+        // odd capacity so pages straddle refills
+        let mut src = tokio::io::BufReader::with_capacity(3000, &input[..]);
+        let r = IncrementBodyReader::new(b"HDR".to_vec(), &mut src, vec![1, 2, 4], 0);
+        let mut out = Vec::new();
+        tokio::io::BufReader::with_capacity(1000, r)
+            .read_to_end(&mut out)
+            .await
+            .unwrap();
+        let mut want = b"HDR".to_vec();
+        for b in [1u8, 2, 4] {
+            want.extend(std::iter::repeat_n(b, page));
+        }
+        assert_eq!(out, want);
+
+        // truncated mid-page 1, page 3 gone: zero-pad both
+        let mut short = &input[..page + 10];
+        let mut r = IncrementBodyReader::new(Vec::new(), &mut short, vec![1, 3], 0);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await.unwrap();
+        let mut want = vec![1u8; 10];
+        want.resize(2 * page, 0);
+        assert_eq!(out, want);
     }
 
     #[tokio::test]

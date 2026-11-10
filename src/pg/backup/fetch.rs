@@ -10,18 +10,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
 use futures::StreamExt;
-use tokio_tar::Archive;
+use tokio::io::AsyncBufReadExt;
+use tokio::sync::mpsc;
 use tokio_util::io::SyncIoBridge;
 
 use crate::compression;
 use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::backup::increment::apply_increment_in_place;
+use crate::pg::backup::tarball::{Body, Entry, Kind, Reader};
 use crate::pg::backup::{
     BackupSentinelDtoV2, FilesMetadataDto, LATEST, TablespaceSpec, files_metadata_key,
     name_from_sentinel_key, sentinel_key, tar_partitions_prefix,
 };
+use crate::pg::replication::base_backup::ChannelReader;
 use crate::storage::DynStorage;
 
 #[derive(Debug, Clone, Default)]
@@ -347,11 +351,9 @@ async fn unpack_part(
     let decrypted = settings.decrypt(throttled);
     let decoded = compression::decode(method, decrypted);
 
-    let mut archive = Archive::new(decoded);
-    let mut entries = archive.entries().context("open tar entries")?;
-    while let Some(entry) = entries.next().await {
-        let entry = entry.context("read tar entry")?;
-        unpack_entry(entry, dst, &incremented)
+    let mut reader = Reader::new(decoded);
+    while let Some((entry, body)) = reader.next().await.context("read tar entry")? {
+        unpack_entry(entry, body, dst, &incremented)
             .await
             .with_context(|| format!("unpack {key}"))?;
     }
@@ -361,29 +363,27 @@ async fn unpack_part(
 
 /// Restore one tar entry. PG restores legitimately follow `pg_tblspc/<oid>`
 /// symlinks pointing outside `dst`, so we skip the tar crate's "stays inside
-/// dst" canonicalization. File bodies bridge to a `spawn_blocking` apply path
-/// because `apply_increment_in_place` needs `Seek`
+/// dst" canonicalization. File bodies stream over a channel to a
+/// `spawn_blocking` apply path because `apply_increment_in_place` needs `Seek`
 async fn unpack_entry<R>(
-    entry: tokio_tar::Entry<R>,
+    entry: Entry,
+    mut body: Body<'_, R>,
     dst: &Path,
     incremented: &HashSet<String>,
 ) -> Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    R: tokio::io::AsyncRead + Unpin + Send,
 {
-    let path = entry.path().context("entry path")?.into_owned();
     // Skip absolute / parent-dir traversals
-    let rel = strip_to_relative(&path);
+    let rel = strip_to_relative(Path::new(&entry.path));
     if rel.as_os_str().is_empty() {
         return Ok(());
     }
     let target = dst.join(&rel);
-    let header = entry.header().clone();
-    let etype = header.entry_type();
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    if etype.is_dir() {
+    if entry.kind == Kind::Directory {
         match tokio::fs::create_dir(&target).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -393,15 +393,15 @@ where
         // Without this dirs land at the umask default (0775) and PG rejects the
         // restored data dir; files already get their mode applied below
         #[cfg(unix)]
-        if let Ok(mode) = header.mode() {
+        {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+            tokio::fs::set_permissions(&target, std::fs::Permissions::from_mode(entry.mode))
                 .await
                 .with_context(|| format!("chmod dir {}", target.display()))?;
         }
         return Ok(());
     }
-    if etype.is_symlink() {
+    if entry.kind == Kind::SymbolicLink {
         // pg_tblspc/<oid> links are restored up-front from the sentinel
         // TablespaceSpec (mapping-aware) before any part unpacks. Recreating
         // them from a part entry would race the concurrent data fan-out — its
@@ -415,28 +415,28 @@ where
         }
         #[cfg(unix)]
         {
-            let link = header
-                .link_name()
-                .context("symlink target")?
-                .ok_or_else(|| anyhow!("symlink without target"))?;
+            if entry.link.is_empty() {
+                bail!("symlink without target");
+            }
             // best-effort overwrite
             let _ = tokio::fs::remove_file(&target).await;
-            tokio::fs::symlink(link.as_ref(), &target).await?;
+            tokio::fs::symlink(&entry.link, &target).await?;
         }
         return Ok(());
     }
     // ignore fifo, char/block devices — none appear in a PG basebackup. Hard
     // links are treated like regular files (basebackup emits none)
-    if !(etype.is_file() || etype.is_hard_link()) {
+    if !matches!(entry.kind, Kind::Regular | Kind::HardLink) {
         return Ok(());
     }
 
     let path_key = rel.to_string_lossy().into_owned();
     let is_increment = incremented.contains(&path_key);
     let target = target.clone();
-    let mode = header.mode().ok();
-    let bridge = SyncIoBridge::new(entry);
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+    let mode = entry.mode;
+    let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(4);
+    let bridge = SyncIoBridge::new(ChannelReader::new(rx));
+    let apply = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         use std::io::Write;
         let mut bridge = bridge;
         if is_increment {
@@ -474,14 +474,29 @@ where
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = mode {
-                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
-            }
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
         }
         Ok(())
-    })
-    .await
-    .context("unpack file join")??;
+    });
+    // send fails once apply stops reading; its own result then says why
+    let pumped = async {
+        loop {
+            let chunk = body.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok::<_, std::io::Error>(());
+            }
+            let chunk = Bytes::copy_from_slice(chunk);
+            body.consume(chunk.len());
+            if tx.send(Ok(chunk)).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    drop(tx);
+    let applied = apply.await.context("unpack file join")?;
+    pumped.context("read tar body")?;
+    applied?;
     Ok(())
 }
 

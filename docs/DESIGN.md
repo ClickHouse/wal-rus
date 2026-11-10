@@ -116,8 +116,8 @@ location aren't honored, matching the env-only `PGSSLROOTCERT` handling.
 
 ## Tar streamer
 
-The BASE_BACKUP path uses `astral-tokio-tar` async archive and builder
-APIs. One task per archive re-tars with tablespace path remap, rotates
+The BASE_BACKUP path reads with `tarball::Reader` (tar-framing) and writes
+with `tarball::Writer`. One task per archive re-tars with tablespace path remap, rotates
 parts at `WALG_TAR_SIZE_THRESHOLD`, tees `global/pg_control` into its own
 part uploaded last, and collects per-file metadata. Part bytes flow
 through bounded mpsc chunks into upload workers, overlapping
