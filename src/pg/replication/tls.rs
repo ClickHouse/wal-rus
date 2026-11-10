@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rustls::CertificateError;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -230,8 +231,7 @@ fn load_client_auth(
 
 fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(file)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("parse PEM: {e}"))?;
     if certs.is_empty() {
@@ -242,19 +242,20 @@ fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    // private_key reads the first PKCS#8 / PKCS#1 / SEC1 block; encrypted keys
-    // (PGSSLPASSWORD) yield no recognized block and surface as the None error
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| anyhow!("parse private key PEM: {e}"))?
-        .ok_or_else(|| anyhow!("no private key found in {path} (encrypted keys unsupported)"))
+    // from_pem_reader reads the first PKCS#8 / PKCS#1 / SEC1 block; encrypted
+    // keys (PGSSLPASSWORD) yield no recognized block and surface as NoItemsFound
+    PrivateKeyDer::from_pem_reader(file).map_err(|e| match e {
+        pem::Error::NoItemsFound => {
+            anyhow!("no private key found in {path} (encrypted keys unsupported)")
+        }
+        e => anyhow!("parse private key PEM: {e}"),
+    })
 }
 
 fn load_pem_roots(path: &str, roots: &mut RootCertStore) -> Result<()> {
     let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
     let mut added = 0usize;
-    for cert in rustls_pemfile::certs(&mut reader) {
+    for cert in CertificateDer::pem_reader_iter(file) {
         let cert = cert.map_err(|e| anyhow!("parse PEM: {e}"))?;
         roots.add(cert).map_err(|e| anyhow!("add root cert: {e}"))?;
         added += 1;
@@ -493,6 +494,21 @@ HsRAMqj+AEAJ4N1uK9G/PW0ZGo+hRANCAASobCN8ilLXpwq1CNm8ONYZh1SgKKOR\n\
         let err = load_private_key(crt.to_str().unwrap()).err().unwrap();
         assert!(err.to_string().contains("no private key"), "{err}");
         std::fs::remove_file(crt).ok();
+    }
+
+    #[test]
+    fn private_key_rejects_encrypted_pem() {
+        // PGSSLPASSWORD-style PKCS#8 encryption is not a recognized key block
+        let enc = write_tmp(
+            "enckey",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAEC\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        );
+        let err = load_private_key(enc.to_str().unwrap()).err().unwrap();
+        assert!(
+            err.to_string().contains("encrypted keys unsupported"),
+            "{err}"
+        );
+        std::fs::remove_file(enc).ok();
     }
 
     #[tokio::test]
