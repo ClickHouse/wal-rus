@@ -1,6 +1,6 @@
 [package]
 name = "wal-rus"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.90"
 description = "Rust port of wal-g for PostgreSQL, optimized for no-overcommit hosts"
@@ -12,53 +12,140 @@ keywords = ["postgres", "postgresql"]
 [[bin]]
 name = "walrus"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [lib]
 name = "walrus"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "signal", "sync", "time", "process"] }
+pg-walparser = { version = "0.1.0", path = "walparser" }
+tokio = { version = "1", features = ["rt", "macros", "fs", "io-util", "io-std", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 futures = "0.3"
 async-trait = "0.1"
 bytes = "1"
-clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-async-compression = { version = "0.4", default-features = false, features = ["tokio", "zstd", "brotli", "lz4", "lzma", "gzip"] }
-hex = "0.4"
-url = "2"
-percent-encoding = "2"
-base64 = "0.23"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "form", "query", "http2"] }
-crc32c = "0.6"
-roaring = "0.12"
 aws-lc-rs = "1"
-quick-xml = "0.42"
-tar-framing = "0.0.16"
-postgres-protocol = "0.6"
-fallible-iterator = "0.2"
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
-rustls-pki-types = { version = "1.9", features = ["std"] }
-webpki-roots = "1"
-dryoc = { version = "2", default-features = false, features = ["std"] }
-libc = "0.2"
 glob = "0.3.3"
 
+# cli
+clap = { version = "4", features = ["derive", "env"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+libc = { version = "0.2", optional = true }
+
+# compression codecs
+async-compression = { version = "0.4", default-features = false, features = ["tokio"], optional = true }
+
+# storage backends
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "form", "query", "http2"], optional = true }
+quick-xml = { version = "0.42", optional = true }
+url = { version = "2", optional = true }
+percent-encoding = { version = "2", optional = true }
+
+# shared by several optional groups
+base64 = { version = "0.23", optional = true }
+hex = { version = "0.4", optional = true }
+rustls-pki-types = { version = "1.9", features = ["std"], optional = true }
+
+# libsodium encryption
+dryoc = { version = "2", default-features = false, features = ["std"], optional = true }
+
+# replication protocol
+postgres-protocol = { version = "0.6", optional = true }
+fallible-iterator = { version = "0.2", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
+# base backups
+tar-framing = { version = "0.0.16", optional = true }
+roaring = { version = "0.12", optional = true }
+crc32c = { version = "0.6", optional = true }
+
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "process"] }
 tempfile = "3"
 tar = "0.4"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
+# Integration tests that exercise optional features. Skipped (not failed) when
+# a required feature is off
+[[test]]
+name = "backup_roundtrip"
+required-features = ["backup", "libsodium", "zstd"]
+
+[[test]]
+name = "cli_bin"
+required-features = ["cli", "backup"]
+
+[[test]]
+name = "daemon_roundtrip"
+required-features = ["cli"]
+
+[[test]]
+name = "vm_live"
+required-features = ["vm-test", "cli", "backup", "libsodium"]
+
+[[test]]
+name = "wal_roundtrip"
+required-features = ["libsodium", "zstd"]
+
+[[test]]
+name = "walsender_server"
+required-features = ["replication"]
+
+[[test]]
+name = "walsender_vs_libpq"
+required-features = ["replication"]
+
+[workspace]
+members = ["walparser"]
+exclude = ["bench/tools"]
+
 [features]
+default = ["cli", "s3", "gcs", "zstd", "lz4", "brotli", "lzma", "gzip", "libsodium", "backup"]
+
+# `walrus` binary: clap, log init, daemon mode
+cli = ["dep:clap", "dep:tracing-subscriber", "dep:libc", "tokio/rt-multi-thread", "tokio/net", "tokio/signal"]
+
+# Storage backends. fs is always available
+s3 = ["dep:reqwest", "dep:quick-xml", "dep:url", "dep:hex", "dep:percent-encoding"]
+gcs = ["dep:reqwest", "dep:percent-encoding", "dep:base64", "dep:rustls-pki-types"]
+
+# Compression codecs. Method names always parse; using a compiled-out codec
+# is a runtime error
+zstd = ["dep:async-compression", "async-compression/zstd"]
+lz4 = ["dep:async-compression", "async-compression/lz4"]
+brotli = ["dep:async-compression", "async-compression/brotli"]
+lzma = ["dep:async-compression", "async-compression/lzma"]
+gzip = ["dep:async-compression", "async-compression/gzip"]
+
+# WALG_LIBSODIUM_KEY encryption
+libsodium = ["dep:dryoc", "dep:base64", "dep:hex"]
+
+# Streaming replication protocol: wal-receive, replication server
+replication = [
+    "dep:postgres-protocol",
+    "dep:fallible-iterator",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:webpki-roots",
+    "dep:base64",
+    "tokio/net",
+    "tokio/signal",
+]
+# backup-push / backup-fetch, delta backups, WAL summaries. Metadata-only
+# commands (backup-list/show/mark, delete, copy) don't need it
+backup = ["replication", "dep:tar-framing", "dep:roaring", "dep:crc32c"]
+
 # Enabled only on the VM test runner: hits a real PG cluster at PGPORT
 vm-test = []
 

@@ -2,17 +2,37 @@
 //!
 //! Reader-to-reader transforms via tokio::bufread adapters; no thread bridge,
 //! no full-segment buffering. Memory cost ~= codec window size + tokio BufReader.
+//!
+//! Each codec sits behind its own cargo feature (`zstd`, `lz4`, `brotli`,
+//! `lzma`, `gzip`). Every [`Method`] still parses, so object names & metadata
+//! of any codec stay readable; encoding or decoding with a compiled-out codec
+//! yields a reader that errors on first read
 
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
+#[cfg(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "brotli",
+    feature = "lzma",
+    feature = "gzip"
+))]
 use async_compression::Level;
+#[cfg(feature = "lz4")]
 use async_compression::lz4::{BlockSize, EncoderParams};
-use async_compression::tokio::bufread::{
-    BrotliDecoder, BrotliEncoder, GzipDecoder, GzipEncoder, Lz4Decoder, Lz4Encoder, LzmaDecoder,
-    LzmaEncoder, ZstdDecoder, ZstdEncoder,
-};
+#[cfg(feature = "brotli")]
+use async_compression::tokio::bufread::{BrotliDecoder, BrotliEncoder};
+#[cfg(feature = "gzip")]
+use async_compression::tokio::bufread::{GzipDecoder, GzipEncoder};
+#[cfg(feature = "lz4")]
+use async_compression::tokio::bufread::{Lz4Decoder, Lz4Encoder};
+#[cfg(feature = "lzma")]
+use async_compression::tokio::bufread::{LzmaDecoder, LzmaEncoder};
+#[cfg(feature = "zstd")]
+use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
 
 const BUF_CAPACITY: usize = 256 * 1024;
 
@@ -64,6 +84,67 @@ impl Method {
             _ => None,
         }
     }
+
+    /// Cargo feature that provides this codec (`None` needs no feature)
+    pub fn feature(self) -> &'static str {
+        match self {
+            Method::None => "",
+            Method::Zstd => "zstd",
+            Method::Brotli => "brotli",
+            Method::Lz4 => "lz4",
+            Method::Lzma => "lzma",
+            Method::Gz => "gzip",
+        }
+    }
+
+    /// Whether this build includes the codec
+    pub fn is_available(self) -> bool {
+        match self {
+            Method::None => true,
+            Method::Zstd => cfg!(feature = "zstd"),
+            Method::Brotli => cfg!(feature = "brotli"),
+            Method::Lz4 => cfg!(feature = "lz4"),
+            Method::Lzma => cfg!(feature = "lzma"),
+            Method::Gz => cfg!(feature = "gzip"),
+        }
+    }
+
+    fn unavailable_error(self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{self:?} compression requires walrus built with the `{}` feature",
+                self.feature()
+            ),
+        )
+    }
+}
+
+impl Default for Method {
+    /// lz4 (wal-g's default) when built, else zstd, else no compression
+    fn default() -> Self {
+        if cfg!(feature = "lz4") {
+            Method::Lz4
+        } else if cfg!(feature = "zstd") {
+            Method::Zstd
+        } else {
+            Method::None
+        }
+    }
+}
+
+/// Stand-in for a compiled-out codec: fails the first read, so `encode` /
+/// `decode` keep their infallible signatures
+struct Unavailable(Method);
+
+impl AsyncRead for Unavailable {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(self.0.unavailable_error()))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -83,67 +164,94 @@ pub fn encode(method: Method, input: AsyncReader, level: i32) -> AsyncReader {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "zstd",
+        feature = "lz4",
+        feature = "brotli",
+        feature = "lzma",
+        feature = "gzip"
+    )),
+    allow(unused_variables)
+)]
 pub fn encode_buffered(method: Method, input: AsyncBufReader, level: i32) -> AsyncReader {
     match method {
         Method::None => Box::pin(input),
+        #[cfg(feature = "zstd")]
         Method::Zstd => Box::pin(ZstdEncoder::with_quality(input, Level::Precise(level))),
+        #[cfg(feature = "brotli")]
         Method::Brotli => Box::pin(BrotliEncoder::with_quality(
             input,
             Level::Precise(brotli_quality(level)),
         )),
+        #[cfg(feature = "lz4")]
         Method::Lz4 => Box::pin(Lz4Encoder::with_quality_and_params(
             input,
             Level::Precise(level),
             EncoderParams::default().block_size(BlockSize::Max256KB),
         )),
+        #[cfg(feature = "lzma")]
         Method::Lzma => Box::pin(LzmaEncoder::with_quality(
             input,
             Level::Precise(lzma_preset(level)),
         )),
+        #[cfg(feature = "gzip")]
         Method::Gz => Box::pin(GzipEncoder::with_quality(
             input,
             Level::Precise(gzip_level(level)),
         )),
+        #[allow(unreachable_patterns)]
+        m => Box::pin(Unavailable(m)),
     }
 }
 
 pub fn decode(method: Method, input: AsyncReader) -> AsyncReader {
     match method {
         Method::None => input,
+        #[cfg(feature = "zstd")]
         Method::Zstd => {
             let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
             Box::pin(ZstdDecoder::new(buffered))
         }
+        #[cfg(feature = "brotli")]
         Method::Brotli => {
             let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
             Box::pin(BrotliDecoder::new(buffered))
         }
+        #[cfg(feature = "lz4")]
         Method::Lz4 => {
             let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
             Box::pin(Lz4Decoder::new(buffered))
         }
+        #[cfg(feature = "lzma")]
         Method::Lzma => {
             let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
             Box::pin(LzmaDecoder::new(buffered))
         }
+        #[cfg(feature = "gzip")]
         Method::Gz => {
             let buffered = BufReader::with_capacity(BUF_CAPACITY, input);
             Box::pin(GzipDecoder::new(buffered))
         }
+        #[allow(unreachable_patterns)]
+        m => Box::pin(Unavailable(m)),
     }
 }
 
 // brotli quality 0..=11; clamp caller-supplied zstd-shaped level into range
+#[cfg(feature = "brotli")]
 fn brotli_quality(level: i32) -> i32 {
     level.clamp(0, 11)
 }
 
 // lzma preset 0..=9
+#[cfg(feature = "lzma")]
 fn lzma_preset(level: i32) -> i32 {
     level.clamp(0, 9)
 }
 
 // gzip level 0..=9 (flate2 / async-compression accept 0..=9)
+#[cfg(feature = "gzip")]
 fn gzip_level(level: i32) -> i32 {
     level.clamp(0, 9)
 }
@@ -158,10 +266,24 @@ mod tests {
         Box::pin(Cursor::new(b.to_vec()))
     }
 
+    #[cfg(any(
+        feature = "zstd",
+        feature = "lz4",
+        feature = "brotli",
+        feature = "lzma",
+        feature = "gzip"
+    ))]
     fn payload() -> Vec<u8> {
         (0..200_000u32).map(|i| (i % 251) as u8).collect()
     }
 
+    #[cfg(any(
+        feature = "zstd",
+        feature = "lz4",
+        feature = "brotli",
+        feature = "lzma",
+        feature = "gzip"
+    ))]
     async fn roundtrip(method: Method) {
         let original = payload();
         let enc = encode(method, reader(&original), 3);
@@ -171,31 +293,37 @@ mod tests {
         assert_eq!(out, original, "{method:?} roundtrip mismatch");
     }
 
+    #[cfg(feature = "zstd")]
     #[tokio::test]
     async fn zstd_roundtrip() {
         roundtrip(Method::Zstd).await;
     }
 
+    #[cfg(feature = "brotli")]
     #[tokio::test]
     async fn brotli_roundtrip() {
         roundtrip(Method::Brotli).await;
     }
 
+    #[cfg(feature = "lz4")]
     #[tokio::test]
     async fn lz4_roundtrip() {
         roundtrip(Method::Lz4).await;
     }
 
+    #[cfg(feature = "lzma")]
     #[tokio::test]
     async fn lzma_roundtrip() {
         roundtrip(Method::Lzma).await;
     }
 
+    #[cfg(feature = "gzip")]
     #[tokio::test]
     async fn gz_roundtrip() {
         roundtrip(Method::Gz).await;
     }
 
+    #[cfg(feature = "lz4")]
     #[tokio::test]
     async fn encode_buffered_matches_encode() {
         // encode_buffered feeds the codec an AsyncBufRead directly (no internal
@@ -239,5 +367,39 @@ mod tests {
         assert_eq!(Method::Lz4.extension(), "lz4");
         assert_eq!(Method::Lzma.extension(), "lzma");
         assert_eq!(Method::Gz.extension(), "gz");
+    }
+
+    #[test]
+    fn availability_tracks_features() {
+        assert!(Method::None.is_available());
+        assert_eq!(Method::Lz4.is_available(), cfg!(feature = "lz4"));
+        assert_eq!(Method::Gz.feature(), "gzip");
+        assert!(Method::default().is_available());
+    }
+
+    #[cfg(not(all(
+        feature = "zstd",
+        feature = "lz4",
+        feature = "brotli",
+        feature = "lzma",
+        feature = "gzip"
+    )))]
+    #[tokio::test]
+    async fn unavailable_codec_errors_on_read() {
+        let m = [
+            Method::Zstd,
+            Method::Lz4,
+            Method::Brotli,
+            Method::Lzma,
+            Method::Gz,
+        ]
+        .into_iter()
+        .find(|m| !m.is_available())
+        .unwrap();
+        for mut r in [encode(m, reader(b"x"), 3), decode(m, reader(b"x"))] {
+            let err = r.read_to_end(&mut Vec::new()).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+            assert!(err.to_string().contains(m.feature()), "{err}");
+        }
     }
 }

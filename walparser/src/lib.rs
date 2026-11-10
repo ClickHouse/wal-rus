@@ -17,6 +17,15 @@
 //!
 //! Page size assumed 8 KiB (`BLOCK_SIZE`). Non-default WAL/block sizes are
 //! unsupported & match wal-g's behavior
+//!
+//! `no_std` + `alloc`. The default `std` feature adds the `std::io`
+//! adapters (`WalParser::save`/`load`, `extract_locations_from_wal_file`,
+//! delta location list readers/writers); the slice-based parsers & the
+//! per-segment walk need only `alloc`
+
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
+
+extern crate alloc;
 
 mod parse;
 mod state;
@@ -26,9 +35,10 @@ pub use parse::{
     ExtractError, ParseError, extract_block_locations, parse_record_from_bytes,
     read_xlog_record_header,
 };
+pub use state::{ParsePageError, SegmentBoundary, WalParser, walk_segment_locations};
+#[cfg(feature = "std")]
 pub use state::{
-    ParsePageError, ReadLocationsError, SegmentBoundary, WalParser,
-    extract_locations_from_wal_file, read_locations_from, walk_segment_locations,
+    ReadLocationsError, extract_locations_from_wal_file, read_locations_from,
     write_location_tuples, write_locations_to,
 };
 pub use types::{

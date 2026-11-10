@@ -10,11 +10,13 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{Settings, Vars};
 use crate::pg::backup;
+#[cfg(feature = "replication")]
 use crate::pg::replication::conn::PgConfig;
 use crate::pg::wal;
 
 /// `--increment-format`: delta file wire format. wal-g restores only `wi1`;
 /// `native` (PG17 INCREMENTAL) restores via pg_combinebackup, not wal-g
+#[cfg(feature = "backup")]
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum IncrementFormatArg {
     #[value(name = "wi1")]
@@ -23,6 +25,7 @@ pub enum IncrementFormatArg {
     Native,
 }
 
+#[cfg(feature = "backup")]
 impl From<IncrementFormatArg> for backup::increment::Format {
     fn from(f: IncrementFormatArg) -> Self {
         match f {
@@ -130,6 +133,7 @@ pub enum Cmd {
     },
     /// Long-running START_REPLICATION consumer that archives segments
     /// directly (alternative to archive_command)
+    #[cfg(feature = "replication")]
     WalReceive {
         /// Directory used to assemble segments mid-flight; each completed
         /// segment is shipped via the regular wal-push pipeline
@@ -143,6 +147,7 @@ pub enum Cmd {
     },
     /// Restore a base backup to a directory.
     /// Select via positional `name` (or `LATEST`) or `--target-user-data <json>`
+    #[cfg(feature = "backup")]
     BackupFetch {
         /// Destination directory (created if missing)
         dst: PathBuf,
@@ -159,6 +164,7 @@ pub enum Cmd {
     /// Uses libpq env vars (PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE).
     /// With PGDATA, reads local filesystem like wal-g. Without PGDATA, streams
     /// through replication BASE_BACKUP and records server-reported data_directory.
+    #[cfg(feature = "backup")]
     BackupPush {
         /// Optional path to local PostgreSQL data directory
         #[arg(value_name = "PGDATA")]
@@ -445,8 +451,11 @@ impl Cli {
         }
         let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         Ok(match self.cmd {
+            #[cfg(feature = "backup")]
             Cmd::BackupPush { .. } => cores.min(crate::config::upload_concurrency(vars)?),
-            Cmd::BackupFetch { .. } | Cmd::WalPrefetch { .. } | Cmd::WalRestore { .. } => {
+            #[cfg(feature = "backup")]
+            Cmd::BackupFetch { .. } => cores.min(crate::config::download_concurrency(vars)?),
+            Cmd::WalPrefetch { .. } | Cmd::WalRestore { .. } => {
                 cores.min(crate::config::download_concurrency(vars)?)
             }
             _ => 1,
@@ -492,13 +501,19 @@ impl Cli {
             Cmd::WalVerify { op } => {
                 let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
-                wal::verify::run(storage, op).await
+                let (check, json) = match op {
+                    WalVerifyOp::Integrity { json } => (wal::verify::Check::Integrity, json),
+                    WalVerifyOp::Timeline { json } => (wal::verify::Check::Timeline, json),
+                    WalVerifyOp::All { json } => (wal::verify::Check::All, json),
+                };
+                wal::verify::run(storage, check, json).await
             }
             Cmd::WalRestore { dst, timeline } => {
                 let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
                 wal::restore::handle(&s, storage, &dst, timeline).await
             }
+            #[cfg(feature = "replication")]
             Cmd::WalReceive { archive_dir } => {
                 let s = Settings::resolve(&vars, config_path.clone())?;
                 let storage = s.build_storage()?;
@@ -516,6 +531,7 @@ impl Cli {
                 };
                 backup::list::handle(storage, format).await
             }
+            #[cfg(feature = "backup")]
             Cmd::BackupFetch {
                 dst,
                 name,
@@ -538,6 +554,7 @@ impl Cli {
                 };
                 backup::fetch::handle(&s, storage, &resolved, &dst).await
             }
+            #[cfg(feature = "backup")]
             Cmd::BackupPush {
                 pgdata,
                 permanent,
@@ -815,6 +832,7 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[cfg(feature = "backup")]
     #[test]
     fn increment_format_arg_maps_to_wire_format() {
         use backup::increment::Format;
@@ -822,6 +840,7 @@ mod tests {
         assert_eq!(Format::from(IncrementFormatArg::Native), Format::Native);
     }
 
+    #[cfg(feature = "backup")]
     #[test]
     fn backup_push_accepts_positional_pgdata() {
         let cli = Cli::parse_from(["walrus", "backup-push", "/dat/18/data", "--full"]);
@@ -834,6 +853,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "backup")]
     #[test]
     fn backup_push_accepts_walg_verify_flag() {
         let cli = Cli::parse_from(["walrus", "backup-push", "/dat/18/data", "--verify"]);
@@ -1155,12 +1175,15 @@ mod tests {
     #[test]
     fn concurrent_commands_scale_with_cores() {
         // min(cores, concurrency-from-env); both factors are >=1
-        for args in [
-            vec!["walrus", "backup-push"],
-            vec!["walrus", "backup-fetch", "LATEST", "/dst"],
+        let mut cmds = vec![
             vec!["walrus", "wal-prefetch", "seg", "/pg_wal"],
             vec!["walrus", "wal-restore", "/dst"],
-        ] {
+        ];
+        if cfg!(feature = "backup") {
+            cmds.push(vec!["walrus", "backup-push"]);
+            cmds.push(vec!["walrus", "backup-fetch", "LATEST", "/dst"]);
+        }
+        for args in cmds {
             assert!(worker_threads_of(&args) >= 1);
         }
     }

@@ -11,6 +11,8 @@
 //! prefix + the parser's `current_record_data` bytes. See wal-g
 //! `block_location_writer.go` & `wal_parser.go::Save`
 
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
 use std::io::{self, Read, Write};
 
 use thiserror::Error;
@@ -30,12 +32,14 @@ use super::types::{
 pub enum ParsePageError {
     #[error(transparent)]
     Parse(#[from] ParseError),
+    #[cfg(feature = "std")]
     #[error("io: {0}")]
     Io(#[from] io::Error),
     #[error("cannot save partial parser: no record beginning present")]
     CantSavePartialParser,
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Error)]
 pub enum ReadLocationsError {
     #[error("io: {0}")]
@@ -121,7 +125,7 @@ impl WalParser {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let mut current_record_data = std::mem::take(&mut self.current_record_data);
+        let mut current_record_data = core::mem::take(&mut self.current_record_data);
         current_record_data.extend_from_slice(&page.prev_record_trailing_data);
 
         if !self.has_current_record_beginning {
@@ -173,7 +177,7 @@ impl WalParser {
         ar.read_to_alignment()?;
 
         // Bytes carrying over a previous record's tail
-        let want = std::cmp::min(header.remaining_data_len as usize, WAL_PAGE_SIZE as usize);
+        let want = core::cmp::min(header.remaining_data_len as usize, WAL_PAGE_SIZE as usize);
         let take_n = want.min(ar.buf.len());
         let remaining_data = ar.take(take_n, "pageRemainingData")?.to_vec();
 
@@ -207,6 +211,7 @@ impl WalParser {
         read_xlog_page_inner(&mut ar, header, remaining_data)
     }
 
+    #[cfg(feature = "std")]
     pub fn save<W: Write>(&self, mut w: W) -> Result<(), ParsePageError> {
         if !self.current_record_data.is_empty() && !self.has_current_record_beginning {
             return Err(ParsePageError::CantSavePartialParser);
@@ -217,6 +222,7 @@ impl WalParser {
         Ok(())
     }
 
+    #[cfg(feature = "std")]
     pub fn load<R: Read>(mut r: R) -> Result<Self, ParsePageError> {
         let mut len_bytes = [0u8; 4];
         r.read_exact(&mut len_bytes)?;
@@ -293,6 +299,7 @@ fn read_xlog_page_inner(
 /// Walk a WAL segment file (or any `Read` that yields raw page bytes),
 /// extracting every `BlockLocation` referenced. Tolerates Partial / Zero
 /// page errors as end-of-valid-data signals
+#[cfg(feature = "std")]
 pub fn extract_locations_from_wal_file<R: Read>(
     parser: &mut WalParser,
     mut r: R,
@@ -409,7 +416,7 @@ pub fn process_locations_from_page<F: FnMut(BlockLocation)>(
     };
     ar.read_to_alignment()?;
 
-    let want = std::cmp::min(header.remaining_data_len as usize, WAL_PAGE_SIZE as usize);
+    let want = core::cmp::min(header.remaining_data_len as usize, WAL_PAGE_SIZE as usize);
     let take_n = want.min(ar.buf.len());
     let remaining_data = ar.take(take_n, "pageRemainingData")?;
     let page_magic = header.magic;
@@ -426,7 +433,7 @@ pub fn process_locations_from_page<F: FnMut(BlockLocation)>(
     // tail-without-head bytes get drained, matching the existing
     // parse_records_from_page semantics
     let had_beginning = parser.has_current_record_beginning;
-    let mut stitched = std::mem::take(&mut parser.current_record_data);
+    let mut stitched = core::mem::take(&mut parser.current_record_data);
     stitched.extend_from_slice(remaining_data);
     parser.has_current_record_beginning = false;
 
@@ -493,17 +500,20 @@ fn walk_locations_xlog_page_inner<F: FnMut(BlockLocation)>(
 fn parse_to_extract(e: ParsePageError) -> ExtractError {
     match e {
         ParsePageError::Parse(p) => ExtractError::Parse(p),
+        #[cfg(feature = "std")]
         ParsePageError::Io(i) => ExtractError::Io(i),
         ParsePageError::CantSavePartialParser => ExtractError::Parse(ParseError::PartialPage),
     }
 }
 
+#[cfg(feature = "std")]
 enum ReadStatus {
     Eof,
     Short(usize),
     Full,
 }
 
+#[cfg(feature = "std")]
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadStatus> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -524,6 +534,7 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadStatu
 
 /// Write locations as 16-byte LE u32×4 tuples, no terminator. Lets a sidecar
 /// be built by appending segment fragments before the terminator is written
+#[cfg(feature = "std")]
 pub fn write_location_tuples<W: Write>(mut w: W, locations: &[BlockLocation]) -> io::Result<()> {
     for loc in locations {
         w.write_all(&loc.to_le_bytes())?;
@@ -533,6 +544,7 @@ pub fn write_location_tuples<W: Write>(mut w: W, locations: &[BlockLocation]) ->
 
 /// Write a list of locations as 16-byte LE u32×4 tuples + an all-zero
 /// terminator. Format consumed by wal-g's `ReadLocationsFrom`
+#[cfg(feature = "std")]
 pub fn write_locations_to<W: Write>(mut w: W, locations: &[BlockLocation]) -> io::Result<()> {
     write_location_tuples(&mut w, locations)?;
     w.write_all(&[0u8; 16])?;
@@ -541,6 +553,7 @@ pub fn write_locations_to<W: Write>(mut w: W, locations: &[BlockLocation]) -> io
 
 /// Read locations until the terminal (all-zero) tuple. EOF before terminal
 /// is tolerated (returns what we got) — matches wal-g behavior
+#[cfg(feature = "std")]
 pub fn read_locations_from<R: Read>(mut r: R) -> Result<Vec<BlockLocation>, ReadLocationsError> {
     let mut out = Vec::new();
     let mut buf = [0u8; 16];
@@ -563,6 +576,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "std")]
     fn locations_round_trip() {
         let locs = vec![
             BlockLocation::new(1663, 16384, 16385, 7),
@@ -577,6 +591,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn parser_save_load_empty() {
         let p = WalParser::new();
         let mut buf = Vec::new();
@@ -587,6 +602,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn parser_save_with_data_round_trips() {
         let mut p = WalParser::new();
         p.set_current_record_data(vec![1, 2, 3, 4, 5]);
@@ -598,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn cannot_save_tail_without_beginning() {
         let mut p = WalParser::new();
         p.current_record_data = vec![1, 2, 3];
@@ -607,6 +624,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn terminator_at_eof_treated_as_terminator() {
         let buf = [0u8; 16];
         let parsed = read_locations_from(buf.as_slice()).unwrap();
@@ -614,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn empty_wal_file_yields_no_locations() {
         let mut p = WalParser::new();
         let v = extract_locations_from_wal_file(&mut p, std::io::Cursor::new(Vec::new())).unwrap();
@@ -621,6 +640,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn all_zero_wal_file_yields_no_locations() {
         // Common end-of-segment shape for .partial files
         let buf = vec![0u8; (WAL_PAGE_SIZE as usize) * 4];
@@ -635,10 +655,8 @@ mod tests {
     /// reuse, and surfaces both block locations via extract_block_locations
     #[test]
     fn synthetic_page_with_two_blocks_and_same_rel() {
-        use crate::pg::walparser::parse::extract_block_locations;
-        use crate::pg::walparser::types::{
-            BKP_BLOCK_SAME_REL, RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER,
-        };
+        use crate::parse::extract_block_locations;
+        use crate::types::{BKP_BLOCK_SAME_REL, RmId, X_LOG_RECORD_HEADER_SIZE, XLP_LONG_HEADER};
 
         // Record body: two block-0 / block-1 headers (no data, no image) and
         // a 0-byte short main-data marker. Block 0 uses explicit
@@ -711,7 +729,7 @@ mod tests {
         assert_eq!(locs2, locs);
     }
 
-    use super::super::types::{
+    use crate::types::{
         XLP_FIRST_IS_CONT_RECORD, XLP_LONG_HEADER, XLP_PAGE_MAGIC_PG14, XLR_BLOCK_ID_DATA_LONG,
     };
 
@@ -756,7 +774,7 @@ mod tests {
         r.extend_from_slice(&0u32.to_le_bytes()); // crc
         r
     }
-    use super::super::types::X_LOG_RECORD_HEADER_SIZE;
+    use crate::types::X_LOG_RECORD_HEADER_SIZE;
 
     #[test]
     fn record_continuation_across_page_boundary() {
@@ -837,8 +855,9 @@ mod tests {
     /// walk and the per-segment walk + boundary stitch must surface the same
     /// block location, neither segment seeing it alone
     #[test]
+    #[cfg(feature = "std")]
     fn segment_boundary_record_stitches_like_serial_walk() {
-        use crate::pg::walparser::parse::extract_block_locations;
+        use crate::parse::extract_block_locations;
         let total = 9049;
         let record = block_record(total);
         let split = 8152; // record bytes that fit on segment A after header+align
@@ -958,6 +977,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn parse_to_extract_maps_each_variant() {
         assert!(matches!(
             parse_to_extract(ParsePageError::Parse(ParseError::PartialPage)),

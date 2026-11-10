@@ -38,6 +38,7 @@ use anyhow::{Result, bail};
 
 use crate::compression::AsyncReader;
 
+#[cfg(feature = "libsodium")]
 pub mod libsodium;
 
 pub trait Crypter: Send + Sync + std::fmt::Debug {
@@ -53,7 +54,20 @@ pub type DynCrypter = Arc<dyn Crypter>;
 /// Build a crypter from config. Returns Ok(None) when no crypto vars are set
 pub fn resolve(vars: &crate::config::Vars) -> Result<Option<DynCrypter>> {
     forbid_pgp(vars)?;
-    libsodium::resolve(vars)
+    #[cfg(feature = "libsodium")]
+    {
+        libsodium::resolve(vars)
+    }
+    #[cfg(not(feature = "libsodium"))]
+    {
+        // A configured key with no way to honor it must not degrade to
+        // plaintext writes
+        if vars.get("WALG_LIBSODIUM_KEY").is_some() || vars.get("WALG_LIBSODIUM_KEY_PATH").is_some()
+        {
+            bail!("WALG_LIBSODIUM_KEY requires walrus built with the `libsodium` feature");
+        }
+        Ok(None)
+    }
 }
 
 /// Hard-error if any `WALG_PGP_*` setting is present. Silently writing plaintext

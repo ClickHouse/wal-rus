@@ -8,6 +8,8 @@
 //! are 8-byte aligned (`X_LOG_RECORD_ALIGNMENT`); the `AlignedReader`
 //! helper hides that padding from the record-walking code
 
+use alloc::vec::Vec;
+
 use thiserror::Error;
 
 use super::all_zero;
@@ -344,8 +346,8 @@ fn read_block_header_part<'a>(
                     read_block_header(&mut last_rel, id, &mut max_block_id, &mut c, page_magic)?;
                 record.blocks.push(XLogRecordBlock {
                     header: h,
-                    image: std::borrow::Cow::Borrowed(&[]),
-                    data: std::borrow::Cow::Borrowed(&[]),
+                    image: alloc::borrow::Cow::Borrowed(&[]),
+                    data: alloc::borrow::Cow::Borrowed(&[]),
                 });
             }
         }
@@ -362,12 +364,12 @@ fn read_block_data_and_images<'a>(
         if b.header.has_image() {
             let n = b.header.image_header.image_length as usize;
             let head = take(buf, n, "blockImage")?;
-            b.image = std::borrow::Cow::Borrowed(head);
+            b.image = alloc::borrow::Cow::Borrowed(head);
         }
         if b.header.has_data() {
             let n = b.header.data_length as usize;
             let head = take(buf, n, "blockData")?;
-            b.data = std::borrow::Cow::Borrowed(head);
+            b.data = alloc::borrow::Cow::Borrowed(head);
         }
     }
     Ok(())
@@ -389,7 +391,7 @@ pub(crate) fn read_xlog_record_body<'a>(
     read_block_header_part(&mut record, buf, page_magic)?;
     read_block_data_and_images(&mut record, buf)?;
     let main_data = read_xlog_record_main_data(record.main_data_len, buf)?;
-    record.main_data = std::borrow::Cow::Borrowed(main_data);
+    record.main_data = alloc::borrow::Cow::Borrowed(main_data);
     Ok(record)
 }
 
@@ -569,6 +571,7 @@ pub(crate) fn try_read_xlog_record_data(
 pub enum ExtractError {
     #[error(transparent)]
     Parse(#[from] ParseError),
+    #[cfg(feature = "std")]
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -591,7 +594,7 @@ pub fn extract_block_locations(records: &[XLogRecord<'_>]) -> Vec<BlockLocation>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pg::walparser::types::{RmId, X_LOG_SWITCH};
+    use crate::types::{RmId, X_LOG_SWITCH};
 
     pub(crate) fn encode_record_header(h: &XLogRecordHeader) -> Vec<u8> {
         let mut v = Vec::with_capacity(X_LOG_RECORD_HEADER_SIZE);
@@ -693,7 +696,7 @@ mod tests {
         let mut body: Vec<u8> = Vec::new();
         // block 0 header
         body.push(0); // block_id 0
-        body.push(super::super::types::BKP_BLOCK_HAS_DATA); // fork_flags: HAS_DATA only
+        body.push(crate::types::BKP_BLOCK_HAS_DATA); // fork_flags: HAS_DATA only
         body.extend_from_slice(&(block_data.len() as u16).to_le_bytes());
         // rel file node (12) + block no (4)
         body.extend_from_slice(&100u32.to_le_bytes()); // spc
@@ -718,7 +721,7 @@ mod tests {
         });
         bytes.extend_from_slice(&body);
 
-        let r = parse_record_from_bytes(&bytes, super::super::types::XLP_PAGE_MAGIC_PG14).unwrap();
+        let r = parse_record_from_bytes(&bytes, crate::types::XLP_PAGE_MAGIC_PG14).unwrap();
         assert_eq!(r.blocks.len(), 1);
         let b = &r.blocks[0];
         assert_eq!(b.header.location.rel.spc_node, 100);
@@ -738,7 +741,7 @@ mod tests {
     /// with PG-14 magic the same bytes must fail
     #[test]
     fn fpi_apply_bit_parses_on_pg15_rejects_on_pg14() {
-        use crate::pg::walparser::types::{
+        use crate::types::{
             _BKP_IMAGE_APPLY_PG15, BKP_BLOCK_HAS_IMAGE, BLOCK_SIZE, RmId, X_LOG_RECORD_HEADER_SIZE,
             XLP_PAGE_MAGIC_PG14, XLP_PAGE_MAGIC_PG15,
         };
@@ -799,7 +802,7 @@ mod tests {
     /// and `image_length != BLOCK_SIZE && !has_hole` is inconsistent)
     #[test]
     fn fpi_pg14_compressed_bit_parses_on_pg14_rejects_on_pg15() {
-        use crate::pg::walparser::types::{
+        use crate::types::{
             BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_IS_COMPRESSED_PG14, RmId, X_LOG_RECORD_HEADER_SIZE,
             XLP_PAGE_MAGIC_PG14, XLP_PAGE_MAGIC_PG15,
         };
@@ -854,7 +857,7 @@ mod tests {
     /// full-BLOCK image, mismatching the 2048-byte payload
     #[test]
     fn fpi_pg15_pglz_parses_on_pg15() {
-        use crate::pg::walparser::types::{
+        use crate::types::{
             BKP_BLOCK_HAS_IMAGE, BKP_IMAGE_COMPRESS_PGLZ, RmId, X_LOG_RECORD_HEADER_SIZE,
             XLP_PAGE_MAGIC_PG15,
         };

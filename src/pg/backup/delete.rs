@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use serde::Serialize;
 
-use crate::pg::backup::fetch::fetch_sentinel;
+use crate::pg::backup::fetch_sentinel;
 use crate::pg::backup::{LATEST, name_from_sentinel_key, strip_leftmost_backup_name};
 use crate::pg::wal::segment::{SegmentName, wal_segment_size};
 use crate::storage::DynStorage;

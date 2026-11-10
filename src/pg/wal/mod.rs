@@ -1,6 +1,7 @@
 pub mod fetch;
 pub mod prefetch;
 pub mod push;
+#[cfg(feature = "replication")]
 pub mod receive;
 pub mod restore;
 pub mod segment;

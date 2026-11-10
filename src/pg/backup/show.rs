@@ -7,9 +7,8 @@ use futures::StreamExt;
 
 use crate::compression::AsyncReader;
 use crate::pg::backup::{
-    BackupSentinelDtoV2, FilesMetadataDto,
-    fetch::{fetch_sentinel, resolve_name},
-    files_metadata_key, format_pg_lsn, load_json, name_from_sentinel_key, sentinel_key,
+    BackupSentinelDtoV2, FilesMetadataDto, fetch_sentinel, files_metadata_key, format_pg_lsn,
+    load_json, name_from_sentinel_key, resolve_name, sentinel_key,
 };
 use crate::storage::DynStorage;
 

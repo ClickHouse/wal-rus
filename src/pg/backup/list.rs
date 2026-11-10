@@ -6,7 +6,7 @@ use std::num::NonZeroU64;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 
-use crate::pg::backup::fetch::fetch_sentinel;
+use crate::pg::backup::fetch_sentinel;
 use crate::pg::backup::name_from_sentinel_key;
 use crate::storage::DynStorage;
 use crate::time::Timestamp;

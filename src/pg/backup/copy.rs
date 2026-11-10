@@ -16,7 +16,7 @@ use futures::StreamExt;
 use crate::concurrency::BoundedTasks;
 use crate::config::Settings;
 use crate::pg::backup::delete::{BackupRecord, collect_records};
-use crate::pg::backup::fetch::resolve_name;
+use crate::pg::backup::resolve_name;
 use crate::storage::DynStorage;
 
 #[derive(Debug, Clone)]

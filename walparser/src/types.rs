@@ -8,6 +8,8 @@
 //! All multi-byte fields little-endian (postgres native on every supported
 //! arch). 8-byte alignment between records is handled by `parse::AlignedReader`
 
+use alloc::vec::Vec;
+
 pub type Oid = u32;
 pub type TimeLineId = u32;
 pub type XLogRecordPtr = u64;
@@ -204,7 +206,7 @@ pub struct XLogRecord<'a> {
     /// otherwise. Surfaces SAVEPOINT-style lineage to logical decoders.
     pub toplevel_xid: u32,
     pub blocks: Vec<XLogRecordBlock<'a>>,
-    pub main_data: std::borrow::Cow<'a, [u8]>,
+    pub main_data: alloc::borrow::Cow<'a, [u8]>,
 }
 
 impl<'a> Default for XLogRecord<'a> {
@@ -215,7 +217,7 @@ impl<'a> Default for XLogRecord<'a> {
             origin: 0,
             toplevel_xid: 0,
             blocks: Vec::new(),
-            main_data: std::borrow::Cow::Borrowed(&[]),
+            main_data: alloc::borrow::Cow::Borrowed(&[]),
         }
     }
 }
@@ -246,7 +248,7 @@ impl<'a> XLogRecord<'a> {
             origin: self.origin,
             toplevel_xid: self.toplevel_xid,
             blocks: self.blocks.into_iter().map(|b| b.into_owned()).collect(),
-            main_data: std::borrow::Cow::Owned(self.main_data.into_owned()),
+            main_data: alloc::borrow::Cow::Owned(self.main_data.into_owned()),
         }
     }
 }
@@ -255,16 +257,16 @@ impl<'a> XLogRecord<'a> {
 #[derive(Debug, Clone)]
 pub struct XLogRecordBlock<'a> {
     pub header: XLogRecordBlockHeader,
-    pub image: std::borrow::Cow<'a, [u8]>,
-    pub data: std::borrow::Cow<'a, [u8]>,
+    pub image: alloc::borrow::Cow<'a, [u8]>,
+    pub data: alloc::borrow::Cow<'a, [u8]>,
 }
 
 impl<'a> Default for XLogRecordBlock<'a> {
     fn default() -> Self {
         Self {
             header: XLogRecordBlockHeader::default(),
-            image: std::borrow::Cow::Borrowed(&[]),
-            data: std::borrow::Cow::Borrowed(&[]),
+            image: alloc::borrow::Cow::Borrowed(&[]),
+            data: alloc::borrow::Cow::Borrowed(&[]),
         }
     }
 }
@@ -273,8 +275,8 @@ impl<'a> XLogRecordBlock<'a> {
     pub fn into_owned(self) -> XLogRecordBlock<'static> {
         XLogRecordBlock {
             header: self.header,
-            image: std::borrow::Cow::Owned(self.image.into_owned()),
-            data: std::borrow::Cow::Owned(self.data.into_owned()),
+            image: alloc::borrow::Cow::Owned(self.image.into_owned()),
+            data: alloc::borrow::Cow::Owned(self.data.into_owned()),
         }
     }
 }

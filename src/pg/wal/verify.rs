@@ -14,7 +14,6 @@ use std::num::NonZeroU64;
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
-use crate::cli::WalVerifyOp;
 use crate::pg::backup::list as backup_list;
 use crate::pg::backup::{format_pg_lsn, parse_timeline_from_backup_name};
 use crate::pg::wal::show::{self, GapInfo};
@@ -44,11 +43,19 @@ pub enum ReportStatus {
     Empty,
 }
 
-pub async fn run(storage: DynStorage, op: WalVerifyOp) -> Result<()> {
-    let (json, integrity, timeline) = match op {
-        WalVerifyOp::Integrity { json } => (json, true, false),
-        WalVerifyOp::Timeline { json } => (json, false, true),
-        WalVerifyOp::All { json } => (json, true, true),
+/// Which `wal-verify` checks to run
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    Integrity,
+    Timeline,
+    All,
+}
+
+pub async fn run(storage: DynStorage, check: Check, json: bool) -> Result<()> {
+    let (integrity, timeline) = match check {
+        Check::Integrity => (true, false),
+        Check::Timeline => (false, true),
+        Check::All => (true, true),
     };
     let i = if integrity {
         Some(check_integrity(storage.clone()).await?)
@@ -232,10 +239,7 @@ mod tests {
         assert!(!r.gaps.is_empty());
 
         // run() surfaces FAILURE as a non-zero (Err) exit
-        let err = run(s, WalVerifyOp::Integrity { json: false })
-            .await
-            .err()
-            .unwrap();
+        let err = run(s, Check::Integrity, false).await.err().unwrap();
         assert!(err.to_string().contains("FAILURE"), "{err}");
     }
 
@@ -298,10 +302,8 @@ mod tests {
         put_wal_segment(&s, "000000010000000000000002").await;
         put_wal_segment(&s, "000000010000000000000003").await;
         // plain branch (print_integrity + print_timeline)
-        run(s.clone(), WalVerifyOp::All { json: false })
-            .await
-            .unwrap();
+        run(s.clone(), Check::All, false).await.unwrap();
         // json branch
-        run(s, WalVerifyOp::All { json: true }).await.unwrap();
+        run(s, Check::All, true).await.unwrap();
     }
 }

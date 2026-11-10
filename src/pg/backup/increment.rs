@@ -35,7 +35,7 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::delta::PG_PAGE_SIZE;
+pub const PG_PAGE_SIZE: u64 = 8192;
 
 /// wal-g `wi1` magic bytes — `'w'`, `'i'`, version `'1'`, `0x55`
 pub const INCREMENT_MAGIC: [u8; 4] = [b'w', b'i', b'1', 0x55];

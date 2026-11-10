@@ -6,21 +6,29 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use anyhow::{Context, Result, anyhow};
+use futures::StreamExt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::pg::parse_hex;
+use crate::storage::DynStorage;
 use crate::time::Timestamp;
 
 pub mod copy;
 pub mod delete;
+#[cfg(feature = "backup")]
 pub mod delta;
+#[cfg(feature = "backup")]
 pub mod fetch;
+#[cfg(feature = "backup")]
 pub mod fs_push;
 pub mod increment;
 pub mod list;
+#[cfg(feature = "backup")]
 pub mod push;
 pub mod show;
+#[cfg(feature = "backup")]
 pub mod tar_streamer;
+#[cfg(feature = "backup")]
 pub mod tarball;
 pub mod wal_delta;
 
@@ -182,6 +190,37 @@ pub(crate) async fn load_json<T: serde::de::DeserializeOwned>(
     let mut buf = Vec::with_capacity(buf_hint);
     r.read_to_end(&mut buf).await?;
     serde_json::from_slice(&buf).with_context(|| format!("parse {key}"))
+}
+
+/// Resolve `LATEST` to the newest backup by sentinel mtime; other names pass
+/// through unchanged
+pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
+    if name != LATEST {
+        return Ok(name.to_string());
+    }
+    let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
+    let mut stream = storage.list(&prefix).await?;
+    let mut latest: Option<(crate::time::Timestamp, String)> = None;
+    while let Some(item) = stream.next().await {
+        let obj = item?;
+        let Some(n) = name_from_sentinel_key(&obj.key) else {
+            continue;
+        };
+        let mtime = obj
+            .last_modified
+            .unwrap_or_else(crate::time::Timestamp::now);
+        match &latest {
+            Some((t, _)) if *t >= mtime => {}
+            _ => latest = Some((mtime, n.to_string())),
+        }
+    }
+    latest
+        .map(|(_, n)| n)
+        .ok_or_else(|| anyhow!("no backups found"))
+}
+
+pub async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
+    load_json(storage, &sentinel_key(name), 4096).await
 }
 
 /// Tablespace map mirrored from wal-g `TablespaceSpec`. JSON shape:

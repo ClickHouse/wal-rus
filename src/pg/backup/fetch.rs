@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio::io::AsyncBufReadExt;
@@ -22,11 +22,13 @@ use crate::config::Settings;
 use crate::pg::backup::increment::apply_increment_in_place;
 use crate::pg::backup::tarball::{Body, Entry, Kind, Reader};
 use crate::pg::backup::{
-    BackupSentinelDtoV2, FilesMetadataDto, LATEST, TablespaceSpec, files_metadata_key,
-    name_from_sentinel_key, sentinel_key, tar_partitions_prefix,
+    BackupSentinelDtoV2, FilesMetadataDto, TablespaceSpec, files_metadata_key,
+    tar_partitions_prefix,
 };
 use crate::pg::replication::base_backup::ChannelReader;
 use crate::storage::DynStorage;
+
+pub use crate::pg::backup::{fetch_sentinel, resolve_name};
 
 #[derive(Debug, Clone, Default)]
 pub struct FetchArgs {
@@ -229,35 +231,6 @@ fn strip_to_relative(p: &Path) -> PathBuf {
         }
     }
     rel
-}
-
-pub async fn resolve_name(storage: &DynStorage, name: &str) -> Result<String> {
-    if name != LATEST {
-        return Ok(name.to_string());
-    }
-    let prefix = format!("{}/", crate::pg::BASEBACKUP_FOLDER);
-    let mut stream = storage.list(&prefix).await?;
-    let mut latest: Option<(crate::time::Timestamp, String)> = None;
-    while let Some(item) = stream.next().await {
-        let obj = item?;
-        let Some(n) = name_from_sentinel_key(&obj.key) else {
-            continue;
-        };
-        let mtime = obj
-            .last_modified
-            .unwrap_or_else(crate::time::Timestamp::now);
-        match &latest {
-            Some((t, _)) if *t >= mtime => {}
-            _ => latest = Some((mtime, n.to_string())),
-        }
-    }
-    latest
-        .map(|(_, n)| n)
-        .ok_or_else(|| anyhow!("no backups found"))
-}
-
-pub async fn fetch_sentinel(storage: &DynStorage, name: &str) -> Result<BackupSentinelDtoV2> {
-    crate::pg::backup::load_json(storage, &sentinel_key(name), 4096).await
 }
 
 async fn restore_tablespace_symlinks(
