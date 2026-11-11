@@ -11,8 +11,6 @@ use crate::crypto::{self, DynCrypter};
 use crate::retry::RetryPolicy;
 #[cfg(feature = "gcs")]
 use crate::storage::gcs;
-#[cfg(any(feature = "s3", feature = "gcs"))]
-use crate::storage::retrying::RetryingStorage;
 #[cfg(feature = "s3")]
 use crate::storage::s3;
 use crate::storage::{DynStorage, Storage, fs::FsStorage};
@@ -245,13 +243,13 @@ impl Settings {
             StorageSettings::S3(c) => {
                 let s = s3::S3Storage::with_retry_policy(c.clone(), policy)
                     .context("init s3 storage")?;
-                Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
+                Ok(Arc::new(s) as Arc<dyn Storage>)
             }
             #[cfg(feature = "gcs")]
             StorageSettings::Gcs(c) => {
-                let cfg = c.clone();
-                let s = gcs::GcsStorage::new(cfg).context("init gcs storage")?;
-                Ok(Arc::new(RetryingStorage::new(s, policy)) as Arc<dyn Storage>)
+                let s = gcs::GcsStorage::with_retry_policy(c.clone(), policy)
+                    .context("init gcs storage")?;
+                Ok(Arc::new(s) as Arc<dyn Storage>)
             }
         }
     }

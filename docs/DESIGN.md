@@ -67,17 +67,18 @@ Profile/shared-credentials files and STS web-identity
 
 Service-account JWT (RS256 via aws-lc-rs) exchanged for an OAuth bearer,
 cached until 60 s before expiry. Without a key file, the token comes from the
-GCE/GKE metadata server instead (same cache). Uploads stream via
-`uploadType=media`. Resumable uploads not implemented.
+GCE/GKE metadata server instead (same cache). Treat 429 and 5xx responses from
+either token endpoint as temporary failures. Uploads use `uploadType=media`.
+Buffer bodies up to 32 MiB so failed uploads can be retried. Stream larger
+bodies in one attempt. Resumable uploads are not implemented.
 
 ### Retry classification
 
-`is_transient()` classifies `StorageError::Http { status, body }` +
-`Transport`. Reads retry unconditionally on transient. `RetryingStorage`
-retries small bounded-size `put`s (sentinels, manifests, history files)
-by buffering the body once; larger or unknown-size streams pass through
-to S3's own in-place retry, which replays its per-PUT / per-part buffer.
-`fs` skips the wrapper.
+`is_transient()` identifies errors that may succeed on retry. S3 and GCS each
+use one `RetryPolicy` to retry reads, individual list pages, deletes and copies
+after temporary failures. Uploads can be retried when bodies are buffered:
+S3 buffers single PUTs and multipart parts; GCS buffers bodies up to 32 MiB.
+`fs` doesn't retry.
 
 ## Compression
 
