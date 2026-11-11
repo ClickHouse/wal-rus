@@ -2,7 +2,9 @@
 //!
 //! Auth: service-account JSON file pointed to by GOOGLE_APPLICATION_CREDENTIALS
 //! when set, else the GCE/GKE metadata server (the VM's attached service
-//! account). Streaming uploads via chunked transfer encoding (uploadType=media)
+//! account). Uploads use uploadType=media. Buffer bodies up to
+//! BUFFERED_UPLOAD_LIMIT so failed uploads can be retried. Stream larger
+//! bodies via chunked transfer encoding in one attempt
 //!
 //! Env: GOOGLE_APPLICATION_CREDENTIALS, WALG_GS_PREFIX (parsed by config layer)
 
@@ -16,7 +18,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::{Body, Client};
+use reqwest::{Body, Client, Method, RequestBuilder, Response, StatusCode};
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::{self, PemObject};
 use serde::Deserialize;
@@ -25,16 +27,19 @@ use tokio_util::io::ReaderStream;
 
 use super::{
     AsyncReader, CopySource, ObjectMeta, ObjectStream, PutIfAbsentOutcome, Result, Storage,
-    StorageError,
+    StorageError, UploadBody, is_transient_status,
 };
+use crate::retry::{RetryPolicy, with_retry};
 
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const STORAGE_HOST: &str = "https://storage.googleapis.com";
 const SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const METADATA_HOST: &str = "http://metadata.google.internal";
 const METADATA_TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
+/// Match S3's single PUT limit
+const BUFFERED_UPLOAD_LIMIT: u64 = 32 * 1024 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ServiceAccount {
     client_email: String,
     private_key: String,
@@ -57,6 +62,7 @@ pub struct GcsConfig {
     pub endpoint: Option<String>,
 }
 
+#[derive(Clone)]
 enum TokenSource {
     /// fake-gcs-server (emulator): no auth at all
     None,
@@ -66,16 +72,22 @@ enum TokenSource {
     Imds { endpoint: String, client: Client },
 }
 
+#[derive(Clone)]
 pub struct GcsStorage {
     cfg: GcsConfig,
     client: Client,
     host: String,
     token_source: TokenSource,
     token: Arc<Mutex<Option<CachedToken>>>,
+    retry_policy: RetryPolicy,
 }
 
 impl GcsStorage {
     pub fn new(cfg: GcsConfig) -> Result<Self> {
+        Self::with_retry_policy(cfg, RetryPolicy::default())
+    }
+
+    pub fn with_retry_policy(cfg: GcsConfig, retry_policy: RetryPolicy) -> Result<Self> {
         let client = Client::builder()
             .connect_timeout(crate::storage::CONNECT_TIMEOUT)
             .read_timeout(crate::storage::READ_TIMEOUT)
@@ -97,6 +109,7 @@ impl GcsStorage {
                 host,
                 token_source: TokenSource::None,
                 token: Arc::new(Mutex::new(None)),
+                retry_policy,
             });
         }
 
@@ -118,6 +131,7 @@ impl GcsStorage {
             host: STORAGE_HOST.to_string(),
             token_source,
             token: Arc::new(Mutex::new(None)),
+            retry_policy,
         })
     }
 
@@ -148,8 +162,11 @@ impl GcsStorage {
         };
         let resp = req.send().await?;
 
-        if !resp.status().is_success() {
-            let st = resp.status();
+        let st = resp.status();
+        if is_transient_status(st.as_u16()) {
+            return Err(http_error(resp, "token endpoint").await);
+        }
+        if !st.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(StorageError::Auth(format!("token endpoint {st}: {body}")));
         }
@@ -207,6 +224,99 @@ impl GcsStorage {
         ]))
     }
 
+    /// Fetch token on each attempt so token endpoint failures can be retried too
+    async fn request(&self, method: Method, url: &str) -> Result<RequestBuilder> {
+        let token = self.access_token().await?;
+        Ok(self.client.request(method, url).bearer_auth(token))
+    }
+
+    fn upload_url(&self, key: &str, precondition: &str) -> String {
+        format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media{precondition}&name={}",
+            self.host,
+            self.cfg.bucket,
+            utf8_percent_encode(&self.full_key(key), NON_ALPHANUMERIC),
+        )
+    }
+
+    /// Retry temporary failures for buffered bodies; return other responses as is
+    async fn upload(&self, url: &str, body: UploadBody) -> Result<Response> {
+        let send = |body: Body| async move {
+            let resp = self
+                .request(Method::POST, url)
+                .await?
+                .header("content-type", "application/octet-stream")
+                .body(body)
+                .send()
+                .await?;
+            if is_transient_status(resp.status().as_u16()) {
+                return Err(http_error(resp, "gcs upload").await);
+            }
+            Ok(resp)
+        };
+        match body {
+            UploadBody::Buffered(bytes) => {
+                with_retry(&self.retry_policy, StorageError::is_transient, || {
+                    send(Body::from(bytes.clone()))
+                })
+                .await
+            }
+            UploadBody::Stream(r) => send(Body::wrap_stream(ReaderStream::new(r))).await,
+        }
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        page: &str,
+    ) -> Result<(Vec<ObjectMeta>, Option<String>)> {
+        #[derive(Deserialize)]
+        struct ListResp {
+            items: Option<Vec<Item>>,
+            #[serde(rename = "nextPageToken")]
+            next_page_token: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Item {
+            name: String,
+            #[serde(default)]
+            size: Option<String>,
+            #[serde(default)]
+            updated: Option<String>,
+        }
+        let mut url = format!(
+            "{}/storage/v1/b/{}/o?prefix={}",
+            self.host,
+            self.cfg.bucket,
+            utf8_percent_encode(prefix, NON_ALPHANUMERIC),
+        );
+        if !page.is_empty() {
+            url.push_str(&format!(
+                "&pageToken={}",
+                utf8_percent_encode(page, NON_ALPHANUMERIC)
+            ));
+        }
+        let lr: ListResp = with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self.request(Method::GET, &url).await?.send().await?;
+            Ok(check_status(resp, "gcs list").await?.json().await?)
+        })
+        .await?;
+        let strip = &self.cfg.prefix;
+        let items = lr
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|it| ObjectMeta {
+                key: match it.name.strip_prefix(strip.trim_end_matches('/')) {
+                    Some(rest) if !strip.is_empty() => rest.trim_start_matches('/').to_string(),
+                    _ => it.name,
+                },
+                size: it.size.and_then(|s| s.parse().ok()).unwrap_or(0),
+                last_modified: it.updated.and_then(|s| s.parse().ok()),
+            });
+        Ok((items.collect(), lr.next_page_token))
+    }
+
     fn object_url(&self, key: &str) -> String {
         let full = self.full_key(key);
         let enc = utf8_percent_encode(&full, NON_ALPHANUMERIC);
@@ -253,97 +363,65 @@ fn rewrite_url(
     )
 }
 
+async fn http_error(resp: Response, what: &str) -> StorageError {
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    StorageError::Http {
+        status,
+        body: format!("{what}: {body}"),
+    }
+}
+
+async fn check_status(resp: Response, what: &str) -> Result<Response> {
+    if resp.status().is_success() {
+        Ok(resp)
+    } else {
+        Err(http_error(resp, what).await)
+    }
+}
+
 #[async_trait]
 impl Storage for GcsStorage {
     fn describe(&self) -> String {
         format!("gs://{}/{}", self.cfg.bucket, self.cfg.prefix)
     }
 
-    async fn put(&self, key: &str, body: AsyncReader, _size_hint: Option<u64>) -> Result<()> {
-        let token = self.access_token().await?;
-        let full = self.full_key(key);
-        let url = format!(
-            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
-            self.host,
-            self.cfg.bucket,
-            utf8_percent_encode(&full, NON_ALPHANUMERIC),
-        );
-        let stream = ReaderStream::new(body);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header("content-type", "application/octet-stream")
-            .body(Body::wrap_stream(stream))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(StorageError::Http {
-                status: st.as_u16(),
-                body: format!("gcs put: {body}"),
-            });
-        }
-        Ok(())
+    async fn put(&self, key: &str, body: AsyncReader, size_hint: Option<u64>) -> Result<()> {
+        let body = UploadBody::read(body, size_hint, BUFFERED_UPLOAD_LIMIT).await?;
+        let resp = self.upload(&self.upload_url(key, ""), body).await?;
+        check_status(resp, "gcs put").await.map(drop)
     }
 
     async fn put_if_absent(
         &self,
         key: &str,
         body: AsyncReader,
-        _size_hint: Option<u64>,
+        size_hint: Option<u64>,
     ) -> Result<PutIfAbsentOutcome> {
-        let token = self.access_token().await?;
-        let full = self.full_key(key);
-        // ifGenerationMatch=0 makes the upload a create-if-absent: it succeeds
-        // only when no live object exists, and returns 412 otherwise.
-        let url = format!(
-            "{}/upload/storage/v1/b/{}/o?uploadType=media&ifGenerationMatch=0&name={}",
-            self.host,
-            self.cfg.bucket,
-            utf8_percent_encode(&full, NON_ALPHANUMERIC),
-        );
-        let stream = ReaderStream::new(body);
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token)
-            .header("content-type", "application/octet-stream")
-            .body(Body::wrap_stream(stream))
-            .send()
-            .await?;
-        let st = resp.status();
-        if st.is_success() {
-            Ok(PutIfAbsentOutcome::Created)
-        } else if st == reqwest::StatusCode::PRECONDITION_FAILED
-            || st == reqwest::StatusCode::CONFLICT
-        {
-            Ok(PutIfAbsentOutcome::AlreadyExists)
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(StorageError::Http {
-                status: st.as_u16(),
-                body: format!("gcs put_if_absent: {body}"),
-            })
+        // ifGenerationMatch=0 returns 412 when an object already exists, including
+        // when an earlier attempt wrote it but lost its response
+        let body = UploadBody::read(body, size_hint, BUFFERED_UPLOAD_LIMIT).await?;
+        let url = self.upload_url(key, "&ifGenerationMatch=0");
+        let resp = self.upload(&url, body).await?;
+        match resp.status() {
+            st if st.is_success() => Ok(PutIfAbsentOutcome::Created),
+            StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
+                Ok(PutIfAbsentOutcome::AlreadyExists)
+            }
+            _ => Err(http_error(resp, "gcs put_if_absent").await),
         }
     }
 
     async fn get(&self, key: &str) -> Result<AsyncReader> {
-        let token = self.access_token().await?;
         let url = format!("{}?alt=media", self.object_url(key));
-        let resp = self.client.get(&url).bearer_auth(token).send().await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(StorageError::NotFound(key.to_string()));
-        }
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(StorageError::Http {
-                status: st.as_u16(),
-                body: format!("gcs get: {body}"),
-            });
-        }
+        let resp = with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self.request(Method::GET, &url).await?.send().await?;
+            if resp.status() == StatusCode::NOT_FOUND {
+                return Err(StorageError::NotFound(key.to_string()));
+            }
+            check_status(resp, "gcs get").await
+        })
+        .await?;
         let stream = resp
             .bytes_stream()
             .map_err(|e| std::io::Error::other(e.to_string()));
@@ -351,116 +429,25 @@ impl Storage for GcsStorage {
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
-        let token = self.access_token().await?;
-        let resp = self
-            .client
-            .get(self.object_url(key))
-            .bearer_auth(token)
-            .send()
-            .await?;
-        Ok(resp.status().is_success())
+        let url = self.object_url(key);
+        with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self.request(Method::GET, &url).await?.send().await?;
+            if resp.status() == StatusCode::NOT_FOUND {
+                return Ok(false);
+            }
+            check_status(resp, "gcs exists").await.map(|_| true)
+        })
+        .await
     }
 
     async fn list(&self, prefix: &str) -> Result<ObjectStream> {
-        let full = self.full_key(prefix);
-        let cfg_prefix = self.cfg.prefix.clone();
-        let bucket = self.cfg.bucket.clone();
-        let client = self.client.clone();
-        let host = self.host.clone();
-        let token = self.access_token().await?;
-
         let s = stream::unfold(
-            (
-                Some(String::new()),
-                full,
-                cfg_prefix,
-                bucket,
-                client,
-                host,
-                token,
-            ),
-            |(token_page, prefix, strip, bucket, client, host, auth)| async move {
-                let token_page = token_page?;
-                let mut url = format!(
-                    "{}/storage/v1/b/{}/o?prefix={}",
-                    host,
-                    bucket,
-                    utf8_percent_encode(&prefix, NON_ALPHANUMERIC),
-                );
-                if !token_page.is_empty() {
-                    url.push_str(&format!(
-                        "&pageToken={}",
-                        utf8_percent_encode(&token_page, NON_ALPHANUMERIC)
-                    ));
+            (Some(String::new()), self.clone(), self.full_key(prefix)),
+            |(page, gcs, prefix)| async move {
+                match gcs.list_page(&prefix, &page?).await {
+                    Ok((items, next)) => Some((Ok(items), (next, gcs, prefix))),
+                    Err(e) => Some((Err(e), (None, gcs, prefix))),
                 }
-                let resp = match client.get(&url).bearer_auth(&auth).send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return Some((
-                            Err(e.into()),
-                            (None, prefix, strip, bucket, client, host, auth),
-                        ));
-                    }
-                };
-                if !resp.status().is_success() {
-                    let st = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Some((
-                        Err(StorageError::Http {
-                            status: st.as_u16(),
-                            body: format!("gcs list: {body}"),
-                        }),
-                        (None, prefix, strip, bucket, client, host, auth),
-                    ));
-                }
-                #[derive(Deserialize)]
-                struct ListResp {
-                    items: Option<Vec<Item>>,
-                    #[serde(rename = "nextPageToken")]
-                    next_page_token: Option<String>,
-                }
-                #[derive(Deserialize)]
-                struct Item {
-                    name: String,
-                    #[serde(default)]
-                    size: Option<String>,
-                    #[serde(default)]
-                    updated: Option<String>,
-                }
-                let lr: ListResp = match resp.json().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Some((
-                            Err(e.into()),
-                            (None, prefix, strip, bucket, client, host, auth),
-                        ));
-                    }
-                };
-                let items = lr.items.unwrap_or_default();
-                let mut out = Vec::with_capacity(items.len());
-                for it in items {
-                    let key = if !strip.is_empty() {
-                        it.name
-                            .strip_prefix(strip.trim_end_matches('/'))
-                            .map(|s| s.trim_start_matches('/').to_string())
-                            .unwrap_or(it.name)
-                    } else {
-                        it.name
-                    };
-                    let size = it
-                        .size
-                        .as_deref()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    let last_modified = it.updated.as_deref().and_then(|s| s.parse().ok());
-                    out.push(ObjectMeta {
-                        key,
-                        size,
-                        last_modified,
-                    });
-                }
-                let next = lr.next_page_token;
-                Some((Ok(out), (next, prefix, strip, bucket, client, host, auth)))
             },
         )
         .flat_map(|res| match res {
@@ -472,23 +459,15 @@ impl Storage for GcsStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let token = self.access_token().await?;
-        let resp = self
-            .client
-            .delete(self.object_url(key))
-            .bearer_auth(token)
-            .send()
-            .await?;
-        let st = resp.status();
-        if st.is_success() || st == reqwest::StatusCode::NOT_FOUND {
-            Ok(())
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(StorageError::Http {
-                status: st.as_u16(),
-                body: format!("gcs delete: {body}"),
-            })
-        }
+        let url = self.object_url(key);
+        with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self.request(Method::DELETE, &url).await?.send().await?;
+            if resp.status() == StatusCode::NOT_FOUND {
+                return Ok(());
+            }
+            check_status(resp, "gcs delete").await.map(drop)
+        })
+        .await
     }
 
     fn copy_source(&self, key: &str) -> Option<CopySource> {
@@ -500,10 +479,15 @@ impl Storage for GcsStorage {
     }
 
     async fn copy_within(&self, src: &CopySource, dst_key: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct RewriteResp {
+            done: bool,
+            #[serde(rename = "rewriteToken")]
+            rewrite_token: Option<String>,
+        }
         if src.backend != self.backend_id() {
             return Err(StorageError::Unimplemented("copy_within backend mismatch"));
         }
-        let token = self.access_token().await?;
         let base = rewrite_url(
             &self.host,
             &src.bucket,
@@ -511,45 +495,30 @@ impl Storage for GcsStorage {
             &self.cfg.bucket,
             &self.full_key(dst_key),
         );
-        // large objects rewrite in chunks; loop until done
-        let mut rewrite_token: Option<String> = None;
+        // GCS copies large objects in steps; retry each step with same rewriteToken
+        let mut url = base.clone();
         loop {
-            let url = match &rewrite_token {
-                Some(t) => format!(
-                    "{}?rewriteToken={}",
-                    base,
-                    utf8_percent_encode(t, NON_ALPHANUMERIC)
-                ),
-                None => base.clone(),
-            };
-            let resp = self.client.post(&url).bearer_auth(&token).send().await?;
-            if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                return Err(StorageError::NotFound(src.key.clone()));
-            }
-            if !resp.status().is_success() {
-                let st = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(StorageError::Http {
-                    status: st.as_u16(),
-                    body: format!("gcs rewrite: {body}"),
-                });
-            }
-            #[derive(Deserialize)]
-            struct RewriteResp {
-                done: bool,
-                #[serde(rename = "rewriteToken")]
-                rewrite_token: Option<String>,
-            }
-            let rr: RewriteResp = resp.json().await?;
+            let rr: RewriteResp =
+                with_retry(&self.retry_policy, StorageError::is_transient, || async {
+                    let resp = self.request(Method::POST, &url).await?.send().await?;
+                    if resp.status() == StatusCode::NOT_FOUND {
+                        return Err(StorageError::NotFound(src.key.clone()));
+                    }
+                    Ok(check_status(resp, "gcs rewrite").await?.json().await?)
+                })
+                .await?;
             if rr.done {
                 return Ok(());
             }
-            if rr.rewrite_token.is_none() {
+            let Some(t) = rr.rewrite_token else {
                 return Err(StorageError::InvalidResponse(
                     "rewrite not done, no rewriteToken".into(),
                 ));
-            }
-            rewrite_token = rr.rewrite_token;
+            };
+            url = format!(
+                "{base}?rewriteToken={}",
+                utf8_percent_encode(&t, NON_ALPHANUMERIC)
+            );
         }
     }
 }
@@ -683,6 +652,7 @@ mod tests {
             host: STORAGE_HOST.into(),
             token_source: imds_source(base).unwrap(),
             token: Arc::new(Mutex::new(None)),
+            retry_policy: RetryPolicy::default(),
         };
 
         assert_eq!(s.access_token().await.unwrap(), "vmtok");
@@ -709,6 +679,16 @@ mod tests {
             host,
             token_source: TokenSource::None,
             token: Arc::new(Mutex::new(None)),
+            retry_policy: quick_retries(),
+        }
+    }
+
+    fn quick_retries() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
         }
     }
 
@@ -878,6 +858,7 @@ mod tests {
                 token_uri: Some(format!("{token_base}/token")),
             }),
             token: Arc::new(Mutex::new(None)),
+            retry_policy: RetryPolicy::default(),
         };
 
         assert_eq!(s.access_token().await.unwrap(), "tok123");
@@ -888,5 +869,89 @@ mod tests {
             1,
             "second token request must hit the cache"
         );
+    }
+
+    #[tokio::test]
+    async fn gcs_buffered_uploads_retry_transient() {
+        use crate::storage::test_http::{Req, Resp, reader, serve};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Fail each upload once with 503, then return 412 for conditional retries
+        let puts = Arc::new(AtomicU32::new(0));
+        let conditional = Arc::new(AtomicU32::new(0));
+        let (p, c) = (puts.clone(), conditional.clone());
+        let base = serve(move |req: &Req| {
+            if req.query("ifGenerationMatch") == Some("0") {
+                match c.fetch_add(1, Ordering::SeqCst) {
+                    0 => Resp::new(503),
+                    _ => Resp::new(412),
+                }
+            } else {
+                match p.fetch_add(1, Ordering::SeqCst) {
+                    0 => Resp::new(503),
+                    _ => Resp::new(200).body(b"{}".to_vec()),
+                }
+            }
+        })
+        .await;
+
+        let s = emulator(base);
+        s.put("a", reader(b"hello"), None).await.unwrap();
+        assert_eq!(puts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            s.put_if_absent("b", reader(b"hello"), None).await.unwrap(),
+            PutIfAbsentOutcome::AlreadyExists
+        );
+        assert_eq!(conditional.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn gcs_token_endpoint_blip_is_retried() {
+        use crate::storage::test_http::{Req, Resp, read_all, serve};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let mints = Arc::new(AtomicU32::new(0));
+        let m = mints.clone();
+        let base = serve(move |req: &Req| {
+            if req.path != METADATA_TOKEN_PATH {
+                return Resp::new(200).body(b"ok".to_vec());
+            }
+            match m.fetch_add(1, Ordering::SeqCst) {
+                0 => Resp::new(503),
+                _ => Resp::new(200)
+                    .body(b"{\"access_token\":\"vmtok\",\"expires_in\":3599}".to_vec()),
+            }
+        })
+        .await;
+
+        let s = GcsStorage {
+            token_source: imds_source(base.clone()).unwrap(),
+            ..emulator(base)
+        };
+        assert_eq!(read_all(s.get("a").await.unwrap()).await, b"ok");
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn gcs_exists_errors_unless_found_or_missing() {
+        use crate::storage::test_http::{Req, Resp, serve};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let flaky = Arc::new(AtomicU32::new(0));
+        let f = flaky.clone();
+        let base = serve(move |req: &Req| match req.path.rsplit("%2F").next() {
+            Some("denied") => Resp::new(403),
+            Some("flaky") if f.fetch_add(1, Ordering::SeqCst) == 0 => Resp::new(503),
+            _ => Resp::new(404),
+        })
+        .await;
+
+        let s = emulator(base);
+        assert!(!s.exists("flaky").await.unwrap());
+        assert_eq!(flaky.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            s.exists("denied").await,
+            Err(StorageError::Http { status: 403, .. })
+        ));
     }
 }

@@ -17,7 +17,6 @@ pub mod creds;
 pub mod fs;
 #[cfg(feature = "gcs")]
 pub mod gcs;
-pub mod retrying;
 #[cfg(feature = "s3")]
 pub mod s3;
 #[cfg(all(test, any(feature = "s3", feature = "gcs")))]
@@ -85,9 +84,7 @@ impl StorageError {
     pub fn is_transient(&self) -> bool {
         match self {
             StorageError::Transport(_) => true,
-            StorageError::Http { status, .. } => {
-                matches!(status, 408 | 425 | 429 | 500..=599)
-            }
+            StorageError::Http { status, .. } => is_transient_status(*status),
             StorageError::Io(e) => {
                 use std::io::ErrorKind::*;
                 matches!(
@@ -105,6 +102,10 @@ impl StorageError {
             _ => false,
         }
     }
+}
+
+pub(crate) fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500..=599)
 }
 
 #[cfg(any(feature = "s3", feature = "gcs"))]
@@ -191,6 +192,36 @@ pub trait Storage: Send + Sync {
 }
 
 pub type DynStorage = Arc<dyn Storage>;
+
+/// Buffer small uploads so failed requests can be retried
+#[cfg(any(feature = "s3", feature = "gcs"))]
+pub(crate) enum UploadBody {
+    Buffered(Bytes),
+    Stream(AsyncReader),
+}
+
+#[cfg(any(feature = "s3", feature = "gcs"))]
+impl UploadBody {
+    /// Read one byte past `limit` to distinguish bodies at limit from larger ones
+    pub(crate) async fn read(
+        body: AsyncReader,
+        size_hint: Option<u64>,
+        limit: u64,
+    ) -> Result<Self> {
+        use tokio::io::AsyncReadExt;
+        if matches!(size_hint, Some(s) if s > limit) {
+            return Ok(Self::Stream(body));
+        }
+        let mut limited = body.take(limit + 1);
+        let mut buf = Vec::with_capacity(size_hint.unwrap_or(0) as usize);
+        limited.read_to_end(&mut buf).await?;
+        if buf.len() as u64 <= limit {
+            return Ok(Self::Buffered(buf.into()));
+        }
+        let combined = std::io::Cursor::new(buf).chain(limited.into_inner());
+        Ok(Self::Stream(Box::pin(combined)))
+    }
+}
 
 /// Join a storage `prefix` to an object `key`, collapsing the slash between
 /// them. Empty prefix returns the key unchanged. Shared by object backends so
@@ -308,6 +339,27 @@ mod tests {
         assert!(!StorageError::Auth("a".into()).is_transient());
         assert!(!StorageError::Config("c".into()).is_transient());
         assert!(!StorageError::Unimplemented("x").is_transient());
+    }
+
+    #[cfg(any(feature = "s3", feature = "gcs"))]
+    #[tokio::test]
+    async fn upload_body_buffers_within_limit_and_streams_overflow() {
+        use test_http::{read_all, reader};
+
+        let b = UploadBody::read(reader(b"abcd"), None, 4).await.unwrap();
+        assert!(matches!(b, UploadBody::Buffered(b) if b.as_ref() == b"abcd"));
+        let UploadBody::Stream(r) = UploadBody::read(reader(b"abcdef"), None, 4).await.unwrap()
+        else {
+            panic!("overflow must stream");
+        };
+        assert_eq!(read_all(r).await, b"abcdef");
+        let UploadBody::Stream(r) = UploadBody::read(reader(b"abcdef"), Some(6), 4)
+            .await
+            .unwrap()
+        else {
+            panic!("oversize hint must stream");
+        };
+        assert_eq!(read_all(r).await, b"abcdef");
     }
 
     #[cfg(any(feature = "s3", feature = "gcs"))]

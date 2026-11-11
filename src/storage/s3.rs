@@ -7,7 +7,6 @@
 //! / WALG_S3_ENDPOINT, path-style from AWS_S3_FORCE_PATH_STYLE. Without static
 //! keys, credentials come from the EC2 metadata service (see [`super::creds`])
 
-use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -28,7 +27,7 @@ use url::Url;
 pub use super::creds::{CredentialSource, Credentials, ImdsProvider};
 use super::{
     AsyncReader, CopySource, ObjectMeta, ObjectStream, PutIfAbsentOutcome, Result, Storage,
-    StorageError,
+    StorageError, UploadBody,
 };
 use crate::retry::{RetryPolicy, with_retry};
 use crate::time::Timestamp;
@@ -421,57 +420,31 @@ impl Storage for S3Storage {
         format!("s3://{}/{}", self.cfg.bucket, self.cfg.prefix)
     }
 
-    async fn put(&self, key: &str, mut body: AsyncReader, size_hint: Option<u64>) -> Result<()> {
-        match size_hint {
-            // known small: buffer & single PUT, retrying transients in place
-            Some(s) if s <= MULTIPART_THRESHOLD => {
-                let mut buf = Vec::with_capacity(s as usize);
-                body.read_to_end(&mut buf).await?;
-                self.put_single_retrying(key, Bytes::from(buf)).await
-            }
-            // known large: stream to multipart
-            Some(_) => self.put_multipart(key, body).await,
-            // unknown size (compressed/encrypted WAL, tar parts): buffer up to
-            // the multipart threshold. Bodies under it, every WAL segment since
-            // 16 MiB raw compresses smaller, go out as one PUT with a known
-            // Content-Length instead of multipart's create/upload/complete trio.
-            // Read one past the cap to tell a fitting EOF from overflow.
-            None => {
-                let limit = MULTIPART_THRESHOLD as usize;
-                let mut limited = body.take(limit as u64 + 1);
-                let mut buf = Vec::new();
-                limited.read_to_end(&mut buf).await?;
-                if buf.len() <= limit {
-                    self.put_single_retrying(key, Bytes::from(buf)).await
-                } else {
-                    // overflow: prepend buffered prefix to the unread remainder
-                    let combined = Cursor::new(buf).chain(limited.into_inner());
-                    self.put_multipart(key, Box::pin(combined)).await
-                }
-            }
+    async fn put(&self, key: &str, body: AsyncReader, size_hint: Option<u64>) -> Result<()> {
+        // Small uploads need only one PUT; multipart needs create and complete too
+        match UploadBody::read(body, size_hint, MULTIPART_THRESHOLD).await? {
+            UploadBody::Buffered(body) => self.put_single_retrying(key, body).await,
+            UploadBody::Stream(body) => self.put_multipart(key, body).await,
         }
     }
 
     async fn put_if_absent(
         &self,
         key: &str,
-        mut body: AsyncReader,
+        body: AsyncReader,
         size_hint: Option<u64>,
     ) -> Result<PutIfAbsentOutcome> {
         // A conditional PUT needs a rewindable body and bypasses the multipart
         // manager, so buffer it. WAL segments compress well under the multipart
         // threshold; a body over it is rejected rather than silently split (a
         // multipart create-if-absent write is not atomic).
-        let mut buf = Vec::with_capacity(size_hint.unwrap_or(0) as usize);
-        body.read_to_end(&mut buf).await?;
-        if buf.len() as u64 > MULTIPART_THRESHOLD {
+        let UploadBody::Buffered(body) =
+            UploadBody::read(body, size_hint, MULTIPART_THRESHOLD).await?
+        else {
             return Err(StorageError::Config(format!(
-                "put_if_absent body {} B exceeds single-PUT limit {} B",
-                buf.len(),
-                MULTIPART_THRESHOLD
+                "put_if_absent body exceeds single-PUT limit {MULTIPART_THRESHOLD} B"
             )));
-        }
-        let body = Bytes::from(buf);
+        };
         with_retry(&self.retry_policy, StorageError::is_transient, || {
             let body = body.clone();
             async move { self.put_if_absent_once(key, body).await }
@@ -480,13 +453,16 @@ impl Storage for S3Storage {
     }
 
     async fn get(&self, key: &str) -> Result<AsyncReader> {
-        let resp = self
-            .signed_request("GET", &self.full_key(key), &[], Bytes::new(), &[])
-            .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(StorageError::NotFound(key.to_string()));
-        }
-        let resp = check_status(resp).await?;
+        let resp = with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self
+                .signed_request("GET", &self.full_key(key), &[], Bytes::new(), &[])
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(StorageError::NotFound(key.to_string()));
+            }
+            check_status(resp).await
+        })
+        .await?;
         let stream = resp
             .bytes_stream()
             .map_err(|e| std::io::Error::other(e.to_string()));
@@ -494,10 +470,16 @@ impl Storage for S3Storage {
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
-        let resp = self
-            .signed_request("HEAD", &self.full_key(key), &[], Bytes::new(), &[])
-            .await?;
-        Ok(resp.status().is_success())
+        with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self
+                .signed_request("HEAD", &self.full_key(key), &[], Bytes::new(), &[])
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(false);
+            }
+            check_status(resp).await.map(|_| true)
+        })
+        .await
     }
 
     async fn list(&self, prefix: &str) -> Result<ObjectStream> {
@@ -529,19 +511,14 @@ impl Storage for S3Storage {
                         ("continuation-token", token.as_str()),
                     ];
                     let q = if token.is_empty() { &q[..2] } else { &q[..] };
-                    let resp = match s.signed_request("GET", "", q, Bytes::new(), &[]).await {
-                        Ok(r) => r,
-                        Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
-                    };
-                    let resp = match check_status(resp).await {
-                        Ok(r) => r,
-                        Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
-                    };
-                    let body = match resp.text().await {
+                    let page = with_retry(&retry_policy, StorageError::is_transient, || async {
+                        let resp = s.signed_request("GET", "", q, Bytes::new(), &[]).await?;
+                        Ok(check_status(resp).await?.text().await?)
+                    })
+                    .await;
+                    let body = match page {
                         Ok(b) => b,
-                        Err(e) => {
-                            return Some((Err(e.into()), (None, prefix, cfg, client, base)));
-                        }
+                        Err(e) => return Some((Err(e), (None, prefix, cfg, client, base))),
                     };
                     match parse_list_v2(&body, &cfg.prefix) {
                         Ok((objects, next)) => {
@@ -562,20 +539,22 @@ impl Storage for S3Storage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let resp = self
-            .signed_request("DELETE", &self.full_key(key), &[], Bytes::new(), &[])
-            .await?;
-        // 204 or 404 both ok
-        let st = resp.status();
-        if st.is_success() || st == reqwest::StatusCode::NOT_FOUND {
-            Ok(())
-        } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(StorageError::Http {
-                status: st.as_u16(),
-                body: format!("delete {key}: {body}"),
-            })
-        }
+        with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self
+                .signed_request("DELETE", &self.full_key(key), &[], Bytes::new(), &[])
+                .await?;
+            let st = resp.status();
+            if st.is_success() || st == reqwest::StatusCode::NOT_FOUND {
+                Ok(())
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                Err(StorageError::Http {
+                    status: st.as_u16(),
+                    body: format!("delete {key}: {body}"),
+                })
+            }
+        })
+        .await
     }
 
     fn copy_source(&self, key: &str) -> Option<CopySource> {
@@ -593,20 +572,24 @@ impl Storage for S3Storage {
         // CopyObject caps at 5 GiB per request; larger sources fail with 400
         // and caller falls back to stream-through
         let header = copy_source_header(&src.bucket, &src.key);
-        let resp = self
-            .signed_request(
-                "PUT",
-                &self.full_key(dst_key),
-                &[],
-                Bytes::new(),
-                &[("x-amz-copy-source", header.as_str())],
-            )
-            .await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(StorageError::NotFound(src.key.clone()));
-        }
-        let resp = check_status(resp).await?;
-        copy_object_result(&resp.text().await?)
+        // CopyObject can be retried after a lost response
+        with_retry(&self.retry_policy, StorageError::is_transient, || async {
+            let resp = self
+                .signed_request(
+                    "PUT",
+                    &self.full_key(dst_key),
+                    &[],
+                    Bytes::new(),
+                    &[("x-amz-copy-source", header.as_str())],
+                )
+                .await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(StorageError::NotFound(src.key.clone()));
+            }
+            let resp = check_status(resp).await?;
+            copy_object_result(&resp.text().await?)
+        })
+        .await
     }
 }
 
@@ -615,9 +598,8 @@ fn copy_source_header(bucket: &str, key: &str) -> String {
     format!("/{}/{}", bucket, utf8_percent_encode(key, PATH_ENCODE))
 }
 
-/// CopyObject returns 200 before copy completes; failures past that point
-/// surface as <Error> in the body. Mapped to 500 (transient) so the retry
-/// wrapper replays, per AWS guidance to retry embedded copy errors
+/// CopyObject can return 200 with <Error> in response body. Treat these errors
+/// as 500 so copy_within retries, as AWS recommends
 fn copy_object_result(body: &str) -> Result<()> {
     if body.contains("<CopyObjectResult") {
         Ok(())
@@ -1454,6 +1436,124 @@ mod tests {
             2,
             "one transient retry then success"
         );
+    }
+
+    #[tokio::test]
+    async fn s3_exists_errors_unless_found_or_missing() {
+        use crate::storage::test_http::{Req, Resp, serve};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let flaky = Arc::new(AtomicU32::new(0));
+        let f = flaky.clone();
+        let base = serve(move |req: &Req| match req.path.rsplit('/').next() {
+            Some("denied") => Resp::new(403),
+            Some("flaky") if f.fetch_add(1, Ordering::SeqCst) == 0 => Resp::new(503),
+            Some("here") => Resp::new(200),
+            _ => Resp::new(404),
+        })
+        .await;
+
+        let cfg = S3Config {
+            bucket: "bkt".into(),
+            prefix: "p".into(),
+            region: "us-east-1".into(),
+            creds: CredentialSource::Static(Credentials {
+                access_key: "AKID".into(),
+                secret_key: "sek".into(),
+                session_token: None,
+                expires_at: None,
+            }),
+            endpoint: Some(base),
+            force_path_style: true,
+        };
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
+        };
+        let s = S3Storage::with_retry_policy(cfg, policy).unwrap();
+
+        assert!(s.exists("here").await.unwrap());
+        assert!(!s.exists("flaky").await.unwrap());
+        assert_eq!(flaky.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            s.exists("denied").await,
+            Err(StorageError::Http { status: 403, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn s3_get_and_list_pages_retry_transient() {
+        use crate::storage::test_http::{Req, Resp, serve};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Fail first object GET and first list page with 503
+        let gets = Arc::new(AtomicU32::new(0));
+        let lists = Arc::new(AtomicU32::new(0));
+        let (g, l) = (gets.clone(), lists.clone());
+        let base = serve(move |req: &Req| {
+            let counter = if req.query("list-type").is_some() {
+                &l
+            } else {
+                &g
+            };
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Resp::new(503).body(b"<Error><Code>SlowDown</Code></Error>".to_vec());
+            }
+            if req.query("list-type").is_some() {
+                Resp::new(200).body(
+                    b"<ListBucketResult><IsTruncated>false</IsTruncated>\
+                      <Contents><Key>p/a</Key><Size>2</Size></Contents></ListBucketResult>"
+                        .to_vec(),
+                )
+            } else {
+                Resp::new(200).body(b"ok".to_vec())
+            }
+        })
+        .await;
+
+        let cfg = S3Config {
+            bucket: "bkt".into(),
+            prefix: "p".into(),
+            region: "us-east-1".into(),
+            creds: CredentialSource::Static(Credentials {
+                access_key: "AKID".into(),
+                secret_key: "sek".into(),
+                session_token: None,
+                expires_at: None,
+            }),
+            endpoint: Some(base),
+            force_path_style: true,
+        };
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
+        };
+        let s = S3Storage::with_retry_policy(cfg, policy).unwrap();
+
+        let mut buf = Vec::new();
+        s.get("a")
+            .await
+            .unwrap()
+            .read_to_end(&mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"ok");
+        let keys: Vec<_> = s
+            .list("")
+            .await
+            .unwrap()
+            .map(|m| m.unwrap().key)
+            .collect()
+            .await;
+        assert_eq!(keys, ["a"]);
+        assert_eq!(gets.load(Ordering::SeqCst), 2);
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
     }
 
     /// Pipelined multipart keeps several part PUTs in flight, so they finish
